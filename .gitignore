@@ -1,0 +1,8 @@
+node_modules
+.pnpm-store
+dist
+.wrangler
+.dev.vars
+coverage
+*.log
+.DS_Store

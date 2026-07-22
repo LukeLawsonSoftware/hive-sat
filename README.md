@@ -26,7 +26,16 @@ pnpm build
 pnpm preview
 pnpm wrangler:types:check
 pnpm wrangler:dry-run
+pnpm wasm:build
+pnpm wasm:reproducible
 ```
+
+## Solver feasibility artifact
+
+Phase 2 adds a pinned, reproducible CaDiCaL 3.0.1 WebAssembly artifact behind
+the HiveSAT-specific C ABI. Its source locks, licenses, build instructions,
+runtime constraints, and proof-checking scope are documented in
+[`solver/README.md`](solver/README.md).
 
 ## Cloudflare deployment
 

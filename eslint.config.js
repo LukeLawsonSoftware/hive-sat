@@ -6,7 +6,15 @@ import { reactRefresh } from "eslint-plugin-react-refresh";
 import tseslint from "typescript-eslint";
 
 export default defineConfig([
-  globalIgnores(["dist", ".wrangler", "coverage", ".pnpm-store"]),
+  globalIgnores([
+    "dist",
+    ".wrangler",
+    "coverage",
+    ".pnpm-store",
+    "playwright-report",
+    "test-results",
+    "worker-configuration.d.ts",
+  ]),
   {
     files: ["**/*.{ts,tsx}"],
     extends: [

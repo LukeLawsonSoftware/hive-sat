@@ -56,12 +56,14 @@ Incomplete user-facing behavior remains behind feature flags. The architecture i
 
 Branch: `codex/hivesat-01-foundation`
 
-- Pin Node 24 across local development and CI, fix the current jsdom/localStorage mismatch, and retain the existing lint/type/build baseline.
-- Replace the hand-written Worker `Env` with committed `wrangler types` output and a CI drift check.
-- Add `nodejs_compat`, structured log/trace sampling, explicit `/api/*` assets-first routing, production feature flags, and append-only SQLite migration conventions.
-- Add separate JSDOM, Workers-runtime, and browser-E2E test configurations.
-- Split the monolithic UI into an app shell with home, job, and `/swarm` route placeholders.
-- Extend CI so a successful merge to `main` deploys automatically using protected Cloudflare secrets.
+- [x] Pin Node 24 across local development and CI, fix the current jsdom/localStorage mismatch, and retain the existing lint/type/build baseline. Local pins live in `.nvmrc`, `.node-version`, and `package.json`; JSDOM uses an explicit non-opaque origin.
+- [x] Replace the hand-written Worker `Env` with committed `wrangler types` output and a CI drift check (`pnpm wrangler:types:check`).
+- [x] Add `nodejs_compat`, structured log/trace sampling, explicit `/api/*` assets-first routing, production feature flags, and append-only SQLite migration conventions. The convention is documented in `docs/durable-object-migrations.md` before the first namespace is introduced.
+- [x] Add separate JSDOM, Workers-runtime, and browser-E2E test configurations using Vitest, Cloudflare's Workers pool, and Playwright respectively.
+- [x] Split the monolithic UI into an app shell with home, job, and `/swarm` route placeholders. Public job and swarm functionality remains clearly disabled.
+- [x] Extend CI so a successful merge to `main` deploys automatically using protected Cloudflare secrets, then verifies the disabled production flags through `/api/v1/health`.
+
+Phase 1 implementation note: deployment verification is automated on merges to `main`; the protected `production` environment must provide the two Cloudflare secrets and `HIVESAT_PRODUCTION_URL` described in `README.md`.
 
 Exit gate: existing behavior remains unchanged, all test environments run, Wrangler dry-run succeeds, and a feature-flagged production deployment is verified.
 

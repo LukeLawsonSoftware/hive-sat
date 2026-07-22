@@ -21,6 +21,60 @@
   --shadow: 0 22px 65px rgba(39, 41, 32, 0.1);
 }
 
+.route-shell {
+  min-height: 100vh;
+  background: var(--paper, #f5f2e9);
+}
+
+.route-header {
+  display: flex;
+  align-items: center;
+  min-height: 5rem;
+  padding: 0 5vw;
+  border-bottom: 1px solid rgba(25, 27, 24, 0.16);
+}
+
+.route-brand {
+  color: inherit;
+  text-decoration: none;
+}
+
+.route-brand-mark {
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border-radius: 0.35rem;
+  background: #c7f000;
+  color: #171a14;
+  font-weight: 800;
+}
+
+.route-placeholder {
+  width: min(46rem, 90vw);
+  margin: 0 auto;
+  padding: clamp(5rem, 12vw, 10rem) 0;
+}
+
+.route-placeholder h1 {
+  margin: 0.5rem 0 1.25rem;
+  font-size: clamp(3rem, 8vw, 6rem);
+  line-height: 0.95;
+}
+
+.route-placeholder-copy {
+  max-width: 38rem;
+  color: var(--muted, #62665d);
+  font-size: 1.05rem;
+  line-height: 1.65;
+}
+
+.route-home-link {
+  display: inline-flex;
+  margin-top: 2rem;
+  text-decoration: none;
+}
+
 * {
   box-sizing: border-box;
 }

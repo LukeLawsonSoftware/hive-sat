@@ -22,7 +22,6 @@
     "wrangler:types": "wrangler types",
     "wrangler:types:check": "wrangler types --check",
     "wrangler:dry-run": "CLOUDFLARE_ENV=production vite build && wrangler deploy --dry-run --env production",
-    "smoke:production": "node scripts/verify-production.mjs",
     "deploy": "CLOUDFLARE_ENV=production pnpm run build && wrangler deploy --env production"
   },
   "dependencies": {

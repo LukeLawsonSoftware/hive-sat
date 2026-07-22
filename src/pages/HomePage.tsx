@@ -15,13 +15,13 @@ import {
   ShieldIcon,
   XIcon,
 } from "../components/Icons";
-import { useMockSolver } from "../hooks/useMockSolver";
+import { useBrowserSolver } from "../hooks/useBrowserSolver";
 import {
   formatFileSize,
-  type SelectedFile,
   type SolverPhase,
   validateCnfFile,
 } from "../lib/solver";
+import { formatDimacsSatModel, modelDownloadFilename } from "../lib/formula/modelOutput";
 
 const HIVE_PREFERENCE_KEY = "hivesat:hive-enabled";
 
@@ -31,20 +31,20 @@ const phaseDetails: Record<
 > = {
   queued: {
     eyebrow: "Step 1 of 3",
-    title: "Entering the queue",
-    body: "Registering this instance with a simulated hive coordinator.",
+    title: "Validating the formula",
+    body: "Strictly parsing DIMACS and creating a deterministic, hashed encoding.",
     step: 1,
   },
   distributing: {
     eyebrow: "Step 2 of 3",
-    title: "Splitting the search",
-    body: "Preparing independent search branches for participating browsers.",
+    title: "Loading the solver",
+    body: "Transferring clause-aligned typed-array batches to a dedicated worker.",
     step: 2,
   },
   solving: {
     eyebrow: "Step 3 of 3",
     title: "Exploring assignments",
-    body: "Simulated workers are racing through their assigned search space.",
+    body: "CaDiCaL is solving locally in cancellable, conflict-bounded slices.",
     step: 3,
   },
 };
@@ -58,16 +58,8 @@ function readHivePreference(): boolean {
   }
 }
 
-function toSelectedFile(file: File): SelectedFile {
-  return {
-    name: file.name,
-    size: file.size,
-    lastModified: file.lastModified,
-  };
-}
-
 function HomePage() {
-  const { client, snapshot } = useMockSolver();
+  const { client, snapshot } = useBrowserSolver();
   const [hiveEnabled, setHiveEnabled] = useState(readHivePreference);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -95,7 +87,7 @@ function HomePage() {
     }
 
     setValidationError(null);
-    client.select(toSelectedFile(file));
+    client.select(file);
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -176,10 +168,10 @@ function HomePage() {
           </div>
 
           <div className="demo-banner" role="note">
-            <span className="demo-tag">Demo mode</span>
+            <span className="demo-tag">Local solver</span>
             <p>
-              This interface is a working prototype. Solve progress and verdicts
-              are simulated; your file never leaves this browser.
+              DIMACS parsing, SHA-256 hashing, model verification, and bounded
+              CaDiCaL solving all run in dedicated workers in this browser.
             </p>
           </div>
         </section>
@@ -240,7 +232,7 @@ function HomePage() {
                   ref={fileInputRef}
                   className="visually-hidden"
                   type="file"
-                  accept=".cnf,text/plain"
+                  accept=".cnf,.cnf.gz,text/plain,application/gzip"
                   aria-label="Choose DIMACS CNF file"
                   onChange={handleFileChange}
                 />
@@ -281,6 +273,7 @@ function HomePage() {
               <SolveProgress
                 phase={snapshot.phase as "queued" | "distributing" | "solving"}
                 filename={snapshot.file.name}
+                progress={snapshot.progress}
                 onCancel={() => client.cancel()}
               />
             )}
@@ -290,15 +283,22 @@ function HomePage() {
                 filename={snapshot.file.name}
                 verdict={snapshot.result.verdict}
                 fingerprint={snapshot.result.fingerprint}
+                elapsedMs={snapshot.result.elapsedMs}
+                formulaHash={snapshot.result.formulaHash}
+                variableCount={snapshot.result.variableCount}
+                clauseCount={snapshot.result.clauseCount}
+                modelVerified={snapshot.result.modelVerified}
+                model={snapshot.result.model}
+                cacheHit={snapshot.result.cacheHit}
                 onReset={resetFile}
-                onSolveAgain={() => client.cancel()}
+                onSolveAgain={() => client.start()}
               />
             )}
 
             {snapshot.phase === "error" && snapshot.file && (
               <ErrorPanel
-                message={snapshot.message ?? "The simulated solve did not complete."}
-                onRetry={() => client.cancel()}
+                message={snapshot.message ?? "The local solve did not complete."}
+                onRetry={() => client.start()}
                 onReset={resetFile}
               />
             )}
@@ -337,8 +337,8 @@ function HomePage() {
               <NetworkIcon />
               <h3>Divide the search</h3>
               <p>
-                A Cloudflare Durable Object will coordinate the job and distribute
-                independent branches across participating browsers.
+                A later phase will let a Cloudflare Durable Object coordinate the
+                job and distribute independent branches across browsers.
               </p>
             </article>
             <article className="step-card">
@@ -381,8 +381,8 @@ function HomePage() {
             </p>
             <div className="privacy-rule" />
             <p className="privacy-footnote">
-              <strong>Right now:</strong> this prototype does not read, upload, or
-              solve your file. Only its name and size are held temporarily in memory.
+              <strong>Right now:</strong> the selected formula is parsed and solved
+              locally. It is cached by hash in this browser and is not uploaded.
             </p>
           </aside>
         </section>
@@ -403,11 +403,15 @@ function HomePage() {
 interface SolveProgressProps {
   phase: "queued" | "distributing" | "solving";
   filename: string;
+  progress: import("../lib/solver").SolverProgress | null;
   onCancel: () => void;
 }
 
-function SolveProgress({ phase, filename, onCancel }: SolveProgressProps) {
+function SolveProgress({ phase, filename, progress, onCancel }: SolveProgressProps) {
   const details = phaseDetails[phase];
+  const percentage = progress?.bytesRead !== undefined && progress.totalBytes
+    ? Math.min(100, Math.round((progress.bytesRead / progress.totalBytes) * 100))
+    : null;
 
   return (
     <div className="solve-progress" aria-live="polite">
@@ -415,9 +419,20 @@ function SolveProgress({ phase, filename, onCancel }: SolveProgressProps) {
         <HexIcon />
         <span />
       </div>
-      <p className="eyebrow">{details.eyebrow} · Simulated</p>
+      <p className="eyebrow">{details.eyebrow} · Local browser worker</p>
       <h3>{details.title}</h3>
       <p>{details.body}</p>
+      {phase === "queued" && (
+        <p className="progress-detail">
+          {percentage !== null ? `${percentage}% read` : "Reading stream"}
+          {progress?.line ? ` · line ${progress.line.toLocaleString()}` : ""}
+        </p>
+      )}
+      {phase === "solving" && progress?.metrics && (
+        <p className="progress-detail">
+          {progress.metrics.conflicts.toLocaleString()} conflicts · {progress.metrics.decisions.toLocaleString()} decisions
+        </p>
+      )}
       <span className="progress-filename">{filename}</span>
       <div className="step-track" aria-hidden="true">
         {[1, 2, 3].map((step) => (
@@ -425,7 +440,7 @@ function SolveProgress({ phase, filename, onCancel }: SolveProgressProps) {
         ))}
       </div>
       <button className="text-button cancel-button" type="button" onClick={onCancel}>
-        Cancel demo solve
+        {phase === "solving" ? "Pause solve" : "Cancel processing"}
       </button>
     </div>
   );
@@ -435,26 +450,67 @@ interface ResultPanelProps {
   filename: string;
   verdict: "SAT" | "UNSAT";
   fingerprint: string;
+  elapsedMs: number;
+  formulaHash: string;
+  variableCount: number;
+  clauseCount: number;
+  modelVerified: boolean;
+  model: number[] | null;
+  cacheHit: boolean;
   onReset: () => void;
   onSolveAgain: () => void;
 }
 
-function ResultPanel({ filename, verdict, fingerprint, onReset, onSolveAgain }: ResultPanelProps) {
+function ResultPanel({
+  filename,
+  verdict,
+  fingerprint,
+  elapsedMs,
+  formulaHash,
+  variableCount,
+  clauseCount,
+  modelVerified,
+  model,
+  cacheHit,
+  onReset,
+  onSolveAgain,
+}: ResultPanelProps) {
+  function downloadModel() {
+    if (!model) return;
+    const contents = formatDimacsSatModel(model, formulaHash);
+    const url = URL.createObjectURL(new Blob([contents], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = modelDownloadFilename(filename);
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
   return (
     <div className="result-panel" aria-live="polite">
       <span className="result-icon"><CheckIcon /></span>
-      <p className="eyebrow">Simulated verdict</p>
+      <p className="eyebrow">Local CaDiCaL verdict</p>
       <h3>{verdict}</h3>
       <p>
-        Demo complete for <strong>{filename}</strong>. This verdict was generated
-        from the filename, not the formula.
+        Solve complete for <strong>{filename}</strong>. {verdict === "SAT"
+          ? "An independent TypeScript pass verified the returned model against every clause."
+          : "CaDiCaL exhausted the formula locally; proof certification is planned for Phase 10."}
       </p>
       <dl className="result-meta">
-        <div><dt>Demo runtime</dt><dd>4.25 s</dd></div>
-        <div><dt>Job fingerprint</dt><dd>{fingerprint}</dd></div>
-        <div><dt>Proof</dt><dd>Not generated</dd></div>
+        <div><dt>Local runtime</dt><dd>{(elapsedMs / 1_000).toFixed(2)} s</dd></div>
+        <div><dt>Formula</dt><dd>{variableCount.toLocaleString()} vars · {clauseCount.toLocaleString()} clauses</dd></div>
+        <div><dt>SHA-256</dt><dd title={formulaHash}>{fingerprint}</dd></div>
+        <div><dt>Formula cache</dt><dd>{cacheHit ? "Verified hit" : "Stored"}</dd></div>
+        <div><dt>Independent check</dt><dd>{modelVerified ? "Model verified" : "Not applicable"}</dd></div>
       </dl>
       <div className="result-actions">
+        {model && (
+          <button className="secondary-button" type="button" onClick={downloadModel}>
+            Download model
+          </button>
+        )}
         <button className="secondary-button" type="button" onClick={onSolveAgain}>
           Run again
         </button>
@@ -476,8 +532,8 @@ function ErrorPanel({ message, onRetry, onReset }: ErrorPanelProps) {
   return (
     <div className="error-panel" role="alert">
       <span className="error-mark">!</span>
-      <p className="eyebrow">Simulated interruption</p>
-      <h3>That demo run stopped.</h3>
+      <p className="eyebrow">Local runtime error</p>
+      <h3>That solve stopped.</h3>
       <p>{message}</p>
       <div className="result-actions">
         <button className="secondary-button" type="button" onClick={onReset}>Remove file</button>
@@ -537,7 +593,7 @@ function HiveCard({ enabled, helpingCount, hasPersonalJob, onToggle }: HiveCardP
         </button>
       </div>
       <p className="hive-disclosure">
-        Simulated for this prototype · Preference saved on this device
+        Public contribution arrives in Phase 9 · Preference saved on this device
       </p>
     </aside>
   );

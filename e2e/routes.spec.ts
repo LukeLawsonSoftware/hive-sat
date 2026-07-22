@@ -1,9 +1,9 @@
 import { expect, test } from "@playwright/test";
 
-test("serves the unchanged home experience", async ({ page }) => {
+test("serves the local browser-solver experience", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: /Many browsers/i })).toBeVisible();
-  await expect(page.getByText("Demo mode")).toBeVisible();
+  await expect(page.getByText("Local solver")).toBeVisible();
 });
 
 test("serves route placeholders through SPA fallback", async ({ page }) => {

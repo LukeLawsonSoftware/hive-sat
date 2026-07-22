@@ -85,12 +85,14 @@ Exit gate: all required capabilities work without Wasm pthreads. If portability,
 
 Branch: `codex/hivesat-03-formula-runtime`
 
-- Implement strict DIMACS parsing in a browser worker with useful line/offset errors, progress, cancellation, and decompression-bomb limits.
-- Define `HiveCnfV1`: deterministic little-endian integer encoding preserving parsed clause order, with SHA-256 over the uncompressed encoding and gzip for transfer.
-- Enforce 5 MiB compressed, 32 MiB encoded, and two million literal-occurrence limits.
-- Cache verified formulas by hash in IndexedDB and transfer typed arrays to solver workers in batches.
-- Replace filename-derived mock verdicts with real bounded CaDiCaL solving and an independent TypeScript model verifier.
-- Add brute-force differential tests for random small formulas and known SAT/UNSAT fixtures.
+- [x] Implement strict DIMACS parsing in a browser worker with useful line/offset errors, progress, cancellation, and decompression-bomb limits. Plain `.cnf` and gzip `.cnf.gz` streams report one-based line/column plus zero-based byte offsets and yield often enough for cancellation without quadratic long-line buffering.
+- [x] Define `HiveCnfV1`: deterministic little-endian integer encoding preserving parsed clause order, with SHA-256 over the uncompressed encoding and gzip for transfer. The byte-level contract is documented in `docs/formula-runtime.md`.
+- [x] Enforce 5 MiB compressed, 32 MiB encoded, and two million literal-occurrence limits. Decompressed source text is independently capped at 32 MiB so comments and whitespace cannot form a gzip bomb.
+- [x] Cache verified formulas by hash in IndexedDB and transfer typed arrays to solver workers in batches. Cache reads re-decode and re-hash canonical bytes; corrupt entries fail closed and are deleted.
+- [x] Replace filename-derived mock verdicts with real bounded CaDiCaL solving and an independent TypeScript model verifier. Dedicated solver workers retain CaDiCaL state across pause/resume, the UI displays only SAT models that satisfy every parsed clause, and verified assignments can be downloaded as DIMACS-style `s`/`v` output.
+- [x] Add brute-force differential tests for random small formulas and known SAT/UNSAT fixtures. Browser coverage also exercises gzip input/cache hits, malformed locations, decompression limits, and bounded cancellation/resume.
+
+Phase 3 implementation note: verified local SAT assignments are retained only for the active result and can be downloaded as text containing `s SATISFIABLE` and signed `v` literals terminated by `0`. Local UNSAT is a CaDiCaL verdict, not a public proof-certified result. Proof production and independent UNSAT certification remain Phase 10 work; durable model artifacts remain Phase 7, and public upload and swarm behavior remain disabled. The exact formula format, cache trust boundary, and resource limits are documented in `docs/formula-runtime.md`.
 
 Exit gate: the browser correctly parses, solves, cancels, resumes, and verifies representative formulas without server computation.
 

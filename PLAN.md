@@ -71,11 +71,13 @@ Exit gate: existing behavior remains unchanged, all test environments run, Wrang
 
 Branch: `codex/hivesat-02-cadical-wasm`
 
-- Pin CaDiCaL 3.0.1 and an Emscripten version, including source checksums and MIT license notices.
-- Build a single-threaded ES-module Wasm artifact behind a HiveSAT C ABI for batched clause loading, assumptions, bounded solve, interrupt, model extraction, metrics, lookahead, and LRAT tracing.
-- Check in the reproducible Wasm artifact and build scripts; CI rebuilds it and compares checksums.
-- Validate repeated conflict-bounded solving, cancellation latency, model extraction, `lookahead()` splitting, memory growth, and at least one externally checked proof in current Chrome, Firefox, Safari, and Edge.
-- Avoid generic IPASIR as the complete interface because it does not standardize budgets, proof output, metrics, or cubing. [CaDiCaL source/API](https://github.com/arminbiere/cadical), [IPASIR interface](https://satcompetition.github.io/2021/track_incremental.html), [Emscripten pthread requirements](https://emscripten.org/docs/porting/pthreads.html).
+- [x] Pin CaDiCaL 3.0.1 and Emscripten 4.0.10, including source checksums and MIT license notices. The lock is `solver/versions.env`; notices are in `solver/THIRD_PARTY_NOTICES.md`.
+- [x] Build a single-threaded ES-module Wasm artifact behind a HiveSAT C ABI for batched clause loading, assumptions, bounded solve, interrupt, model extraction, metrics, lookahead, and LRAT tracing. The artifact verifier rejects imported memory, pthread glue, and pthread worker output.
+- [x] Check in the reproducible Wasm artifact and build scripts; CI rebuilds it and byte-compares both generated files after checking their committed checksums.
+- [x] Validate repeated conflict-bounded solving, cancellation latency, model extraction, `lookahead()` splitting, memory growth, and an externally checked generated proof in current Chrome, Firefox, Safari-compatible WebKit, and Edge. CI owns all four browser projects; Safari itself remains a post-deploy manual smoke test because it has no Playwright channel.
+- [x] Avoid generic IPASIR as the complete interface because it does not standardize budgets, proof output, metrics, or cubing. The committed HiveSAT ABI explicitly covers each of those feasibility requirements. [CaDiCaL source/API](https://github.com/arminbiere/cadical), [IPASIR interface](https://satcompetition.github.io/2021/track_incremental.html), [Emscripten pthread requirements](https://emscripten.org/docs/porting/pthreads.html).
+
+Phase 2 implementation note: CaDiCaL calls are synchronous, so Dedicated Workers must solve in short conflict-bounded slices and yield to their event loop between calls. Cancellation is an immediate latch checked before each slice; a posted Worker message cannot interrupt the middle of synchronous Wasm execution. The text-LRAT RUP checker added here is a feasibility checker only. The independently pinned production checker, proof size limits, and proof correctness pipeline remain Phase 10 work.
 
 Exit gate: all required capabilities work without Wasm pthreads. If portability, resumable budgets, cube semantics, or proof output fails, stop and re-plan before defining the distributed protocol.
 

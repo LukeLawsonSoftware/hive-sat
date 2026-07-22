@@ -2,6 +2,8 @@ node_modules
 .pnpm-store
 dist
 .wrangler
+.build
+.cache
 .dev.vars
 coverage
 playwright-report

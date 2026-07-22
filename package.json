@@ -17,11 +17,15 @@
     "test:unit:watch": "vitest --config vitest.config.ts",
     "test:worker": "vitest run --config vitest.worker.config.ts",
     "test:e2e": "playwright test",
+    "test:e2e:solver": "playwright test e2e/cadical-wasm.spec.ts",
     "test:watch": "pnpm test:unit:watch",
     "typecheck": "tsc -b",
     "wrangler:types": "wrangler types",
     "wrangler:types:check": "wrangler types --check",
     "wrangler:dry-run": "CLOUDFLARE_ENV=production vite build && wrangler deploy --dry-run --env production",
+    "wasm:build": "./solver/build.sh",
+    "wasm:reproducible": "./solver/check-reproducible.sh",
+    "wasm:verify": "node ./solver/verify-artifact.mjs",
     "deploy": "CLOUDFLARE_ENV=production pnpm run build && wrangler deploy --env production"
   },
   "dependencies": {

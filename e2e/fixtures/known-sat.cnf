@@ -1,0 +1,5 @@
+c Unique solution: x1=true, x2=true
+p cnf 2 3
+1 2 0
+-1 2 0
+1 -2 0

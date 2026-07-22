@@ -1,8 +1,19 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
+class IdleWorker {
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: ((event: ErrorEvent) => void) | null = null;
+  postMessage = vi.fn();
+  terminate = vi.fn();
+}
+
 describe("HiveSAT app", () => {
+  beforeEach(() => {
+    vi.stubGlobal("Worker", IdleWorker);
+  });
+
   it("renders feature-flagged route placeholders", () => {
     window.history.replaceState(null, "", "/swarm");
     render(<App />);
@@ -28,7 +39,7 @@ describe("HiveSAT app", () => {
     const input = screen.getByLabelText("Choose DIMACS CNF file");
 
     fireEvent.change(input, { target: { files: [new File(["hello"], "notes.txt")] } });
-    expect(screen.getByRole("alert")).toHaveTextContent(".cnf extension");
+    expect(screen.getByRole("alert")).toHaveTextContent(".cnf or .cnf.gz extension");
 
     fireEvent.change(input, { target: { files: [new File(["p cnf 1 1\n1 0"], "tiny.cnf")] } });
     expect(screen.getByText("tiny.cnf")).toBeInTheDocument();
@@ -44,8 +55,8 @@ describe("HiveSAT app", () => {
     expect(screen.getByText("dropped.cnf")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /solve instance/i }));
-    fireEvent.click(screen.getByRole("button", { name: "Cancel demo solve" }));
-    expect(screen.getByText(/demo solve cancelled/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel processing" }));
+    expect(screen.getByText(/formula processing cancelled/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Remove dropped.cnf" }));
     expect(screen.getByRole("heading", { name: "Drop your CNF instance here" })).toBeInTheDocument();
@@ -59,36 +70,13 @@ describe("HiveSAT app", () => {
 
     expect(screen.getByRole("heading", { name: "Your solve" })).toBeInTheDocument();
     expect(screen.getByText(/Helping 2/)).toBeInTheDocument();
-    expect(screen.getByText(/Entering the queue/)).toBeInTheDocument();
+    expect(screen.getByText(/Validating the formula/)).toBeInTheDocument();
   });
 
-  it("finishes with an explicitly simulated verdict", () => {
-    vi.useFakeTimers();
+  it("describes the real local formula pipeline", () => {
     render(<App />);
-    const input = screen.getByLabelText("Choose DIMACS CNF file");
-    fireEvent.change(input, { target: { files: [new File(["p cnf 1 1"], "result.cnf")] } });
-    fireEvent.click(screen.getByRole("button", { name: /solve instance/i }));
-
-    act(() => vi.runAllTimers());
-
-    expect(screen.getByText("Simulated verdict")).toBeInTheDocument();
-    expect(screen.getByText(/not the formula/i)).toBeInTheDocument();
-    vi.useRealTimers();
-  });
-
-  it("renders the deterministic simulated error state", () => {
-    vi.useFakeTimers();
-    render(<App />);
-    const input = screen.getByLabelText("Choose DIMACS CNF file");
-    fireEvent.change(input, {
-      target: { files: [new File(["p cnf 1 1"], "network-error.cnf")] },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /solve instance/i }));
-
-    act(() => vi.runAllTimers());
-
-    expect(screen.getByText("Simulated interruption")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
-    vi.useRealTimers();
+    expect(screen.getByText("Local solver")).toBeInTheDocument();
+    expect(screen.getByText(/parsing, SHA-256 hashing, model verification/i)).toBeInTheDocument();
+    expect(screen.queryByText(/verdicts are simulated/i)).not.toBeInTheDocument();
   });
 });

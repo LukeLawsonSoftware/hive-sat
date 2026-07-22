@@ -3,6 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import App from "./App";
 
 describe("HiveSAT app", () => {
+  it("renders feature-flagged route placeholders", () => {
+    window.history.replaceState(null, "", "/swarm");
+    render(<App />);
+
+    expect(screen.getByRole("heading", { name: "Swarm mode" })).toBeInTheDocument();
+    expect(screen.getByText(/feature flag remains off/i)).toBeInTheDocument();
+  });
+
   it("defaults hive participation on and persists opt-out", () => {
     render(<App />);
     const hiveSwitch = screen.getByRole("switch", { name: "Join the hive" });

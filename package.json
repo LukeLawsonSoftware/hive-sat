@@ -3,16 +3,26 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
   "packageManager": "pnpm@11.9.0",
   "scripts": {
     "dev": "vite",
     "lint": "eslint . --max-warnings 0",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "pnpm test:unit && pnpm test:worker",
+    "test:unit": "vitest run --config vitest.config.ts",
+    "test:unit:watch": "vitest --config vitest.config.ts",
+    "test:worker": "vitest run --config vitest.worker.config.ts",
+    "test:e2e": "playwright test",
+    "test:watch": "pnpm test:unit:watch",
     "typecheck": "tsc -b",
-    "deploy": "pnpm run build && wrangler deploy"
+    "wrangler:types": "wrangler types",
+    "wrangler:types:check": "wrangler types --check",
+    "wrangler:dry-run": "CLOUDFLARE_ENV=production vite build && wrangler deploy --dry-run --env production",
+    "deploy": "CLOUDFLARE_ENV=production pnpm run build && wrangler deploy --env production"
   },
   "dependencies": {
     "react": "^19.2.7",
@@ -20,7 +30,9 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.45.1",
+    "@cloudflare/vitest-pool-workers": "^0.18.6",
     "@cloudflare/workers-types": "^5.20260719.1",
+    "@playwright/test": "1.61.1",
     "@eslint/js": "^10.0.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",

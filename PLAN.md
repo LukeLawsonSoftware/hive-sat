@@ -10,7 +10,7 @@ Every phase is one independently mergeable branch and PR:
 2. Create `codex/hivesat-NN-description`.
 3. Implement the phase with tests, documentation, and any append-only Durable Object migration.
 4. Merge only after CI passes.
-5. Automatically deploy `main`, smoke-test production, then begin the next phase.
+5. Let the connected Cloudflare project automatically deploy `main`, smoke-test production, then begin the next phase.
 
 Incomplete user-facing behavior remains behind feature flags. The architecture is intentionally conservative because Workers Free permits 100,000 dynamic requests/day and 10 ms CPU per Worker request; Durable Objects and R2 have separate free allowances. Static assets should remain assets-first, while parsing, hashing, SAT solving, and large verification happen in browsers or bounded verifier Durable Objects. [Workers limits](https://developers.cloudflare.com/workers/platform/limits/), [Static Assets billing](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), [R2 pricing](https://developers.cloudflare.com/r2/pricing/).
 
@@ -56,12 +56,14 @@ Incomplete user-facing behavior remains behind feature flags. The architecture i
 
 Branch: `codex/hivesat-01-foundation`
 
-- Pin Node 24 across local development and CI, fix the current jsdom/localStorage mismatch, and retain the existing lint/type/build baseline.
-- Replace the hand-written Worker `Env` with committed `wrangler types` output and a CI drift check.
-- Add `nodejs_compat`, structured log/trace sampling, explicit `/api/*` assets-first routing, production feature flags, and append-only SQLite migration conventions.
-- Add separate JSDOM, Workers-runtime, and browser-E2E test configurations.
-- Split the monolithic UI into an app shell with home, job, and `/swarm` route placeholders.
-- Extend CI so a successful merge to `main` deploys automatically using protected Cloudflare secrets.
+- [x] Pin Node 24 across local development and CI, fix the current jsdom/localStorage mismatch, and retain the existing lint/type/build baseline. Local pins live in `.nvmrc`, `.node-version`, and `package.json`; JSDOM uses an explicit non-opaque origin.
+- [x] Replace the hand-written Worker `Env` with committed `wrangler types` output and a CI drift check (`pnpm wrangler:types:check`).
+- [x] Add `nodejs_compat`, structured log/trace sampling, explicit `/api/*` assets-first routing, production feature flags, and append-only SQLite migration conventions. The convention is documented in `docs/durable-object-migrations.md` before the first namespace is introduced.
+- [x] Add separate JSDOM, Workers-runtime, and browser-E2E test configurations using Vitest, Cloudflare's Workers pool, and Playwright respectively.
+- [x] Split the monolithic UI into an app shell with home, job, and `/swarm` route placeholders. Public job and swarm functionality remains clearly disabled.
+- [x] Extend CI with the Phase 1 validation gates. The existing Cloudflare Git integration—not GitHub Actions—owns automatic production deployment after a successful merge to `main`.
+
+Phase 1 implementation note: GitHub Actions intentionally has no production deployment job or Cloudflare secrets. Production deployment is configured in Cloudflare against `main` and should be verified through that integration after merge.
 
 Exit gate: existing behavior remains unchanged, all test environments run, Wrangler dry-run succeeds, and a feature-flagged production deployment is verified.
 

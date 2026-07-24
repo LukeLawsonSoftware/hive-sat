@@ -342,13 +342,19 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
   }
   if (request.method === "POST" && url.pathname === "/api/v1/jobs") return createJob(request, env);
 
-  const match = url.pathname.match(/^\/api\/v1\/jobs\/([^/]+)(?:\/(formula|cancel))?$/u);
+  const match = url.pathname.match(/^\/api\/v1\/jobs\/([^/]+)(?:\/(formula|cancel|socket))?$/u);
   if (match) {
     const jobId = match[1];
     if (!JOB_ID_PATTERN.test(jobId)) throw new ApiError(404, "JOB_NOT_FOUND", "The job was not found.");
     await requireKnownJob(env, jobId);
     const action = match[2];
     if (request.method === "GET" && !action) return getStatus(env, jobId);
+    if (request.method === "GET" && action === "socket") {
+      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+        throw new ApiError(426, "WEBSOCKET_REQUIRED", "Expected Upgrade: websocket.");
+      }
+      return jobStub(env, jobId).fetch(request);
+    }
     if (request.method === "PUT" && action === "formula") return uploadFormula(request, env, jobId);
     if (request.method === "GET" && action === "formula") return downloadFormula(env, jobId);
     if (request.method === "POST" && action === "cancel") return cancelJob(request, env, jobId);

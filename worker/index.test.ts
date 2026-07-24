@@ -136,6 +136,18 @@ describe("HiveSAT Worker", () => {
     expect(new Uint8Array(await download.arrayBuffer())).toEqual(new Uint8Array([0x1f, 0x8b, 0x00, 0x00]));
   });
 
+  it("routes WebSocket upgrades to the job coordinator", async () => {
+    const job = await createJob();
+    expect((await uploadFormula(job)).status).toBe(201);
+    const response = await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/socket`, {
+      headers: { upgrade: "websocket" },
+    });
+    expect(response.status).toBe(101);
+    expect(response.webSocket).not.toBeNull();
+    response.webSocket?.accept();
+    response.webSocket?.close(1000, "done");
+  });
+
   it("rejects bad upload/owner tokens and safely deletes a cancelled formula", async () => {
     const job = await createJob();
     const badUpload = await SELF.fetch(job.uploadUrl, {

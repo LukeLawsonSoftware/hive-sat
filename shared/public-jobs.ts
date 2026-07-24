@@ -1,3 +1,5 @@
+import type { TaskState } from "./coordinator-protocol";
+
 export const PUBLIC_JOB_PROTOCOL_VERSION = 1 as const;
 
 export type PublicJobState =
@@ -46,5 +48,5 @@ export interface PublicJobStatus {
   createdAt: number;
   expiresAt: number;
   uploadedBytes: number | null;
-  rootTaskState: "READY" | "CANCELLED";
+  rootTaskState: TaskState;
 }

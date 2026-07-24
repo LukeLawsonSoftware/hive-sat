@@ -120,12 +120,19 @@ Exit gate: a valid public formula can be created, uploaded, inspected, cancelled
 
 Branch: `codex/hivesat-05-leasing`
 
-- Implement hibernating Job Coordinator WebSockets and versioned `HELLO`, `REQUEST_WORK`, `HEARTBEAT`, `SPLIT`, `YIELD`, `RESULT`, and cancellation messages.
-- Persist a lease before sending work. Use unpredictable lease IDs, bounded attempts, and atomic task transitions.
-- Target roughly ten-minute desktop tasks with 15-minute leases; use 60-second batched heartbeats and persist only authoritative transitions or an exceptional lease extension.
-- Consolidate lease recovery and job expiry into the object’s single earliest-deadline alarm.
-- Accept valid decisive evidence from stale leases, but reject stale splits and ordinary progress mutations.
-- Add socket attachments, reconnect/backoff, duplicate-message handling, and bounded alarm batches.
+- [x] Implement hibernating Job Coordinator WebSockets and versioned `HELLO`, `REQUEST_WORK`, `HEARTBEAT`, `SPLIT`, `YIELD`, `RESULT`, and cancellation messages. Both protocol directions use bounded runtime validation; application `PING`/`PONG` uses a hibernation auto-response.
+- [x] Persist a lease before sending work. Use unpredictable lease IDs, bounded attempts, and atomic task transitions. Leases use 192-bit random IDs, five-attempt fail-closed recovery, and SQLite transactions for lease/task changes plus duplicate-response recording.
+- [x] Target roughly ten-minute desktop tasks with 15-minute leases; use 60-second batched heartbeats and persist only authoritative transitions or an exceptional lease extension. Ordinary telemetry heartbeats do not write lease progress; one bounded five-minute extension may be persisted near expiry.
+- [x] Consolidate lease recovery and job expiry into the object’s single earliest-deadline alarm. The alarm recomputes the earlier deadline after every authoritative transition.
+- [x] Accept valid decisive evidence from stale leases, but reject stale splits and ordinary progress mutations. Phase 5 stores structurally valid stale SAT/UNSAT candidates without promoting them to a terminal verdict; independent evidence verification remains Phase 7.
+- [x] Add socket attachments, reconnect/backoff, duplicate-message handling, and bounded alarm batches. Stable sessions resume active leases after hibernation, the browser transport uses capped jittered exponential backoff, and alarms recover at most 64 leases per invocation.
+
+Phase 5 implementation note: the coordinator's append-only internal SQLite
+schema migration 2 adds lease history, candidate evidence, processed-message
+replay, task attempts, and active-lease ownership. No Wrangler namespace
+migration was added because the existing `JobCoordinatorDO` class remains in
+`v0001_job_platform`. The wire contract and trust boundaries are documented in
+`docs/coordinator-protocol.md`.
 
 Exit gate: fault-injection tests cover disconnects, hibernation, expiry, reassignment, duplicated results, stale clients, and coordinator restart.
 

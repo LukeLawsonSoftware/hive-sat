@@ -40,6 +40,8 @@ All JSON job requests use `protocolVersion: 1`.
    `GET /api/v1/jobs/{jobId}/formula` streams the public gzip object.
 5. `POST /api/v1/jobs/{jobId}/cancel` requires the owner bearer token, cancels
    the root task, deletes the R2 object, and releases admission capacity.
+6. `GET /api/v1/jobs/{jobId}/socket` upgrades to the hibernating, versioned
+   coordinator protocol documented in [coordinator-protocol.md](coordinator-protocol.md).
 
 Every solver-browser formula download compares the response hash with public
 job status, expands gzip under the 32 MiB cap, validates the HiveCnfV1 encoding,

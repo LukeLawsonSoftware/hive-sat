@@ -182,12 +182,21 @@ Exit gate: no malformed, stale, incomplete, or unverified result can produce a t
 
 Branch: `codex/hivesat-08-public-swarm`
 
-- Connect opted-in browsers to `SwarmDirectoryDO`, assign a job, then move the browser to that job’s coordinator so only one DO socket is active.
-- Schedule the active job with the lowest equal-weight virtual worker runtime. New jobs enter at the current minimum so they receive service without monopolizing the swarm.
-- Reconcile reserved versus actual active worker time; use hour-scale assignment quanta to avoid excessive WebSocket handshakes.
-- Use capability calibration for task sizing and lease length, not priority.
-- Apply aging and a per-job concurrency ceiling so all eligible jobs progress; no credits, contribution register, paid priority, or long-term contributor advantage.
-- Allow non-contributors to submit and receive the same public scheduling weight as contributors.
+- [x] Connect opted-in browsers to `SwarmDirectoryDO`, assign a job, then move the browser to that job’s coordinator so only one DO socket is active. Directory sockets are one-shot and close before `PublicSwarmRuntime` starts the job runtime.
+- [x] Schedule the active job with the lowest equal-weight virtual worker runtime. New jobs enter at the current minimum so they receive service without monopolizing the swarm.
+- [x] Reconcile reserved versus actual active worker time; use hour-scale assignment quanta to avoid excessive WebSocket handshakes.
+- [x] Use capability calibration for task sizing and lease length, not priority. Calibration selects 50/100/200-conflict slices and bounded 10/15/20-minute leases; the fair selection function cannot see it.
+- [x] Apply aging and a per-job concurrency ceiling so all eligible jobs progress; no credits, contribution register, paid priority, or long-term contributor advantage.
+- [x] Allow non-contributors to submit and receive the same public scheduling weight as contributors. The scheduling schema has no contributor or owner weight field.
+
+Phase 8 implementation note: Swarm Directory internal schema migration 2 adds
+eligibility, virtual worker-time accounting, active reservations, aging inputs,
+and an eight-worker per-job ceiling. `PublicSwarmRuntime` performs the
+directory-to-coordinator handoff and reports measured active worker time on its
+next directory connection. Deterministic simulations cover unequal tasks,
+heterogeneous capacities, churn, new arrivals, and concurrency saturation.
+The illustrated scheduling walkthrough is
+`docs/guide/05-fair-swarm-scheduling.md`.
 
 Exit gate: deterministic simulations demonstrate bounded fairness under unequal task durations, worker churn, new-job arrival, and heterogeneous devices.
 

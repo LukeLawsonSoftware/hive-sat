@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">HiveSAT fair swarm handoff</title>
+  <desc id="desc">A browser connects to the swarm directory, receives a fair one-hour job assignment, closes that socket, computes through the selected job coordinator, and later reconciles actual worker time.</desc>
+  <defs>
+    <linearGradient id="bg8" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10150e"/>
+      <stop offset="1" stop-color="#252417"/>
+    </linearGradient>
+    <marker id="arrow8" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#aeb990"/>
+    </marker>
+    <style>
+      .node{fill:#1c2318;stroke:#9bad72;stroke-width:2}
+      .lime{fill:#202c18;stroke:#b8e34f;stroke-width:3}
+      .amber{fill:#2c2618;stroke:#e2a844;stroke-width:3}
+      .h{fill:#f2f4eb;font:700 23px system-ui,sans-serif}
+      .t{fill:#d6ddc8;font:17px system-ui,sans-serif}
+      .s{fill:#aeb99c;font:15px system-ui,sans-serif}
+      .a{fill:none;stroke:#aeb990;stroke-width:3;marker-end:url(#arrow8)}
+      .dash{fill:none;stroke:#778165;stroke-width:2;stroke-dasharray:8 8;marker-end:url(#arrow8)}
+    </style>
+  </defs>
+  <rect width="1200" height="620" rx="24" fill="url(#bg8)"/>
+  <text x="600" y="46" text-anchor="middle" class="h">One browser, one Durable Object socket, one fairly-accounted quantum</text>
+  <rect x="55" y="220" width="220" height="145" rx="16" class="node"/>
+  <text x="165" y="263" text-anchor="middle" class="h">Browser</text>
+  <text x="165" y="300" text-anchor="middle" class="t">opted in</text>
+  <text x="165" y="330" text-anchor="middle" class="s">capacity + calibration</text>
+  <rect x="390" y="105" width="325" height="195" rx="16" class="lime"/>
+  <text x="552" y="150" text-anchor="middle" class="h">SwarmDirectoryDO</text>
+  <text x="552" y="188" text-anchor="middle" class="t">lowest virtual worker time</text>
+  <text x="552" y="220" text-anchor="middle" class="t">aging + concurrency cap</text>
+  <text x="552" y="254" text-anchor="middle" class="s">reserve hour-scale worker-ms</text>
+  <rect x="830" y="220" width="315" height="145" rx="16" class="amber"/>
+  <text x="987" y="263" text-anchor="middle" class="h">JobCoordinatorDO</text>
+  <text x="987" y="300" text-anchor="middle" class="t">cube tasks + leases</text>
+  <text x="987" y="330" text-anchor="middle" class="s">directory socket already closed</text>
+  <path d="M275 255 C325 210 345 190 390 190" class="a"/>
+  <text x="322" y="190" class="s">ask</text>
+  <path d="M715 225 C775 240 790 270 830 280" class="a"/>
+  <text x="743" y="230" class="s">handoff</text>
+  <path d="M830 335 C700 475 390 485 275 345" class="a"/>
+  <text x="545" y="493" text-anchor="middle" class="s">quantum ends: close coordinator socket</text>
+  <path d="M275 325 C320 410 350 390 430 300" class="dash"/>
+  <text x="335" y="414" class="s">later reconcile</text>
+  <rect x="390" y="525" width="420" height="55" rx="12" fill="#171d15" stroke="#6f785e"/>
+  <text x="600" y="559" text-anchor="middle" class="t">reserved time − reservation + actual active worker time</text>
+</svg>

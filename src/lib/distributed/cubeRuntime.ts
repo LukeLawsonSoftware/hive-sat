@@ -65,6 +65,8 @@ export interface CubeRuntimeOptions {
   workerFactory?: (index: number) => WorkerLike;
   webSocketFactory?: (url: string) => CoordinatorWebSocket;
   now?: () => number;
+  conflictBudget?: number;
+  calibratedConflictsPerSecond?: number;
 }
 
 type Listener = () => void;
@@ -253,6 +255,9 @@ export class DistributedCubeRuntime {
         maxWorkers: this.capacity,
         mobile,
         solverVersion: "cadical-3.0.1",
+        ...(this.options.calibratedConflictsPerSecond
+          ? { calibratedConflictsPerSecond: this.options.calibratedConflictsPerSecond }
+          : {}),
       },
       webSocketFactory: this.options.webSocketFactory,
       onStateChange: (state) => {
@@ -343,7 +348,7 @@ export class DistributedCubeRuntime {
       lease: work.lease,
       allowSplit: work.queue.canSplit && work.queue.readyTasks < work.queue.targetWatermark,
       maxSlices: 64,
-      conflictBudget: 100,
+      conflictBudget: this.options.conflictBudget ?? 100,
     });
   }
 

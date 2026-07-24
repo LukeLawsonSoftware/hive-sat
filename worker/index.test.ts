@@ -63,8 +63,9 @@ describe("HiveSAT Worker", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       ok: true,
-      features: { publicJobs: true, publicSwarm: false },
+      features: { publicJobs: true, publicSwarm: true },
       activeJobs: 0,
+      activeWorkers: 0,
     });
   });
 
@@ -146,6 +147,37 @@ describe("HiveSAT Worker", () => {
     expect(response.webSocket).not.toBeNull();
     response.webSocket?.accept();
     response.webSocket?.close(1000, "done");
+  });
+
+  it("routes opted-in browsers through one-shot fair swarm assignment", async () => {
+    const job = await createJob();
+    expect((await uploadFormula(job)).status).toBe(201);
+    const response = await SELF.fetch("https://hive-sat.test/api/v1/swarm/socket", {
+      headers: { upgrade: "websocket" },
+    });
+    expect(response.status).toBe(101);
+    const socket = response.webSocket;
+    if (!socket) throw new Error("Expected a swarm directory WebSocket.");
+    socket.accept();
+    const assigned = new Promise<Record<string, unknown>>((resolve) => {
+      socket.addEventListener("message", (event) => resolve(JSON.parse(String(event.data))));
+    });
+    socket.send(JSON.stringify({
+      type: "SWARM_HELLO",
+      protocolVersion: 1,
+      messageId: "swarm-index-request",
+      sessionId: "swarm-index-session",
+      capabilities: {
+        hardwareConcurrency: 8,
+        maxWorkers: 2,
+        mobile: false,
+        solverVersion: "cadical-3.0.1",
+      },
+    }));
+    await expect(assigned).resolves.toMatchObject({
+      type: "SWARM_ASSIGNMENT",
+      workers: 2,
+    });
   });
 
   it("rejects bad upload/owner tokens and safely deletes a cancelled formula", async () => {

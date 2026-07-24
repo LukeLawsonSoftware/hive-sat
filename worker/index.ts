@@ -295,6 +295,7 @@ async function uploadFormula(request: Request, env: Env, jobId: string): Promise
     await formulas.delete(authorization.objectKey);
     throw new ApiError(409, completed.code, "The job could not accept the completed upload.");
   }
+  await directoryStub(env).markReady(jobId);
   return json({ jobId, state: "QUEUED", formulaHash: authorization.formulaHash }, { status: 201 });
 }
 
@@ -397,9 +398,19 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
       },
       turnstileSiteKey: env.TURNSTILE_SITE_KEY,
       activeJobs: directory.activeJobs,
+      activeWorkers: directory.activeWorkers,
     });
   }
   if (request.method === "POST" && url.pathname === "/api/v1/jobs") return createJob(request, env);
+  if (url.pathname === "/api/v1/swarm/socket") {
+    if (!isEnabled(env.FEATURE_PUBLIC_SWARM)) {
+      throw new ApiError(503, "PUBLIC_SWARM_DISABLED", "Public swarm assignment is currently disabled.");
+    }
+    if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      throw new ApiError(426, "WEBSOCKET_REQUIRED", "Expected Upgrade: websocket.");
+    }
+    return directoryStub(env).fetch(request);
+  }
 
   const modelMatch = url.pathname.match(
     /^\/api\/v1\/jobs\/([^/]+)\/results\/([^/]+)\/model$/u,

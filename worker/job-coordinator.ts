@@ -37,6 +37,7 @@ import type {
 } from "./contracts";
 import { fixedTimeHexEqual, randomToken } from "./crypto";
 import type { VerifySatResult } from "./result-verifier";
+import { calibratedTaskProfile } from "../shared/capability-profile";
 
 interface JobRow {
   [key: string]: SqlStorageValue;
@@ -227,6 +228,17 @@ export class JobCoordinatorDO extends DurableObject<Env> {
           updated_at INTEGER NOT NULL
         );
         INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (3, unixepoch('now') * 1000);
+      `);
+    }
+    if (version < 4) {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE session_profiles (
+          session_id TEXT PRIMARY KEY,
+          conflict_budget INTEGER NOT NULL,
+          lease_duration_ms INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (4, unixepoch('now') * 1000);
       `);
     }
   }
@@ -535,6 +547,20 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     const nextAttachment: SocketAttachment = { ...attachment, sessionId: message.sessionId };
     ws.serializeAttachment(nextAttachment);
     const now = Date.now();
+    const profile = calibratedTaskProfile(message.capabilities);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO session_profiles (
+        session_id, conflict_budget, lease_duration_ms, updated_at
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        conflict_budget = excluded.conflict_budget,
+        lease_duration_ms = excluded.lease_duration_ms,
+        updated_at = excluded.updated_at`,
+      message.sessionId,
+      profile.conflictBudget,
+      profile.leaseDurationMs,
+      now,
+    );
     const activeLeases = this.ctx.storage.sql.exec<LeaseRow & TaskRow>(
       `SELECT l.*, t.task_id, t.parent_task_id, t.depth, t.assumptions_json,
               t.state, t.created_at, t.updated_at, t.attempt_count, t.active_lease_id
@@ -548,7 +574,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       ...this.serverBase(message.jobId, now),
       type: "WELCOME",
       heartbeatIntervalMs: COORDINATOR_HEARTBEAT_INTERVAL_MS,
-      leaseDurationMs: COORDINATOR_LEASE_DURATION_MS,
+      leaseDurationMs: profile.leaseDurationMs,
       activeLeases,
     };
     ws.send(JSON.stringify(response));
@@ -612,12 +638,16 @@ export class JobCoordinatorDO extends DurableObject<Env> {
           retryAfterMs: NO_WORK_RETRY_MS,
         };
       } else {
+        const leaseDurationMs = this.ctx.storage.sql.exec<{ lease_duration_ms: number }>(
+          "SELECT lease_duration_ms FROM session_profiles WHERE session_id = ?",
+          sessionId,
+        ).toArray()[0]?.lease_duration_ms ?? COORDINATOR_LEASE_DURATION_MS;
         const lease: Lease = {
           leaseId,
           taskId: task.task_id,
           attempt: task.attempt_count + 1,
           issuedAt: now,
-          expiresAt: Math.min(now + COORDINATOR_LEASE_DURATION_MS, job.expires_at),
+          expiresAt: Math.min(now + leaseDurationMs, job.expires_at),
         };
         this.ctx.storage.sql.exec(
           `INSERT INTO leases (
@@ -985,6 +1015,9 @@ export class JobCoordinatorDO extends DurableObject<Env> {
         result: "SAT_VERIFIED",
         taskId: task.task_id,
       });
+    }
+    if (verification.status === "VALID_SAT" || verification.status === "INVALID_FORMULA") {
+      await this.env.SWARM_DIRECTORY.getByName("global-v1").close(job.job_id);
     }
     return {
       serialized: this.processedResponse(sessionId, message.messageId) ??

@@ -28,6 +28,10 @@
       {
         "name": "SWARM_DIRECTORY",
         "class_name": "SwarmDirectoryDO"
+      },
+      {
+        "name": "RESULT_VERIFIERS",
+        "class_name": "ResultVerifierDO"
       }
     ]
   },
@@ -54,6 +58,10 @@
     {
       "tag": "v0001_job_platform",
       "new_sqlite_classes": ["JobCoordinatorDO", "SwarmDirectoryDO"]
+    },
+    {
+      "tag": "v0002_result_verifier",
+      "new_sqlite_classes": ["ResultVerifierDO"]
     }
   ],
   "env": {
@@ -74,6 +82,10 @@
           {
             "name": "SWARM_DIRECTORY",
             "class_name": "SwarmDirectoryDO"
+          },
+          {
+            "name": "RESULT_VERIFIERS",
+            "class_name": "ResultVerifierDO"
           }
         ]
       },

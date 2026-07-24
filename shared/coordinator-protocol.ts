@@ -1,4 +1,5 @@
 import { PUBLIC_JOB_PROTOCOL_VERSION } from "./public-jobs";
+import { parseResultManifest, type ResultManifest } from "./result-manifest";
 
 export const COORDINATOR_HEARTBEAT_INTERVAL_MS = 60_000;
 export const COORDINATOR_LEASE_DURATION_MS = 15 * 60_000;
@@ -15,6 +16,8 @@ export type TaskState =
   | "SPLIT"
   | "YIELDED"
   | "SAT_CANDIDATE"
+  | "VERIFYING_SAT"
+  | "SAT_VERIFIED"
   | "UNSAT_CANDIDATE"
   | "UNKNOWN"
   | "CANCELLED";
@@ -112,6 +115,7 @@ export interface ResultMessage extends MessageBase {
   leaseId: string;
   result: "SAT" | "UNSAT";
   evidenceSha256: string;
+  manifest: ResultManifest;
 }
 
 export type CoordinatorClientMessage =
@@ -165,6 +169,7 @@ export interface CoordinatorErrorMessage extends ServerMessageBase {
     | "HELLO_REQUIRED"
     | "INVALID_STATE"
     | "STALE_LEASE"
+    | "SESSION_QUARANTINED"
     | "ATTEMPTS_EXHAUSTED"
     | "TASK_LIMIT";
   retryable: boolean;
@@ -175,13 +180,20 @@ export interface JobCancelledMessage extends ServerMessageBase {
   reason: "OWNER_CANCELLED" | "EXPIRED";
 }
 
+export interface JobResultMessage extends ServerMessageBase {
+  type: "JOB_RESULT";
+  result: "SAT_VERIFIED";
+  taskId: string;
+}
+
 export type CoordinatorServerMessage =
   | WelcomeMessage
   | WorkMessage
   | NoWorkMessage
   | AckMessage
   | CoordinatorErrorMessage
-  | JobCancelledMessage;
+  | JobCancelledMessage
+  | JobResultMessage;
 
 export type CoordinatorMessageParseResult =
   | { ok: true; message: CoordinatorClientMessage }
@@ -290,10 +302,30 @@ export function parseCoordinatorClientMessage(value: unknown): CoordinatorMessag
     return { ok: true, message: { ...base, type: "YIELD", taskId: value.taskId, leaseId: value.leaseId, reason: value.reason as YieldMessage["reason"] } };
   }
   if (value.type === "RESULT") {
-    if ((value.result !== "SAT" && value.result !== "UNSAT") || typeof value.evidenceSha256 !== "string" || !SHA256_PATTERN.test(value.evidenceSha256)) {
+    const manifest = parseResultManifest(value.manifest);
+    if ((value.result !== "SAT" && value.result !== "UNSAT") ||
+      typeof value.evidenceSha256 !== "string" ||
+      !SHA256_PATTERN.test(value.evidenceSha256) ||
+      !manifest ||
+      manifest.taskId !== value.taskId ||
+      (value.result === "SAT" && manifest.kind !== "SAT_MODEL_V1") ||
+      (value.result === "UNSAT" && manifest.kind !== "UNSAT_CANDIDATE_V1") ||
+      (manifest.kind === "SAT_MODEL_V1" && manifest.artifactSha256 !== value.evidenceSha256)
+    ) {
       return { ok: false, code: "INVALID_MESSAGE" };
     }
-    return { ok: true, message: { ...base, type: "RESULT", taskId: value.taskId, leaseId: value.leaseId, result: value.result, evidenceSha256: value.evidenceSha256 } };
+    return {
+      ok: true,
+      message: {
+        ...base,
+        type: "RESULT",
+        taskId: value.taskId,
+        leaseId: value.leaseId,
+        result: value.result,
+        evidenceSha256: value.evidenceSha256,
+        manifest,
+      },
+    };
   }
   return { ok: false, code: "INVALID_MESSAGE" };
 }
@@ -416,6 +448,7 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
     const codes: CoordinatorErrorMessage["code"][] = [
       "INVALID_MESSAGE", "UPGRADE_REQUIRED", "JOB_MISMATCH", "HELLO_REQUIRED",
       "INVALID_STATE", "STALE_LEASE", "ATTEMPTS_EXHAUSTED", "TASK_LIMIT",
+      "SESSION_QUARANTINED",
     ];
     if (!codes.includes(value.code as CoordinatorErrorMessage["code"]) ||
       typeof value.retryable !== "boolean" ||
@@ -434,6 +467,9 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
   }
   if (value.type === "JOB_CANCELLED" && (value.reason === "OWNER_CANCELLED" || value.reason === "EXPIRED")) {
     return { ok: true, message: { ...base, type: "JOB_CANCELLED", reason: value.reason } };
+  }
+  if (value.type === "JOB_RESULT" && value.result === "SAT_VERIFIED" && isId(value.taskId)) {
+    return { ok: true, message: { ...base, type: "JOB_RESULT", result: value.result, taskId: value.taskId } };
   }
   return { ok: false, code: "INVALID_MESSAGE" };
 }

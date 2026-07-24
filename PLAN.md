@@ -161,12 +161,20 @@ Exit gate: several browser contexts can solve complementary cubes, recover from 
 
 Branch: `codex/hivesat-07-results`
 
-- Encode SAT models as compact bitsets with formula, cube, path, and solver-version metadata.
-- Verify final SAT models independently inside a `ResultVerifierDO`; invalid results quarantine that session and requeue the task.
-- Treat browser-reported UNSAT as a candidate only. Require an independent repeated solve before requesting proof production, but never promote consensus alone to final UNSAT.
-- Propagate task completion through the tree only when complementary coverage is intact.
-- Define invalid-formula, invalid-model, verification-timeout, exhausted-budget, and conflicting-result behavior explicitly.
-- Track session reliability only for lease sizing and abuse containment; it never affects job priority.
+- [x] Encode SAT models as compact bitsets with formula, cube, path, and solver-version metadata. `HSMODL01` artifacts carry bounded JSON metadata plus one truth bit per variable and are uploaded under their lease ID.
+- [x] Verify final SAT models independently inside a `ResultVerifierDO`; invalid results quarantine that session and requeue the task. The verifier re-reads and hashes both R2 objects, decodes both formats, and checks the cube and every clause.
+- [x] Treat browser-reported UNSAT as a candidate only. Require an independent repeated solve before requesting proof production, but never promote consensus alone to final UNSAT.
+- [x] Propagate task completion through the tree only when complementary coverage is intact. Upward propagation requires exactly two completed children with the parent prefix and opposite final literals.
+- [x] Define invalid-formula, invalid-model, verification-timeout, exhausted-budget, and conflicting-result behavior explicitly. The fail-closed state table and SAT/UNSAT asymmetry are documented in the sequential guide.
+- [x] Track session reliability only for lease sizing and abuse containment; it never affects job priority. Invalid-model sessions are quarantined; verifier timeouts are recorded separately.
+
+Phase 7 implementation note: the append-only Wrangler migration
+`v0002_result_verifier` introduces the short-lived verifier namespace, while
+Job Coordinator internal schema migration 3 adds candidate manifests,
+verification state, and session reliability. Detailed diagrams, artifact
+layout, examples, and failure semantics are in
+`docs/guide/04-result-correctness.md`. Repeated UNSAT is deliberately retained
+as `UNSAT_CANDIDATE`; proof-backed terminal UNSAT remains Phase 10.
 
 Exit gate: no malformed, stale, incomplete, or unverified result can produce a terminal job verdict.
 

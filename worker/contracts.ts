@@ -12,6 +12,7 @@ export type {
   PublicJobStatus,
 } from "../shared/public-jobs";
 import type { FormulaDeclaration } from "../shared/public-jobs";
+import type { CubeTask } from "../shared/coordinator-protocol";
 
 export interface InitializeJobInput {
   jobId: string;
@@ -47,6 +48,17 @@ export type UploadAuthorization =
 export type OwnerActionResult =
   | { ok: true; changed: boolean; objectKey: string }
   | { ok: false; code: "NOT_FOUND" | "INVALID_TOKEN" };
+
+export type ModelUploadAuthorization =
+  | {
+      ok: true;
+      objectKey: string;
+      jobId: string;
+      formulaHash: string;
+      task: CubeTask;
+      maximumBytes: number;
+    }
+  | { ok: false; code: "NOT_FOUND" | "INVALID_STATE" };
 
 export function formulaObjectKey(jobId: string): string {
   return `jobs/${jobId}/formula.hivecnf.gz`;

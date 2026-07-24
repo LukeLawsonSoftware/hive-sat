@@ -11,6 +11,11 @@ import { verifySatModel } from "../formula/modelVerifier";
 import type { FormulaMetadata } from "../formula/workerProtocol";
 import { JobCoordinatorSocket, type CoordinatorWebSocket } from "../jobCoordinatorSocket";
 import { loadVerifiedPublicFormula } from "../publicJobs";
+import {
+  encodeSatModelArtifact,
+  resultPathHash,
+  type ResultManifest,
+} from "../../../shared/result-manifest";
 import type { CubeWorkerRequest, CubeWorkerResponse } from "./cubeWorkerProtocol";
 import { conservativeWorkerCapacity, isLikelyMobile } from "./workerCapacity";
 
@@ -83,6 +88,7 @@ type RuntimeAction =
       leaseId: string;
       result: "SAT" | "UNSAT";
       evidenceSha256: string;
+      manifest: ResultManifest;
     };
 
 function defaultWorkerFactory(index: number): WorkerLike {
@@ -101,6 +107,7 @@ export class DistributedCubeRuntime {
   private readonly now: () => number;
   private snapshot: CubeRuntimeSnapshot;
   private formula: HiveCnfV1 | null = null;
+  private formulaHash: string | null = null;
   private slots: WorkerSlot[] = [];
   private socket: JobCoordinatorSocket | null = null;
   private retryTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -153,6 +160,7 @@ export class DistributedCubeRuntime {
       const cached = await loadVerifiedPublicFormula(this.options.jobId, this.options.fetcher);
       const encoded = new Uint8Array(cached.encoded);
       this.formula = decodeHiveCnfV1(encoded);
+      this.formulaHash = cached.hash;
       const metadata: FormulaMetadata = {
         hash: cached.hash,
         variableCount: cached.variableCount,
@@ -309,6 +317,16 @@ export class DistributedCubeRuntime {
     if (message.type === "JOB_CANCELLED") {
       this.stop();
       this.update({ ...this.snapshot, phase: "complete", message: "The job is no longer active." });
+      return;
+    }
+    if (message.type === "JOB_RESULT") {
+      this.dispose();
+      this.update({
+        ...this.snapshot,
+        phase: "complete",
+        activeWorkers: 0,
+        message: "The SAT model passed independent server verification.",
+      });
     }
   }
 
@@ -393,10 +411,59 @@ export class DistributedCubeRuntime {
         return this.fail("A cube worker returned an invalid SAT model.");
       }
     }
-    const evidence = message.verdict === "SAT"
-      ? JSON.stringify({ verdict: message.verdict, model: message.model })
-      : JSON.stringify({ verdict: message.verdict, taskId: message.taskId });
-    const evidenceSha256 = await sha256Hex(new TextEncoder().encode(evidence));
+    if (!this.formulaHash) return this.fail("A result arrived without a verified formula hash.");
+    const pathHash = await resultPathHash(slot.task.assumptions);
+    let manifest: ResultManifest;
+    let evidenceSha256: string;
+    if (message.verdict === "SAT") {
+      const artifact = encodeSatModelArtifact({
+        version: 1,
+        formulaHash: this.formulaHash,
+        taskId: message.taskId,
+        cube: slot.task.assumptions,
+        pathHash,
+        solverVersion: "cadical-3.0.1",
+        variableCount: message.model.length,
+      }, message.model);
+      evidenceSha256 = await sha256Hex(artifact);
+      manifest = {
+        kind: "SAT_MODEL_V1",
+        version: 1,
+        formulaHash: this.formulaHash,
+        taskId: message.taskId,
+        cube: [...slot.task.assumptions],
+        pathHash,
+        solverVersion: "cadical-3.0.1",
+        variableCount: message.model.length,
+        artifactId: message.leaseId,
+        artifactSha256: evidenceSha256,
+        artifactBytes: artifact.byteLength,
+      };
+      const fetcher = this.options.fetcher ?? fetch;
+      const response = await fetcher(
+        `/api/v1/jobs/${encodeURIComponent(this.options.jobId)}/results/${encodeURIComponent(message.leaseId)}/model`,
+        {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${message.leaseId}`,
+            "content-type": "application/vnd.hivesat.model",
+            "x-hivesat-content-length": String(artifact.byteLength),
+          },
+          body: artifact.slice().buffer as ArrayBuffer,
+        },
+      );
+      if (!response.ok) return this.fail(`SAT model upload failed with HTTP ${response.status}.`);
+    } else {
+      manifest = {
+        kind: "UNSAT_CANDIDATE_V1",
+        formulaHash: this.formulaHash,
+        taskId: message.taskId,
+        cube: [...slot.task.assumptions],
+        pathHash,
+        solverVersion: "cadical-3.0.1",
+      };
+      evidenceSha256 = await sha256Hex(new TextEncoder().encode(JSON.stringify(manifest)));
+    }
     this.release(slot);
     this.send({
       type: "RESULT",
@@ -404,6 +471,7 @@ export class DistributedCubeRuntime {
       leaseId: message.leaseId,
       result: message.verdict,
       evidenceSha256,
+      manifest,
     });
     this.update({ ...this.snapshot, completedTasks: this.snapshot.completedTasks + 1 });
     if (message.verdict === "SAT") {
@@ -412,7 +480,7 @@ export class DistributedCubeRuntime {
         ...this.snapshot,
         phase: "complete",
         activeWorkers: 0,
-        message: "A SAT model passed independent browser verification.",
+        message: "A SAT model is awaiting independent server verification.",
       });
     }
   }

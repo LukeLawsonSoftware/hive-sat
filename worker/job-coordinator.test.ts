@@ -10,6 +10,11 @@ import {
   COORDINATOR_MAX_TASK_ATTEMPTS,
   type CoordinatorServerMessage,
 } from "../shared/coordinator-protocol";
+import {
+  encodeSatModelArtifact,
+  resultPathHash,
+  satModelObjectKey,
+} from "../shared/result-manifest";
 import type { JobCoordinatorDO } from "./job-coordinator";
 
 let sequence = 0;
@@ -91,6 +96,17 @@ async function requestWork(socket: WebSocket, jobId: string, messageId: string) 
 function expectWork(message: CoordinatorServerMessage | "PONG") {
   if (message === "PONG" || message.type !== "WORK") throw new Error("Expected WORK.");
   return message;
+}
+
+async function digest(bytes: Uint8Array): Promise<string> {
+  const value = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes.slice().buffer as ArrayBuffer));
+  return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function gzip(bytes: Uint8Array): Promise<ArrayBuffer> {
+  return new Response(
+    new Blob([bytes.slice().buffer as ArrayBuffer]).stream().pipeThrough(new CompressionStream("gzip")),
+  ).arrayBuffer();
 }
 
 describe("JobCoordinatorDO leasing protocol", () => {
@@ -271,17 +287,25 @@ describe("JobCoordinatorDO leasing protocol", () => {
       jobId,
       taskId: "root",
       leaseId: first.lease.leaseId,
-      result: "SAT",
+      result: "UNSAT",
       evidenceSha256: "cd".repeat(32),
+      manifest: {
+        kind: "UNSAT_CANDIDATE_V1",
+        formulaHash: "ab".repeat(32),
+        taskId: "root",
+        cube: [],
+        pathHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        solverVersion: "cadical-3.0.1",
+      },
     };
     const accepted = await send(staleSocket, result);
     expect(accepted).toMatchObject({ type: "ACK", action: "RESULT", staleLease: true });
     expect(await send(staleSocket, result)).toEqual(accepted);
 
     await runInDurableObject(stub, (_instance, state) => {
-      expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM tasks WHERE task_id = 'root'").one().state).toBe("SAT_CANDIDATE");
+      expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM tasks WHERE task_id = 'root'").one().state).toBe("LEASED");
       expect(state.storage.sql.exec<{ total: number }>("SELECT COUNT(*) AS total FROM results").one().total).toBe(1);
-      expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM leases WHERE lease_id = ?", second.lease.leaseId).one().status).toBe("SUPERSEDED");
+      expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM leases WHERE lease_id = ?", second.lease.leaseId).one().status).toBe("ACTIVE");
     });
     staleSocket.close(1000, "done");
     currentSocket.close(1000, "done");
@@ -335,6 +359,148 @@ describe("JobCoordinatorDO leasing protocol", () => {
     firstSocket.close(1000, "done");
     secondSocket.close(1000, "done");
     replacementSocket.close(1000, "done");
+  });
+
+  it("requires independent UNSAT solves and propagates only exact complementary coverage", async () => {
+    const { jobId, stub } = await initializedCoordinator();
+    const splitter = await openSocket(stub);
+    await hello(splitter, jobId, "coverage-splitter");
+    const root = expectWork(await requestWork(splitter, jobId, "coverage-root"));
+    await send(splitter, {
+      type: "SPLIT",
+      protocolVersion: 1,
+      messageId: "coverage-split",
+      jobId,
+      taskId: root.task.taskId,
+      leaseId: root.lease.leaseId,
+      splitLiteral: 1,
+    });
+
+    for (let index = 0; index < 4; index += 1) {
+      const sessionId = `independent-${index}`;
+      const socket = await openSocket(stub);
+      await hello(socket, jobId, sessionId);
+      const work = expectWork(await requestWork(socket, jobId, `coverage-work-${index}`));
+      const manifest = {
+        kind: "UNSAT_CANDIDATE_V1",
+        formulaHash: "ab".repeat(32),
+        taskId: work.task.taskId,
+        cube: work.task.assumptions,
+        pathHash: await resultPathHash(work.task.assumptions),
+        solverVersion: "cadical-3.0.1",
+      };
+      await expect(send(socket, {
+        type: "RESULT",
+        protocolVersion: 1,
+        messageId: `coverage-result-${index}`,
+        jobId,
+        taskId: work.task.taskId,
+        leaseId: work.lease.leaseId,
+        result: "UNSAT",
+        evidenceSha256: `${index + 1}`.repeat(64),
+        manifest,
+      })).resolves.toMatchObject({ type: "ACK", action: "RESULT" });
+      socket.close(1000, "done");
+    }
+
+    await runInDurableObject(stub, (_instance, state) => {
+      const tasks = state.storage.sql.exec<{ task_id: string; state: string }>(
+        "SELECT task_id, state FROM tasks ORDER BY depth, task_id",
+      ).toArray();
+      expect(tasks).toHaveLength(3);
+      expect(tasks.every((task) => task.state === "UNSAT_CANDIDATE")).toBe(true);
+      expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM jobs").one().state)
+        .toBe("RUNNING");
+    });
+    splitter.close(1000, "done");
+  });
+
+  it("quarantines an invalid-model session and requeues without a terminal verdict", async () => {
+    const jobId = `invalid-model-${++sequence}`;
+    const stub = env.JOB_COORDINATORS.getByName(jobId);
+    const encoded = new Uint8Array(28);
+    encoded.set([0x48, 0x49, 0x56, 0x45, 0x43, 0x4e, 0x46, 0x31]);
+    const view = new DataView(encoded.buffer);
+    view.setUint32(8, 1, true);
+    view.setUint32(12, 1, true);
+    view.setUint32(16, 1, true);
+    view.setInt32(20, 1, true);
+    const compressed = await gzip(encoded);
+    const formulaHash = await digest(encoded);
+    const now = Date.now();
+    await stub.initialize({
+      jobId,
+      ownerDigest: "11".repeat(32),
+      uploadDigest: "22".repeat(32),
+      formula: {
+        hash: formulaHash,
+        variableCount: 1,
+        clauseCount: 1,
+        literalCount: 1,
+        encodedBytes: encoded.byteLength,
+        compressedBytes: compressed.byteLength,
+      },
+      createdAt: now,
+      expiresAt: now + 24 * 60 * 60_000,
+      objectKey: `jobs/${jobId}/formula.hivecnf.gz`,
+    });
+    await env.FORMULAS.put(`jobs/${jobId}/formula.hivecnf.gz`, compressed);
+    expect(await stub.completeUpload("22".repeat(32), compressed.byteLength)).toMatchObject({ ok: true });
+
+    const socket = await openSocket(stub);
+    await hello(socket, jobId, "dishonest-session");
+    const work = expectWork(await requestWork(socket, jobId, "invalid-model-work"));
+    const pathHash = await resultPathHash([]);
+    const artifact = encodeSatModelArtifact({
+      version: 1,
+      formulaHash,
+      taskId: "root",
+      cube: [],
+      pathHash,
+      solverVersion: "cadical-3.0.1",
+      variableCount: 1,
+    }, [-1]);
+    const artifactSha256 = await digest(artifact);
+    await env.FORMULAS.put(satModelObjectKey(jobId, work.lease.leaseId), artifact);
+    await expect(send(socket, {
+      type: "RESULT",
+      protocolVersion: 1,
+      messageId: "invalid-model-result",
+      jobId,
+      taskId: "root",
+      leaseId: work.lease.leaseId,
+      result: "SAT",
+      evidenceSha256: artifactSha256,
+      manifest: {
+        kind: "SAT_MODEL_V1",
+        version: 1,
+        formulaHash,
+        taskId: "root",
+        cube: [],
+        pathHash,
+        solverVersion: "cadical-3.0.1",
+        variableCount: 1,
+        artifactId: work.lease.leaseId,
+        artifactSha256,
+        artifactBytes: artifact.byteLength,
+      },
+    })).resolves.toMatchObject({ type: "ACK", action: "RESULT" });
+
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM jobs").one().state).toBe("RUNNING");
+      expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM tasks WHERE task_id = 'root'").one().state)
+        .toBe("READY");
+      expect(state.storage.sql.exec<{ quarantined: number }>(
+        "SELECT quarantined FROM session_reliability WHERE session_id = 'dishonest-session'",
+      ).one().quarantined).toBe(1);
+    });
+    expect(await env.FORMULAS.get(satModelObjectKey(jobId, work.lease.leaseId))).toBeNull();
+
+    const reconnect = await openSocket(stub);
+    await expect(hello(reconnect, jobId, "dishonest-session"))
+      .resolves.toMatchObject({ type: "ERROR", code: "SESSION_QUARANTINED" });
+    socket.close(1000, "done");
+    reconnect.close(1000, "done");
   });
 
   it("broadcasts owner cancellation without eagerly recovering disconnected leases", async () => {

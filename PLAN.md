@@ -140,12 +140,20 @@ Exit gate: fault-injection tests cover disconnects, hibernation, expiry, reassig
 
 Branch: `codex/hivesat-06-distributed-cubes`
 
-- Add a browser worker pool with conservative defaults: up to two desktop workers and one mobile worker, bounded by user preference and detected capacity.
-- Use CaDiCaL `lookahead()` to split only into exact complementary children `C ∧ l` and `C ∧ ¬l`; the coordinator independently validates coverage.
-- Use queue watermarks of approximately 1×/3×/8× active workers, a maximum cube depth of 64, and a 10,000-task ceiling.
-- When a budget expires without a safe split, yield and restart the cube later; do not migrate CDCL state.
-- Give a user’s active job first claim on every local worker. Only workers for which no owner task is ready request public swarm work.
-- Cache formulas locally and never send full formulas or proof data through WebSockets.
+- [x] Add a browser worker pool with conservative defaults: up to two desktop workers and one mobile worker, bounded by user preference and detected capacity. `DistributedCubeRuntime` owns the external-store snapshot and one single-threaded CaDiCaL Dedicated Worker per slot.
+- [x] Use CaDiCaL `lookahead()` to split only into exact complementary children `C ∧ l` and `C ∧ ¬l`; the coordinator independently validates coverage. Browsers send only the literal; the coordinator constructs and persists both children atomically.
+- [x] Use queue watermarks of approximately 1×/3×/8× active workers, a maximum cube depth of 64, and a 10,000-task ceiling. Every WORK message carries the coordinator-derived queue snapshot used to decide whether lookahead splitting is appropriate.
+- [x] When a budget expires without a safe split, yield and restart the cube later; do not migrate CDCL state. Cube assumptions are reapplied on every bounded slice and yielded cubes return to READY.
+- [x] Give a user’s active job first claim on every local worker. Only workers for which no owner task is ready request public swarm work. The owner-first claim policy is explicit and unit tested; the job page exposes the owner runtime while public-swarm admission remains Phase 8.
+- [x] Cache formulas locally and never send full formulas or proof data through WebSockets. Public downloads revalidate IndexedDB hits and cache newly verified canonical/gzip bytes by SHA-256.
+
+Phase 6 implementation note: the sequential learning guide begins at
+`docs/guide/README.md` and includes SAT/CNF fundamentals, the canonical formula
+pipeline, and an illustrated cube-and-conquer walkthrough. Coordinator tests
+exercise complementary leases across several browser sessions, expiry, and
+exact cube reassignment after churn. The production bundle includes the
+dedicated cube worker; terminal server-side result verification remains Phase
+7, and public directory assignment remains Phase 8.
 
 Exit gate: several browser contexts can solve complementary cubes, recover from churn, avoid duplicate coverage, and terminate early on a verified SAT candidate.
 

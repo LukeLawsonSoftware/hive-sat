@@ -200,6 +200,13 @@ describe("JobCoordinatorDO leasing protocol", () => {
       reason: "BUDGET",
     })).resolves.toMatchObject({ type: "ACK", action: "YIELD" });
     const second = expectWork(await requestWork(socket, jobId, "transition-work-two"));
+    expect(second.queue).toMatchObject({
+      activeWorkers: 1,
+      lowWatermark: 1,
+      targetWatermark: 3,
+      highWatermark: 8,
+      canSplit: true,
+    });
     await expect(send(socket, {
       type: "SPLIT",
       protocolVersion: 1,
@@ -221,6 +228,10 @@ describe("JobCoordinatorDO leasing protocol", () => {
       expect(state.storage.sql.exec<{ state: string }>(
         "SELECT state FROM tasks WHERE task_id = 'root'",
       ).one().state).toBe("SPLIT");
+      const parent = state.storage.sql.exec<{ assumptions_json: string }>(
+        "SELECT assumptions_json FROM tasks WHERE task_id = 'root'",
+      ).one();
+      expect(JSON.parse(parent.assumptions_json)).toEqual([]);
     });
     socket.close(1000, "done");
   });
@@ -274,6 +285,56 @@ describe("JobCoordinatorDO leasing protocol", () => {
     });
     staleSocket.close(1000, "done");
     currentSocket.close(1000, "done");
+  });
+
+  it("leases exact complementary cubes to separate browser sessions and recovers churn", async () => {
+    const { jobId, stub } = await initializedCoordinator();
+    const splitterSocket = await openSocket(stub);
+    await hello(splitterSocket, jobId, "splitter-session");
+    const root = expectWork(await requestWork(splitterSocket, jobId, "root-work"));
+    await send(splitterSocket, {
+      type: "SPLIT",
+      protocolVersion: 1,
+      messageId: "split-root",
+      jobId,
+      taskId: root.task.taskId,
+      leaseId: root.lease.leaseId,
+      splitLiteral: 4,
+    });
+
+    const firstSocket = await openSocket(stub);
+    const secondSocket = await openSocket(stub);
+    await hello(firstSocket, jobId, "browser-context-a");
+    await hello(secondSocket, jobId, "browser-context-b");
+    const first = expectWork(await requestWork(firstSocket, jobId, "child-a"));
+    const second = expectWork(await requestWork(secondSocket, jobId, "child-b"));
+    expect(new Set([
+      first.task.assumptions.join(","),
+      second.task.assumptions.join(","),
+    ])).toEqual(new Set(["4", "-4"]));
+    expect(first.task.taskId).not.toBe(second.task.taskId);
+
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE leases SET expires_at = ? WHERE lease_id = ?",
+        Date.now() - 1,
+        first.lease.leaseId,
+      );
+      return state.storage.setAlarm(Date.now() + 10_000);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const replacementSocket = await openSocket(stub);
+    await hello(replacementSocket, jobId, "browser-context-c");
+    const replacement = expectWork(await requestWork(replacementSocket, jobId, "child-replacement"));
+    expect(replacement.task.taskId).toBe(first.task.taskId);
+    expect(replacement.task.assumptions).toEqual(first.task.assumptions);
+    expect(replacement.lease.attempt).toBe(2);
+
+    splitterSocket.close(1000, "done");
+    firstSocket.close(1000, "done");
+    secondSocket.close(1000, "done");
+    replacementSocket.close(1000, "done");
   });
 
   it("broadcasts owner cancellation without eagerly recovering disconnected leases", async () => {

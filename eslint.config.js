@@ -8,6 +8,7 @@ import tseslint from "typescript-eslint";
 export default defineConfig([
   globalIgnores([
     "dist",
+    ".build",
     ".wrangler",
     "coverage",
     ".pnpm-store",

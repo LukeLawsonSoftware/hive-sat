@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" role="img" aria-labelledby="title desc">
+  <title id="title">Cube-and-conquer complementary split</title>
+  <desc id="desc">A parent search cube C branches on literal l into C and l, and C and not l. The children are disjoint and together cover the parent.</desc>
+  <rect width="960" height="420" rx="28" fill="#11150f"/>
+  <rect x="350" y="42" width="260" height="92" rx="18" fill="#20271b" stroke="#b8f34a" stroke-width="3"/>
+  <text x="480" y="82" text-anchor="middle" fill="#eff7e7" font-family="ui-monospace, monospace" font-size="28">parent cube C</text>
+  <text x="480" y="112" text-anchor="middle" fill="#a9b2a2" font-family="system-ui, sans-serif" font-size="16">every assignment still possible</text>
+  <path d="M430 135 C410 185 300 190 260 235" fill="none" stroke="#b8f34a" stroke-width="4"/>
+  <path d="M530 135 C550 185 660 190 700 235" fill="none" stroke="#ffbd59" stroke-width="4"/>
+  <circle cx="480" cy="168" r="25" fill="#11150f" stroke="#d7dfd0" stroke-width="2"/>
+  <text x="480" y="176" text-anchor="middle" fill="#eff7e7" font-family="ui-monospace, monospace" font-size="24">l?</text>
+  <rect x="90" y="238" width="340" height="112" rx="18" fill="#1b2518" stroke="#b8f34a" stroke-width="3"/>
+  <text x="260" y="286" text-anchor="middle" fill="#eff7e7" font-family="ui-monospace, monospace" font-size="28">C ∧ l</text>
+  <text x="260" y="320" text-anchor="middle" fill="#b8f34a" font-family="system-ui, sans-serif" font-size="17">literal is true</text>
+  <rect x="530" y="238" width="340" height="112" rx="18" fill="#2a2115" stroke="#ffbd59" stroke-width="3"/>
+  <text x="700" y="286" text-anchor="middle" fill="#eff7e7" font-family="ui-monospace, monospace" font-size="28">C ∧ ¬l</text>
+  <text x="700" y="320" text-anchor="middle" fill="#ffbd59" font-family="system-ui, sans-serif" font-size="17">literal is false</text>
+  <text x="480" y="390" text-anchor="middle" fill="#a9b2a2" font-family="system-ui, sans-serif" font-size="18">disjoint children • exact coverage • independently solvable</text>
+</svg>

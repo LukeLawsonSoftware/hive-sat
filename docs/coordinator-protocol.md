@@ -36,6 +36,11 @@ stops reconnection.
 
 - A `READY` task is atomically changed to `LEASED` and its unpredictable
   192-bit lease ID is inserted in SQLite before `WORK` is sent.
+- `WORK` includes a bounded queue snapshot: READY tasks, active sessions,
+  1×/3×/8× watermarks, total task count, and `canSplit`. Browsers use it only
+  to decide whether lookahead is useful. The coordinator accepts a split
+  literal—not browser-authored children—and constructs both children itself
+  after enforcing depth 64 and 10,000-task caps.
 - The default lease is 15 minutes, capped by job expiry. Attempts are capped at
   five. A task whose fifth lease expires becomes `UNKNOWN` instead of being
   retried indefinitely.

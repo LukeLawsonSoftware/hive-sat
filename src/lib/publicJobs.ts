@@ -5,9 +5,9 @@ import {
   type FormulaDeclaration,
   type PublicJobStatus,
 } from "../../shared/public-jobs";
-import type { CachedFormula } from "./formula/cache";
+import { VerifiedFormulaCache, type CachedFormula } from "./formula/cache";
 import { decodeHiveCnfV1, sha256Hex } from "./formula/hiveCnf";
-import { MAX_ENCODED_FORMULA_BYTES } from "./formula/limits";
+import { MAX_COMPRESSED_FORMULA_BYTES, MAX_ENCODED_FORMULA_BYTES } from "./formula/limits";
 
 const DATABASE_NAME = "hivesat-public-jobs";
 const DATABASE_VERSION = 1;
@@ -205,7 +205,7 @@ export async function cancelPublicJob(
   }));
 }
 
-async function collectBounded(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+async function collectBounded(stream: ReadableStream<Uint8Array>, limit: number, label: string): Promise<Uint8Array> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let length = 0;
@@ -214,7 +214,7 @@ async function collectBounded(stream: ReadableStream<Uint8Array>): Promise<Uint8
       const { done, value } = await reader.read();
       if (done) break;
       length += value.byteLength;
-      if (length > MAX_ENCODED_FORMULA_BYTES) throw new Error("Downloaded formula exceeds the encoded-byte limit.");
+      if (length > limit) throw new Error(`Downloaded formula exceeds the ${label} limit.`);
       chunks.push(value);
     }
   } finally {
@@ -233,19 +233,42 @@ export async function downloadVerifiedPublicFormula(
   jobId: string,
   fetcher: typeof fetch = fetch,
 ): Promise<Uint8Array> {
+  return new Uint8Array((await loadVerifiedPublicFormula(jobId, fetcher)).encoded);
+}
+
+export async function loadVerifiedPublicFormula(
+  jobId: string,
+  fetcher: typeof fetch = fetch,
+  cache = new VerifiedFormulaCache(),
+): Promise<CachedFormula> {
   const status = await getPublicJob(jobId, fetcher);
+  const cached = await cache.get(status.formula.hash);
+  if (cached) return cached;
   const response = await fetcher(`/api/v1/jobs/${encodeURIComponent(jobId)}/formula`);
   if (!response.ok || !response.body) throw new Error("The public formula could not be downloaded.");
   const declaredHeader = response.headers.get("x-hivesat-formula-sha256");
   if (declaredHeader !== status.formula.hash) throw new Error("Formula download metadata does not match job status.");
   if (typeof DecompressionStream === "undefined") throw new Error("This browser cannot decompress public formulas.");
-  const stream = response.body.pipeThrough(
+  const gzip = await collectBounded(response.body, MAX_COMPRESSED_FORMULA_BYTES, "compressed-byte");
+  const compressedStream = new Response(gzip.slice().buffer as ArrayBuffer).body;
+  if (!compressedStream) throw new Error("The downloaded formula could not be streamed.");
+  const stream = compressedStream.pipeThrough(
     new DecompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>,
   );
-  const encoded = await collectBounded(stream);
-  decodeHiveCnfV1(encoded);
+  const encoded = await collectBounded(stream, MAX_ENCODED_FORMULA_BYTES, "encoded-byte");
+  const decoded = decodeHiveCnfV1(encoded);
   if (await sha256Hex(encoded) !== status.formula.hash) {
     throw new Error("Downloaded formula failed its declared SHA-256 verification.");
   }
-  return encoded;
+  const record: CachedFormula = {
+    hash: status.formula.hash,
+    encoded: encoded.slice().buffer as ArrayBuffer,
+    gzip: gzip.slice().buffer as ArrayBuffer,
+    variableCount: decoded.variableCount,
+    clauseCount: decoded.clauseCount,
+    literalCount: decoded.literalCount,
+    verifiedAt: Date.now(),
+  };
+  await cache.put(record);
+  return record;
 }

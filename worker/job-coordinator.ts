@@ -5,7 +5,10 @@ import {
   COORDINATOR_LEASE_DURATION_MS,
   COORDINATOR_LEASE_EXTENSION_MS,
   COORDINATOR_MAX_MESSAGE_BYTES,
+  COORDINATOR_MAX_CUBE_DEPTH,
+  COORDINATOR_MAX_TASKS,
   COORDINATOR_MAX_TASK_ATTEMPTS,
+  cubeQueueWatermarks,
   type CoordinatorClientMessage,
   type CoordinatorErrorMessage,
   type CoordinatorServerMessage,
@@ -85,7 +88,6 @@ interface HandledResponse {
 
 const LEASE_EXTENSION_THRESHOLD_MS = 2 * 60_000;
 const NO_WORK_RETRY_MS = 5_000;
-const MAX_CUBE_DEPTH = 64;
 const PROCESSED_MESSAGE_LIMIT = 2_048;
 
 function isSocketAttachment(value: unknown): value is SocketAttachment {
@@ -562,12 +564,14 @@ export class JobCoordinatorDO extends DurableObject<Env> {
           task.task_id,
         );
         this.ctx.storage.sql.exec("UPDATE jobs SET state = 'RUNNING' WHERE state = 'QUEUED'");
+        const queue = this.queueSnapshot(task.depth);
         response = {
           ...this.serverBase(message.jobId, now),
           type: "WORK",
           requestMessageId: message.messageId,
           task: this.toCubeTask(task),
           lease,
+          queue,
         };
         deadlineChanged = true;
       }
@@ -636,8 +640,14 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       const lease = this.activeLease(sessionId, message.taskId, message.leaseId, now);
       const task = lease ? this.task(message.taskId) : null;
       const job = this.job();
-      if (!lease || !task || !job || task.depth >= MAX_CUBE_DEPTH) {
+      if (!lease || !task || !job || task.depth >= COORDINATOR_MAX_CUBE_DEPTH) {
         return this.errorResponse(message.jobId, lease ? "INVALID_STATE" : "STALE_LEASE", false, message.messageId).serialized;
+      }
+      const taskCount = this.ctx.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM tasks",
+      ).one().total;
+      if (taskCount > COORDINATOR_MAX_TASKS - 2) {
+        return this.errorResponse(message.jobId, "TASK_LIMIT", false, message.messageId).serialized;
       }
       const assumptions = parseAssumptions(task.assumptions_json);
       const variable = Math.abs(message.splitLiteral);
@@ -827,6 +837,25 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       attempt: row.attempt,
       issuedAt: row.issued_at,
       expiresAt: row.expires_at,
+    };
+  }
+
+  private queueSnapshot(taskDepth: number) {
+    const readyTasks = this.ctx.storage.sql.exec<{ total: number }>(
+      "SELECT COUNT(*) AS total FROM tasks WHERE state = 'READY'",
+    ).one().total;
+    const activeWorkers = Math.max(1, this.ctx.storage.sql.exec<{ total: number }>(
+      "SELECT COUNT(DISTINCT session_id) AS total FROM leases WHERE status = 'ACTIVE'",
+    ).one().total);
+    const taskCount = this.ctx.storage.sql.exec<{ total: number }>(
+      "SELECT COUNT(*) AS total FROM tasks",
+    ).one().total;
+    return {
+      readyTasks,
+      activeWorkers,
+      ...cubeQueueWatermarks(activeWorkers),
+      taskCount,
+      canSplit: taskDepth < COORDINATOR_MAX_CUBE_DEPTH && taskCount <= COORDINATOR_MAX_TASKS - 2,
     };
   }
 

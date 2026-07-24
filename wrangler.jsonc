@@ -6,8 +6,30 @@
   "main": "./worker/index.ts",
   "vars": {
     "ENVIRONMENT": "development",
-    "FEATURE_PUBLIC_JOBS": "false",
-    "FEATURE_PUBLIC_SWARM": "false"
+    "FEATURE_PUBLIC_JOBS": "true",
+    "FEATURE_PUBLIC_SWARM": "false",
+    "MAX_ACTIVE_JOBS": "100",
+    "TURNSTILE_SITE_KEY": "1x00000000000000000000AA",
+    "TURNSTILE_SECRET": "1x0000000000000000000000000000000AA",
+    "NETWORK_DIGEST_KEY": "development-only-network-digest-key"
+  },
+  "r2_buckets": [
+    {
+      "binding": "FORMULAS",
+      "bucket_name": "hivesat-formulas"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "JOB_COORDINATORS",
+        "class_name": "JobCoordinatorDO"
+      },
+      {
+        "name": "SWARM_DIRECTORY",
+        "class_name": "SwarmDirectoryDO"
+      }
+    ]
   },
   "assets": {
     "binding": "ASSETS",
@@ -28,14 +50,39 @@
   },
   // Durable Object migrations are append-only. Add future SQLite-backed
   // classes as new, uniquely tagged entries; never edit or reorder old tags.
-  "migrations": [],
+  "migrations": [
+    {
+      "tag": "v0001_job_platform",
+      "new_sqlite_classes": ["JobCoordinatorDO", "SwarmDirectoryDO"]
+    }
+  ],
   "env": {
     "production": {
       "name": "hive-sat",
+      "r2_buckets": [
+        {
+          "binding": "FORMULAS",
+          "bucket_name": "hivesat-formulas"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "JOB_COORDINATORS",
+            "class_name": "JobCoordinatorDO"
+          },
+          {
+            "name": "SWARM_DIRECTORY",
+            "class_name": "SwarmDirectoryDO"
+          }
+        ]
+      },
       "vars": {
         "ENVIRONMENT": "production",
         "FEATURE_PUBLIC_JOBS": "false",
-        "FEATURE_PUBLIC_SWARM": "false"
+        "FEATURE_PUBLIC_SWARM": "false",
+        "MAX_ACTIVE_JOBS": "100",
+        "TURNSTILE_SITE_KEY": "configure-in-cloudflare-dashboard"
       }
     }
   }

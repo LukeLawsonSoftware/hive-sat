@@ -22,6 +22,7 @@ import {
   validateCnfFile,
 } from "../lib/solver";
 import { formatDimacsSatModel, modelDownloadFilename } from "../lib/formula/modelOutput";
+import { PublicJobSubmission } from "../components/PublicJobSubmission";
 
 const HIVE_PREFERENCE_KEY = "hivesat:hive-enabled";
 
@@ -518,6 +519,7 @@ function ResultPanel({
           New instance <ArrowUpIcon />
         </button>
       </div>
+      <PublicJobSubmission formulaHash={formulaHash} />
     </div>
   );
 }

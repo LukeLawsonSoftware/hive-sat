@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import HomePage from "./pages/HomePage";
+import JobPage from "./pages/JobPage";
 
 type Route =
   | { name: "home" }
@@ -85,12 +86,7 @@ function App() {
   }
 
   if (route.name === "job") {
-    return (
-      <RoutePlaceholder eyebrow="Coming in Phase 4" title="Job status">
-        <p>Job <code>{route.jobId}</code></p>
-        <p>Public job storage and status tracking are not enabled yet.</p>
-      </RoutePlaceholder>
-    );
+    return <JobPage jobId={route.jobId} />;
   }
 
   return (

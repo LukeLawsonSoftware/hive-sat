@@ -24,6 +24,8 @@ interface CaDiCaLModule {
     CONFLICTS: number;
     DECISIONS: number;
     PROPAGATIONS: number;
+    MEMORY_BYTES: number;
+    MEMORY_HIGH_WATER_BYTES: number;
   };
 }
 
@@ -51,6 +53,8 @@ async function readMetrics(): Promise<SolverMetrics> {
     conflicts: solver.metric(runtimeModule.SolverMetric.CONFLICTS),
     decisions: solver.metric(runtimeModule.SolverMetric.DECISIONS),
     propagations: solver.metric(runtimeModule.SolverMetric.PROPAGATIONS),
+    memoryBytes: solver.metric(runtimeModule.SolverMetric.MEMORY_BYTES),
+    memoryHighWaterBytes: solver.metric(runtimeModule.SolverMetric.MEMORY_HIGH_WATER_BYTES),
   };
 }
 

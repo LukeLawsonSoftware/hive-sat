@@ -240,10 +240,10 @@ export async function loadVerifiedPublicFormula(
   jobId: string,
   fetcher: typeof fetch = fetch,
   cache = new VerifiedFormulaCache(),
-): Promise<CachedFormula> {
+): Promise<CachedFormula & { cacheHit: boolean; transferredBytes: number }> {
   const status = await getPublicJob(jobId, fetcher);
   const cached = await cache.get(status.formula.hash);
-  if (cached) return cached;
+  if (cached) return { ...cached, cacheHit: true, transferredBytes: 0 };
   const response = await fetcher(`/api/v1/jobs/${encodeURIComponent(jobId)}/formula`);
   if (!response.ok || !response.body) throw new Error("The public formula could not be downloaded.");
   const declaredHeader = response.headers.get("x-hivesat-formula-sha256");
@@ -270,5 +270,5 @@ export async function loadVerifiedPublicFormula(
     verifiedAt: Date.now(),
   };
   await cache.put(record);
-  return record;
+  return { ...record, cacheHit: false, transferredBytes: gzip.byteLength };
 }

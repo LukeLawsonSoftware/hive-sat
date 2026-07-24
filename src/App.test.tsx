@@ -16,12 +16,16 @@ describe("HiveSAT app", () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it("renders feature-flagged route placeholders", () => {
+  it("renders Swarm Mode paused with honest controls and telemetry labels", () => {
     window.history.replaceState(null, "", "/swarm");
     render(<App />);
 
-    expect(screen.getByRole("heading", { name: "Swarm mode" })).toBeInTheDocument();
-    expect(screen.getByText(/feature flag remains off/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /lend a little compute/i })).toBeInTheDocument();
+    expect(screen.getAllByText("Paused").length).toBeGreaterThan(0);
+    expect(screen.getByRole("checkbox", { name: /pause when hidden/i })).toBeChecked();
+    expect(screen.getByText("Wasm allocation now")).toBeInTheDocument();
+    expect(screen.getByText(/not process RAM/i)).toBeInTheDocument();
+    expect(screen.queryByText(/search tree/i)).not.toBeInTheDocument();
   });
 
   it("renders public job status and recognizes an owner-only fragment", async () => {

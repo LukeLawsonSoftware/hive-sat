@@ -12,6 +12,11 @@ Every phase is one independently mergeable branch and PR:
 4. Merge only after CI passes.
 5. Let the connected Cloudflare project automatically deploy `main`, smoke-test production, then begin the next phase.
 
+Phases 6–9 in this implementation run use a stacked-branch delivery override:
+Phase 7 starts from Phase 6, Phase 8 from Phase 7, and Phase 9 from Phase 8.
+No additional pull requests are created; the stack is left for manual
+integration in reverse order.
+
 Incomplete user-facing behavior remains behind feature flags. The architecture is intentionally conservative because Workers Free permits 100,000 dynamic requests/day and 10 ms CPU per Worker request; Durable Objects and R2 have separate free allowances. Static assets should remain assets-first, while parsing, hashing, SAT solving, and large verification happen in browsers or bounded verifier Durable Objects. [Workers limits](https://developers.cloudflare.com/workers/platform/limits/), [Static Assets billing](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), [R2 pricing](https://developers.cloudflare.com/r2/pricing/).
 
 ## Target Architecture and Interfaces
@@ -204,10 +209,10 @@ Exit gate: deterministic simulations demonstrate bounded fairness under unequal 
 
 Branch: `codex/hivesat-09-swarm-ui`
 
-- Build `/swarm` as a scoped dark, moody dashboard using the existing lime/amber HiveSAT visual language.
-- Default contribution to paused. Public work runs only while `/swarm` is active; “pause when hidden” defaults on.
-- Provide start/pause, maximum worker count, visibility policy, and clear unsupported/throttled/reconnecting/no-work states.
-- Show:
+- [x] Build `/swarm` as a scoped dark, moody dashboard using the existing lime/amber HiveSAT visual language.
+- [x] Default contribution to paused. Public work runs only while `/swarm` is active; “pause when hidden” defaults on.
+- [x] Provide start/pause, maximum worker count, visibility policy, and clear unsupported/throttled/reconnecting/no-work states.
+- [x] Show:
   - current task and connection state;
   - active worker count and configured capacity;
   - active compute time and throughput;
@@ -217,9 +222,19 @@ Branch: `codex/hivesat-09-swarm-ui`
   - formula bytes transferred;
   - Wasm linear-memory current and high-water values;
   - global active jobs/workers and a bounded rolling activity graph.
-- Persist session and device-lifetime totals in IndexedDB with a reset action.
-- Label CPU and memory honestly: configured worker share, active compute time, and Wasm allocation—not unavailable OS-level CPU or process-memory claims.
-- Use aggregate statistics only; omit the search-tree visualization.
+- [x] Persist session and device-lifetime totals in IndexedDB with a reset action.
+- [x] Label CPU and memory honestly: configured worker share, active compute time, and Wasm allocation—not unavailable OS-level CPU or process-memory claims.
+- [x] Use aggregate statistics only; omit the search-tree visualization.
+
+Phase 9 implementation note: `SwarmPage` owns `PublicSwarmRuntime`, so leaving
+the route stops public work. Solver workers report operation counters and Wasm
+linear-memory current/high-water values through the existing sparse telemetry;
+network bytes count verified formula cache misses only. The dashboard uses a
+bounded 24-point aggregate activity series and persists aggregate lifetime
+totals in `hivesat-swarm-stats` IndexedDB. Responsive, mobile-fallback,
+reduced-motion, control, and honest-label behavior is covered in unit and
+Playwright tests. The annotated walkthrough is
+`docs/guide/06-swarm-mode.md`.
 
 Exit gate: responsive and accessible behavior is verified on modern desktop browsers, with a one-worker mobile fallback and reduced-motion support.
 

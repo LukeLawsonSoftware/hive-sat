@@ -42,6 +42,8 @@ export interface SolverMetrics {
   conflicts: number;
   decisions: number;
   propagations: number;
+  memoryBytes?: number;
+  memoryHighWaterBytes?: number;
 }
 
 export type SolverWorkerRequest =

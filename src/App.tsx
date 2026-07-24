@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import HomePage from "./pages/HomePage";
 import JobPage from "./pages/JobPage";
+import SwarmPage from "./pages/SwarmPage";
 
 type Route =
   | { name: "home" }
@@ -75,14 +76,7 @@ function App() {
   if (route.name === "home") return <HomePage />;
 
   if (route.name === "swarm") {
-    return (
-      <RoutePlaceholder eyebrow="Coming in Phase 9" title="Swarm mode">
-        <p>
-          Public browser contribution is not enabled yet. The production feature
-          flag remains off while the solver and coordination protocol are built.
-        </p>
-      </RoutePlaceholder>
-    );
+    return <SwarmPage />;
   }
 
   if (route.name === "job") {

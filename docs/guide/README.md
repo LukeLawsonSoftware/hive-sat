@@ -11,7 +11,7 @@ Read the pages in order:
 3. [How cube-and-conquer distributes one search](03-distributed-cubes.md)
 4. [Why results are not trusted on arrival](04-result-correctness.md)
 5. [How the public swarm shares compute fairly](05-fair-swarm-scheduling.md)
-6. The Swarm Mode user experience *(Phase 9)*
+6. [Reading and controlling the Swarm Mode dashboard](06-swarm-mode.md)
 
 The shorter reference documents in the parent `docs/` directory specify wire
 formats and APIs. This guide tells the story: what problem each component

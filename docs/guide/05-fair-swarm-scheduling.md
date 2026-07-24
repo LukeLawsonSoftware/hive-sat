@@ -148,4 +148,4 @@ The assertion is based on received worker time, not task count. These tests are
 deterministic so a scheduling change that creates starvation produces a
 repeatable failure.
 
-Next: the Swarm Mode experience *(added in Phase 9)*.
+Next: [Reading and controlling the Swarm Mode dashboard →](06-swarm-mode.md)

@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
 class IdleWorker {
@@ -14,12 +14,41 @@ describe("HiveSAT app", () => {
     vi.stubGlobal("Worker", IdleWorker);
   });
 
+  afterEach(() => vi.unstubAllGlobals());
+
   it("renders feature-flagged route placeholders", () => {
     window.history.replaceState(null, "", "/swarm");
     render(<App />);
 
     expect(screen.getByRole("heading", { name: "Swarm mode" })).toBeInTheDocument();
     expect(screen.getByText(/feature flag remains off/i)).toBeInTheDocument();
+  });
+
+  it("renders public job status and recognizes an owner-only fragment", async () => {
+    const ownerToken = "a".repeat(43);
+    window.history.replaceState(null, "", `/jobs/${"b".repeat(32)}#owner=${ownerToken}`);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      protocolVersion: 1,
+      jobId: "b".repeat(32),
+      state: "QUEUED",
+      formula: {
+        hash: "ab".repeat(32),
+        variableCount: 4,
+        clauseCount: 3,
+        literalCount: 7,
+        encodedBytes: 60,
+        compressedBytes: 40,
+      },
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      uploadedBytes: 40,
+      rootTaskState: "READY",
+    })));
+    render(<App />);
+
+    expect(await screen.findByText("QUEUED")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /cancel and delete formula/i })).toBeInTheDocument();
+    expect(screen.getByText(/share links contain no owner credential/i)).toBeInTheDocument();
   });
 
   it("defaults hive participation on and persists opt-out", () => {

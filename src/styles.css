@@ -1350,6 +1350,52 @@ svg {
   }
 }
 
+.public-submit {
+  width: min(100%, 660px);
+  margin-top: 28px;
+  padding: 24px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--paper) 92%, var(--lime));
+  text-align: left;
+}
+
+.public-submit h4 {
+  margin: 4px 0 8px;
+  font-size: 1.2rem;
+}
+
+.consent-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 18px 0;
+  font-weight: 700;
+}
+
+.consent-row input {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+}
+
+.turnstile-slot {
+  min-height: 70px;
+  margin-bottom: 14px;
+}
+
+.job-status-page {
+  width: min(760px, calc(100% - 32px));
+}
+
+.job-status-page .result-meta {
+  width: 100%;
+  margin-block: 24px;
+}
+
+.job-status-page .privacy-footnote {
+  max-width: 620px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   *, *::before, *::after {

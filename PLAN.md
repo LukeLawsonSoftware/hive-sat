@@ -100,12 +100,19 @@ Exit gate: the browser correctly parses, solves, cancels, resumes, and verifies 
 
 Branch: `codex/hivesat-04-job-platform`
 
-- Add anonymous device IDs, Turnstile-protected job creation, unguessable job IDs, and cryptographic owner/upload tokens. Store only token digests server-side.
-- Store the owner token in IndexedDB and an owner-only URL fragment; public share links exclude it.
-- Stream formulas to job-scoped R2 keys and verify their declared hash in every solver browser after download.
-- Create `JobCoordinatorDO` and `SwarmDirectoryDO` SQLite schemas, root-task initialization, public status reads, cancellation, and 24-hour alarms.
-- Enforce one active job and three creations per rolling day per device/network digest, plus a configurable global active-job ceiling.
-- Require explicit consent that every submitted formula is public to swarm participants; there is no private or local-only job mode.
+- [x] Add anonymous device IDs, Turnstile-protected job creation, unguessable job IDs, and cryptographic owner/upload tokens. Store only token digests server-side. Device identity is retained in IndexedDB; network identifiers use an HMAC digest before admission storage.
+- [x] Store the owner token in IndexedDB and an owner-only URL fragment; public share links exclude it.
+- [x] Stream formulas to job-scoped R2 keys and verify their declared hash in every solver browser after download. Downloads are gzip-expanded under the canonical-size cap, decoded as HiveCnfV1, and SHA-256 checked before use.
+- [x] Create `JobCoordinatorDO` and `SwarmDirectoryDO` SQLite schemas, root-task initialization, public status reads, cancellation, and 24-hour alarms. The append-only namespace migration is `v0001_job_platform`.
+- [x] Enforce one active job and three creations per rolling day per device/network digest, plus a configurable global active-job ceiling.
+- [x] Require explicit consent that every submitted formula is public to swarm participants; there is no private server-job mode. The existing browser-only solver remains separate and uploads nothing.
+
+Phase 4 implementation note: local development uses Cloudflare's published
+Turnstile test widget/secret and enables public jobs. Production stays disabled
+until the R2 bucket, production Turnstile widget, `TURNSTILE_SECRET`, and
+`NETWORK_DIGEST_KEY` are configured and the exit-gate smoke test is performed.
+The public API and trust boundary are documented in
+`docs/public-job-platform.md`.
 
 Exit gate: a valid public formula can be created, uploaded, inspected, cancelled, expired, and safely deleted without buffering it in the Worker.
 

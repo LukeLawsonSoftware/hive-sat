@@ -1,9 +1,10 @@
 # HiveSAT
 
 HiveSAT is an experimental web-based SAT solver designed to distribute search
-work across participating browsers. The current Phase 3 runtime strictly parses,
-hashes, caches, and solves DIMACS formulas locally in browser workers. Public job
-submission and swarm coordination remain feature-flagged for later phases.
+work across participating browsers. The Phase 4 runtime strictly parses,
+hashes, caches, and solves DIMACS formulas locally, and can submit an explicitly
+public formula to the feature-flagged Cloudflare job platform. Swarm leasing and
+distributed solving remain disabled for later phases.
 
 ## Development
 
@@ -57,11 +58,18 @@ pnpm deploy
 ```
 
 The production environment keeps `FEATURE_PUBLIC_JOBS` and
-`FEATURE_PUBLIC_SWARM` disabled. GitHub Actions owns validation only: lint,
+`FEATURE_PUBLIC_SWARM` disabled until the phase smoke test. Public jobs use an
+R2 binding plus SQLite-backed `JobCoordinatorDO` and `SwarmDirectoryDO`
+namespaces. Turnstile, token handling, admission, streaming upload, browser
+hash verification, cancellation, and expiry are documented in
+[`docs/public-job-platform.md`](docs/public-job-platform.md).
+
+GitHub Actions owns validation only: lint,
 type-checking, unit and Workers-runtime tests, browser E2E tests, the production
 build, generated-type drift detection, and a Wrangler dry-run. The existing
 Cloudflare Git integration owns production deployment after a successful merge
 to `main`; GitHub Actions does not deploy and requires no Cloudflare secrets.
 
-No solver backend, public file upload, or Durable Object binding is included yet.
-See `docs/durable-object-migrations.md` before adding a Durable Object class.
+The browser still performs all parsing, hashing, and SAT solving. The Worker
+never buffers formula uploads and does not solve formulas. See
+`docs/durable-object-migrations.md` before changing a Durable Object class.

@@ -9,6 +9,9 @@ const glue = await readFile(resolve(outputDirectory, "cadical.mjs"), "utf8");
 const module = await WebAssembly.compile(wasm);
 const imports = WebAssembly.Module.imports(module);
 const files = await readdir(outputDirectory);
+const lratWasm = await readFile(resolve(outputDirectory, "lrat-check.wasm"));
+const lratGlue = await readFile(resolve(outputDirectory, "lrat-check.mjs"), "utf8");
+const lratModule = await WebAssembly.compile(lratWasm);
 
 if (imports.some((entry) => entry.kind === "memory")) {
   throw new Error("solver imports memory; the artifact may be a shared/pthread build");
@@ -18,6 +21,10 @@ if (/SharedArrayBuffer|PThread|pthread/.test(glue)) {
 }
 if (files.some((file) => file.endsWith(".worker.js"))) {
   throw new Error("unexpected Emscripten pthread worker artifact found");
+}
+if (WebAssembly.Module.exports(lratModule).filter((entry) => entry.kind === "function").length < 1 ||
+  !/callMain/.test(lratGlue)) {
+  throw new Error("pinned LRAT checker artifact does not expose its command-line entrypoint");
 }
 
 console.log("Solver artifact is a valid non-pthread WebAssembly module.");

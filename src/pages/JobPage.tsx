@@ -6,6 +6,7 @@ import {
   getPublicJob,
   ownerTokenFromFragment,
   publicJobUrl,
+  verifyAndConfirmOwnerProof,
 } from "../lib/publicJobs";
 import { useDistributedCubeRuntime } from "../hooks/useDistributedCubeRuntime";
 
@@ -56,6 +57,23 @@ export default function JobPage({ jobId }: { jobId: string }) {
     }
   }
 
+  async function verifyOwnerProof() {
+    if (!ownerToken || !status) return;
+    setBusy(true);
+    setMessage("Downloading and independently checking the LRAT certificate in this browser…");
+    try {
+      const verified = await verifyAndConfirmOwnerProof(jobId, ownerToken, status);
+      setStatus(verified);
+      setMessage(verified.state === "UNSAT_OWNER_VERIFIED"
+        ? "The complete proof tree was checked. Public status records owner-verified UNSAT."
+        : "This leaf proof was checked. Other proof-covered branches are still required before the root is UNSAT.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The proof could not be verified.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="route-shell">
       <header className="route-header">
@@ -76,6 +94,24 @@ export default function JobPage({ jobId }: { jobId: string }) {
           </dl>
         )}
         {message && <p className="inline-notice" role="status">{message}</p>}
+        {status?.certificate && (
+          <section className="inline-notice" aria-labelledby="certificate-title">
+            <h2 id="certificate-title">UNSAT certificate</h2>
+            <p>
+              {status.certificate.verification === "SERVER_CERTIFIED"
+                ? "HiveSAT independently checked this bounded LRAT proof on the server."
+                : status.certificate.verification === "OWNER_VERIFIED"
+                  ? "The submitting owner independently checked this larger LRAT proof in their browser."
+                  : "This proof is valid-sized but exceeds conservative server limits and awaits an owner-browser check."}
+            </p>
+            <a className="secondary-button" href={status.certificate.downloadUrl}>Download LRAT certificate</a>
+            {ownerToken && status.certificate.verification === "OWNER_CHECK_REQUIRED" && (
+              <button className="primary-button" type="button" disabled={busy} onClick={() => void verifyOwnerProof()}>
+                {busy ? "Checking proof…" : "Verify proof in this browser"}
+              </button>
+            )}
+          </section>
+        )}
         {ownerToken && status && (status.state === "QUEUED" || status.state === "RUNNING") && (
           <section className="inline-notice" aria-labelledby="owner-compute-title">
             <h2 id="owner-compute-title">Solve your job in this browser</h2>

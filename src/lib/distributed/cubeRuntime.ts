@@ -13,6 +13,8 @@ import { JobCoordinatorSocket, type CoordinatorWebSocket } from "../jobCoordinat
 import { loadVerifiedPublicFormula } from "../publicJobs";
 import {
   encodeSatModelArtifact,
+  MAX_UNSAT_PROOF_COMPRESSED_BYTES,
+  MAX_UNSAT_PROOF_DECOMPRESSED_BYTES,
   resultPathHash,
   type ResultManifest,
 } from "../../../shared/result-manifest";
@@ -385,8 +387,8 @@ export class DistributedCubeRuntime {
       requestId: this.requestId,
       task: work.task,
       lease: work.lease,
-      allowSplit: work.queue.canSplit && work.queue.readyTasks < work.queue.targetWatermark,
-      maxSlices: 64,
+      allowSplit: work.task.purpose === "SEARCH" && work.queue.canSplit && work.queue.readyTasks < work.queue.targetWatermark,
+      maxSlices: work.task.purpose === "PROOF_FINISHER" ? 20_000 : 64,
       conflictBudget: this.options.conflictBudget ?? 100,
     });
   }
@@ -498,6 +500,45 @@ export class DistributedCubeRuntime {
         },
       );
       if (!response.ok) return this.fail(`SAT model upload failed with HTTP ${response.status}.`);
+    } else if (slot.task.purpose === "PROOF_FINISHER") {
+      if (!message.proof || !message.proofBytes ||
+        message.proof.byteLength > MAX_UNSAT_PROOF_COMPRESSED_BYTES ||
+        message.proofBytes > MAX_UNSAT_PROOF_DECOMPRESSED_BYTES || !this.formula) {
+        return this.fail("A proof-finisher returned missing or oversized LRAT evidence.");
+      }
+      evidenceSha256 = await sha256Hex(message.proof);
+      manifest = {
+        kind: "UNSAT_PROOF_V1",
+        version: 1,
+        formulaHash: this.formulaHash,
+        taskId: message.taskId,
+        cube: [...slot.task.assumptions],
+        pathHash,
+        solverVersion: "cadical-3.0.1",
+        artifactId: message.leaseId,
+        artifactSha256: evidenceSha256,
+        compressedBytes: message.proof.byteLength,
+        decompressedBytes: message.proofBytes,
+        originalClauseCount: this.formula.clauseCount,
+        cubeClauseIds: slot.task.assumptions.map((_, index) => this.formula!.clauseCount + index + 1),
+        checker: "drat-trim-lrat-check",
+      };
+      const fetcher = this.options.fetcher ?? fetch;
+      const response = await fetcher(
+        `/api/v1/jobs/${encodeURIComponent(this.options.jobId)}/proofs/${encodeURIComponent(message.leaseId)}`,
+        {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${message.leaseId}`,
+            "content-type": "application/vnd.hivesat.lrat+gzip",
+            "x-hivesat-content-length": String(message.proof.byteLength),
+            "x-hivesat-decompressed-length": String(message.proofBytes),
+            "x-hivesat-sha256": evidenceSha256,
+          },
+          body: message.proof.slice().buffer as ArrayBuffer,
+        },
+      );
+      if (!response.ok) return this.fail(`UNSAT proof upload failed with HTTP ${response.status}.`);
     } else {
       manifest = {
         kind: "UNSAT_CANDIDATE_V1",

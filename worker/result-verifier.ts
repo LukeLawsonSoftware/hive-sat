@@ -4,7 +4,12 @@ import {
   decodeSatModelArtifact,
   MAX_SAT_MODEL_ARTIFACT_BYTES,
   type SatResultManifest,
+  MAX_SERVER_PROOF_COMPRESSED_BYTES,
+  MAX_SERVER_PROOF_DECOMPRESSED_BYTES,
+  unsatProofObjectKey,
+  type UnsatProofManifest,
 } from "../shared/result-manifest";
+import { verifyTextLrat } from "../shared/lrat-check";
 
 const MAX_ENCODED_FORMULA_BYTES = 32 * 1024 * 1024;
 const MAX_LITERAL_CHECKS = 2_000_064;
@@ -25,6 +30,22 @@ export type VerifySatResult =
       status: "INVALID_FORMULA" | "INVALID_MODEL" | "VERIFICATION_TIMEOUT";
       reason: string;
     };
+
+export interface VerifyUnsatInput {
+  jobId: string;
+  formulaObjectKey: string;
+  manifest: UnsatProofManifest;
+  expectedCube: number[];
+  maxCompressedBytes?: number;
+  maxDecompressedBytes?: number;
+  maxDerivedClauses?: number;
+  maxHints?: number;
+}
+
+export type VerifyUnsatResult =
+  | { status: "VALID_UNSAT"; derivedClauses: number; checkedHints: number }
+  | { status: "OWNER_CHECK_REQUIRED"; reason: string }
+  | { status: "INVALID_FORMULA" | "INVALID_PROOF" | "VERIFICATION_TIMEOUT"; reason: string };
 
 interface DecodedFormula {
   variableCount: number;
@@ -193,5 +214,83 @@ export class ResultVerifierDO extends DurableObject<Env> {
       }
     }
     return { status: "VALID_SAT", checkedClauses: formula.clauses.length, checkedLiterals };
+  }
+
+  async verifyUnsat(input: VerifyUnsatInput): Promise<VerifyUnsatResult> {
+    if (!equalCube(input.manifest.cube, input.expectedCube)) {
+      return { status: "INVALID_PROOF", reason: "The proof is not bound to the expected cube." };
+    }
+    if (input.manifest.compressedBytes > (input.maxCompressedBytes ?? MAX_SERVER_PROOF_COMPRESSED_BYTES) ||
+      input.manifest.decompressedBytes > (input.maxDecompressedBytes ?? MAX_SERVER_PROOF_DECOMPRESSED_BYTES)) {
+      return { status: "OWNER_CHECK_REQUIRED", reason: "The proof exceeds conservative server verification limits." };
+    }
+
+    const proofObject = await this.env.FORMULAS.get(
+      unsatProofObjectKey(input.jobId, input.manifest.artifactId),
+    );
+    if (!proofObject?.body) return { status: "INVALID_PROOF", reason: "The proof artifact is missing." };
+    let compressed: Uint8Array;
+    try {
+      compressed = await collectBounded(
+        proofObject.body,
+        input.maxCompressedBytes ?? MAX_SERVER_PROOF_COMPRESSED_BYTES,
+        "LRAT proof",
+      );
+    } catch (error) {
+      return { status: "VERIFICATION_TIMEOUT", reason: String(error) };
+    }
+    if (compressed.byteLength !== input.manifest.compressedBytes ||
+      await sha256Hex(compressed) !== input.manifest.artifactSha256) {
+      return { status: "INVALID_PROOF", reason: "The proof artifact does not match its manifest." };
+    }
+    let proofBytes: Uint8Array;
+    try {
+      proofBytes = await collectBounded(
+        new Response(compressed.slice().buffer as ArrayBuffer).body!
+          .pipeThrough(new DecompressionStream("gzip")),
+        input.maxDecompressedBytes ?? MAX_SERVER_PROOF_DECOMPRESSED_BYTES,
+        "decompressed LRAT proof",
+      );
+    } catch (error) {
+      return { status: "INVALID_PROOF", reason: String(error) };
+    }
+    if (proofBytes.byteLength !== input.manifest.decompressedBytes) {
+      return { status: "INVALID_PROOF", reason: "The decompressed proof length does not match its manifest." };
+    }
+
+    const formulaObject = await this.env.FORMULAS.get(input.formulaObjectKey);
+    if (!formulaObject?.body) return { status: "INVALID_FORMULA", reason: "The formula artifact is missing." };
+    let formula: DecodedFormula;
+    try {
+      const encoded = await collectBounded(
+        formulaObject.body.pipeThrough(new DecompressionStream("gzip")),
+        MAX_ENCODED_FORMULA_BYTES,
+        "HiveCnfV1 formula",
+      );
+      if (await sha256Hex(encoded) !== input.manifest.formulaHash) {
+        throw new Error("The formula hash does not match its declaration.");
+      }
+      formula = decodeHiveCnfV1(encoded);
+    } catch (error) {
+      return { status: "INVALID_FORMULA", reason: String(error) };
+    }
+    if (input.manifest.originalClauseCount !== formula.clauses.length ||
+      input.manifest.cubeClauseIds.some((id, index) => id !== formula.clauses.length + index + 1)) {
+      return { status: "INVALID_PROOF", reason: "The proof clause IDs are not bound to the formula and cube." };
+    }
+    const proofFormula = [...formula.clauses, ...input.expectedCube.map((literal) => [literal])];
+    const checked = verifyTextLrat(proofFormula, new TextDecoder().decode(proofBytes), {
+      maxProofBytes: input.maxDecompressedBytes ?? MAX_SERVER_PROOF_DECOMPRESSED_BYTES,
+      maxDerivedClauses: input.maxDerivedClauses ?? 100_000,
+      maxHints: input.maxHints ?? 1_000_000,
+    });
+    if (checked.limitExceeded) {
+      return { status: "VERIFICATION_TIMEOUT", reason: checked.reason ?? "The verifier budget was exhausted." };
+    }
+    if (checked.requiresFullChecker) {
+      return { status: "OWNER_CHECK_REQUIRED", reason: checked.reason ?? "The full checker is required." };
+    }
+    if (!checked.valid) return { status: "INVALID_PROOF", reason: checked.reason ?? "The LRAT proof is invalid." };
+    return { status: "VALID_UNSAT", derivedClauses: checked.derivedClauses, checkedHints: checked.checkedHints };
   }
 }

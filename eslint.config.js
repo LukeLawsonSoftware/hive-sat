@@ -9,6 +9,7 @@ export default defineConfig([
   globalIgnores([
     "dist",
     ".build",
+    ".cache",
     ".wrangler",
     "coverage",
     ".pnpm-store",

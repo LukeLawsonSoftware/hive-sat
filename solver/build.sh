@@ -79,7 +79,29 @@ LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=0 "$HIVESAT_EMXX" -O3 \
   -sEXPORTED_RUNTIME_METHODS='["FS","UTF8ToString","HEAP32","stringToNewUTF8"]' \
   -o "$HIVESAT_OUTPUT_DIR/cadical.mjs"
 
+printf '%s  %s\n' "$HIVESAT_LRAT_CHECK_SHA256" \
+  "$HIVESAT_REPO_ROOT/solver/vendor/drat-trim/lrat-check.c" | shasum -a 256 -c -
+LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=0 "$HIVESAT_EMCC" -O3 \
+  -ffile-prefix-map="$HIVESAT_REPO_ROOT"=/usr/src/hivesat \
+  "$HIVESAT_REPO_ROOT/solver/vendor/drat-trim/lrat-check.c" \
+  -sMODULARIZE=1 \
+  -sEXPORT_ES6=1 \
+  -sENVIRONMENT=web,worker,node \
+  -sALLOW_MEMORY_GROWTH=1 \
+  -sMAXIMUM_MEMORY=536870912 \
+  -sFILESYSTEM=1 \
+  -sFORCE_FILESYSTEM=1 \
+  -sINVOKE_RUN=0 \
+  -sEXIT_RUNTIME=1 \
+  -sDYNAMIC_EXECUTION=0 \
+  -sEXPORTED_RUNTIME_METHODS='["FS","callMain"]' \
+  -o "$HIVESAT_OUTPUT_DIR/lrat-check.mjs"
+# Emscripten emits one whitespace-only line in this entrypoint build. Normalize
+# it so the committed generated module also passes repository diff checks.
+perl -pi -e 's/[ \t]+$//' "$HIVESAT_OUTPUT_DIR/lrat-check.mjs"
+
 cp "$HIVESAT_REPO_ROOT/solver/THIRD_PARTY_NOTICES.md" "$HIVESAT_OUTPUT_DIR/THIRD_PARTY_NOTICES.md"
-(cd "$HIVESAT_OUTPUT_DIR" && shasum -a 256 cadical.mjs cadical.wasm > SHA256SUMS)
+(cd "$HIVESAT_OUTPUT_DIR" && \
+  shasum -a 256 cadical.mjs cadical.wasm lrat-check.mjs lrat-check.wasm > SHA256SUMS)
 printf 'Built CaDiCaL %s with Emscripten %s\n' \
   "$HIVESAT_CADICAL_VERSION" "$HIVESAT_EMSCRIPTEN_VERSION"

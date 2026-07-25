@@ -8,6 +8,8 @@ import {
 import { VerifiedFormulaCache, type CachedFormula } from "./formula/cache";
 import { decodeHiveCnfV1, sha256Hex } from "./formula/hiveCnf";
 import { MAX_COMPRESSED_FORMULA_BYTES, MAX_ENCODED_FORMULA_BYTES } from "./formula/limits";
+import { MAX_UNSAT_PROOF_DECOMPRESSED_BYTES } from "../../shared/result-manifest";
+import { verifyWithPinnedLratChecker } from "./lratChecker";
 
 const DATABASE_NAME = "hivesat-public-jobs";
 const DATABASE_VERSION = 1;
@@ -203,6 +205,46 @@ export async function cancelPublicJob(
     method: "POST",
     headers: { authorization: `Bearer ${ownerToken}` },
   }));
+}
+
+export async function verifyAndConfirmOwnerProof(
+  jobId: string,
+  ownerToken: string,
+  status: PublicJobStatus,
+  fetcher: typeof fetch = fetch,
+): Promise<PublicJobStatus> {
+  const certificate = status.certificate;
+  if (!certificate || certificate.verification !== "OWNER_CHECK_REQUIRED") {
+    throw new Error("This job does not have a proof awaiting owner verification.");
+  }
+  const response = await fetcher(certificate.downloadUrl);
+  if (!response.ok || !response.body) throw new Error("The LRAT certificate could not be downloaded.");
+  const compressed = await collectBounded(response.body, certificate.compressedBytes, "proof compressed-byte");
+  if (compressed.byteLength !== certificate.compressedBytes || await sha256Hex(compressed) !== certificate.artifactSha256) {
+    throw new Error("The downloaded LRAT certificate does not match its public manifest.");
+  }
+  const proofStream = new Response(compressed.slice().buffer as ArrayBuffer).body;
+  if (!proofStream) throw new Error("The LRAT certificate could not be decompressed.");
+  const proofBytes = await collectBounded(
+    proofStream.pipeThrough(new DecompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>),
+    Math.min(certificate.decompressedBytes, MAX_UNSAT_PROOF_DECOMPRESSED_BYTES),
+    "proof decompressed-byte",
+  );
+  if (proofBytes.byteLength !== certificate.decompressedBytes) {
+    throw new Error("The decompressed LRAT certificate length is invalid.");
+  }
+  const encodedFormula = await downloadVerifiedPublicFormula(jobId, fetcher);
+  decodeHiveCnfV1(encodedFormula);
+  await verifyWithPinnedLratChecker({ encodedFormula, cube: certificate.cube, proof: proofBytes });
+  await apiJson(await fetcher(`${certificate.downloadUrl}/owner-verify`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${ownerToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ artifactSha256: certificate.artifactSha256 }),
+  }));
+  return getPublicJob(jobId, fetcher);
 }
 
 async function collectBounded(stream: ReadableStream<Uint8Array>, limit: number, label: string): Promise<Uint8Array> {

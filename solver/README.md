@@ -3,7 +3,8 @@
 This directory owns the Phase 2 solver gate. `versions.env` pins CaDiCaL
 3.0.1 and Emscripten 4.0.10 by source URL and SHA-256. `build.sh` verifies
 those archives, builds a single-threaded ES-module Wasm binary, and writes the
-committed runtime to `public/solver`. No pthread, Wasm Worker, or
+committed runtime to `public/solver`. The same build compiles the pinned
+DRAT-trim `lrat-check.c` into a browser-compatible checker module. No pthread, Wasm Worker, or
 `SharedArrayBuffer` build option is enabled.
 
 Run:
@@ -47,11 +48,10 @@ high-water telemetry.
 
 ## Proof and portability scope
 
-The gate emits text LRAT for a known UNSAT formula and validates it with the
-independent TypeScript RUP-chain checker in `src/lib/lrat.ts`. That checker is
-intentionally a feasibility test, not the production proof checker; Phase 10
-still owns the independently pinned DRAT-trim `lrat-check.c` integration and
-all proof-size/resource controls.
+The solver emits text LRAT for `F ∧ cube`. Phase 10 pins the upstream
+DRAT-trim `lrat-check.c` commit and compiles it beside the solver. Browser
+owner checks and bounded verifier checks share the fail-closed LRAT contract;
+CI byte-compares both Wasm artifacts and checks the vendored source digest.
 
 CI runs the same browser suite in current Google Chrome, Mozilla Firefox,
 Microsoft Edge, and Playwright WebKit (the automation-compatible Safari

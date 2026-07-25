@@ -25,18 +25,23 @@ import {
 import { PUBLIC_JOB_PROTOCOL_VERSION } from "../shared/public-jobs";
 import {
   MAX_SAT_MODEL_ARTIFACT_BYTES,
+  MAX_UNSAT_PROOF_COMPRESSED_BYTES,
+  MAX_UNSAT_PROOF_DECOMPRESSED_BYTES,
   resultPathHash,
   satModelObjectKey,
+  unsatProofObjectKey,
+  type UnsatProofManifest,
 } from "../shared/result-manifest";
 import type {
   InitializeJobInput,
   ModelUploadAuthorization,
+  ProofUploadAuthorization,
   OwnerActionResult,
   PublicJobStatus,
   UploadAuthorization,
 } from "./contracts";
 import { fixedTimeHexEqual, randomToken } from "./crypto";
-import type { VerifySatResult } from "./result-verifier";
+import type { VerifySatResult, VerifyUnsatResult } from "./result-verifier";
 import { calibratedTaskProfile } from "../shared/capability-profile";
 
 interface JobRow {
@@ -68,6 +73,19 @@ interface TaskRow {
   updated_at: number;
   attempt_count: number;
   active_lease_id: string | null;
+  proof_required: number;
+}
+
+interface ProofArtifactRow {
+  [key: string]: SqlStorageValue;
+  artifact_id: string;
+  task_id: string;
+  lease_id: string;
+  artifact_sha256: string;
+  compressed_bytes: number;
+  decompressed_bytes: number;
+  verification_status: "UPLOADED" | "SERVER_CERTIFIED" | "OWNER_CHECK_REQUIRED" | "OWNER_VERIFIED" | "INVALID";
+  created_at: number;
 }
 
 interface LeaseRow {
@@ -241,6 +259,23 @@ export class JobCoordinatorDO extends DurableObject<Env> {
         INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (4, unixepoch('now') * 1000);
       `);
     }
+    if (version < 5) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE tasks ADD COLUMN proof_required INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE proof_artifacts (
+          artifact_id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL,
+          lease_id TEXT NOT NULL,
+          artifact_sha256 TEXT NOT NULL,
+          compressed_bytes INTEGER NOT NULL,
+          decompressed_bytes INTEGER NOT NULL,
+          verification_status TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX proof_artifacts_task ON proof_artifacts(task_id, verification_status);
+        INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (5, unixepoch('now') * 1000);
+      `);
+    }
   }
 
   async initialize(input: InitializeJobInput): Promise<void> {
@@ -289,6 +324,12 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     const root = this.ctx.storage.sql.exec<{ state: TaskState }>(
       "SELECT state FROM tasks WHERE task_id = 'root'",
     ).one();
+    const certificate = this.ctx.storage.sql.exec<ProofArtifactRow>(
+      `SELECT * FROM proof_artifacts
+       WHERE verification_status IN ('SERVER_CERTIFIED', 'OWNER_CHECK_REQUIRED', 'OWNER_VERIFIED')
+       ORDER BY CASE verification_status WHEN 'OWNER_CHECK_REQUIRED' THEN 0 ELSE 1 END,
+                created_at ASC LIMIT 1`,
+    ).toArray()[0];
     return {
       protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       jobId: row.job_id,
@@ -305,6 +346,16 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       expiresAt: row.expires_at,
       uploadedBytes: row.uploaded_bytes,
       rootTaskState: root.state,
+      certificate: certificate ? {
+        artifactId: certificate.artifact_id,
+        artifactSha256: certificate.artifact_sha256,
+        compressedBytes: certificate.compressed_bytes,
+        decompressedBytes: certificate.decompressed_bytes,
+        cube: parseAssumptions(this.task(certificate.task_id)?.assumptions_json ?? "[]"),
+        verification: certificate.verification_status as
+          "SERVER_CERTIFIED" | "OWNER_CHECK_REQUIRED" | "OWNER_VERIFIED",
+        downloadUrl: `/api/v1/jobs/${encodeURIComponent(row.job_id)}/proofs/${encodeURIComponent(certificate.artifact_id)}`,
+      } : null,
     };
   }
 
@@ -346,7 +397,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     if (!job || !lease || !task) return { ok: false, code: "NOT_FOUND" };
     if (
       Date.now() >= job.expires_at ||
-      ["CANCELLED", "INVALID", "SAT_VERIFIED", "UNKNOWN"].includes(job.state) ||
+      ["CANCELLED", "INVALID", "SAT_VERIFIED", "UNSAT_CERTIFIED", "UNSAT_OWNER_VERIFIED", "UNKNOWN"].includes(job.state) ||
       task.state === "CANCELLED"
     ) {
       return { ok: false, code: "INVALID_STATE" };
@@ -359,6 +410,107 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       task: this.toCubeTask(task),
       maximumBytes: MAX_SAT_MODEL_ARTIFACT_BYTES,
     };
+  }
+
+  authorizeProofUpload(leaseId: string, decompressedBytes: number): ProofUploadAuthorization {
+    const job = this.job();
+    const lease = this.ctx.storage.sql.exec<LeaseRow>(
+      "SELECT * FROM leases WHERE lease_id = ?",
+      leaseId,
+    ).toArray()[0];
+    const task = lease ? this.task(lease.task_id) : null;
+    if (!job || !lease || !task) return { ok: false, code: "NOT_FOUND" };
+    if (lease.status !== "ACTIVE" || task.active_lease_id !== leaseId || task.proof_required !== 1 ||
+      task.state !== "LEASED" || Date.now() >= job.expires_at ||
+      decompressedBytes < 1 || decompressedBytes > MAX_UNSAT_PROOF_DECOMPRESSED_BYTES) {
+      return { ok: false, code: "INVALID_STATE" };
+    }
+    const used = this.ctx.storage.sql.exec<{ total: number }>(
+      "SELECT COALESCE(SUM(compressed_bytes), 0) AS total FROM proof_artifacts",
+    ).one().total;
+    const remaining = MAX_UNSAT_PROOF_COMPRESSED_BYTES - used;
+    if (remaining < 1) return { ok: false, code: "PROOF_BUDGET_EXHAUSTED" };
+    return {
+      ok: true,
+      objectKey: unsatProofObjectKey(job.job_id, leaseId),
+      jobId: job.job_id,
+      formulaHash: job.formula_hash,
+      task: this.toCubeTask(task),
+      maximumCompressedBytes: remaining,
+      maximumDecompressedBytes: MAX_UNSAT_PROOF_DECOMPRESSED_BYTES,
+    };
+  }
+
+  recordProofUpload(
+    leaseId: string,
+    artifactSha256: string,
+    compressedBytes: number,
+    decompressedBytes: number,
+  ): boolean {
+    const authorization = this.authorizeProofUpload(leaseId, decompressedBytes);
+    if (!authorization.ok || compressedBytes < 1 || compressedBytes > authorization.maximumCompressedBytes) return false;
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO proof_artifacts (
+        artifact_id, task_id, lease_id, artifact_sha256, compressed_bytes,
+        decompressed_bytes, verification_status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'UPLOADED', ?)`,
+      leaseId,
+      authorization.task.taskId,
+      leaseId,
+      artifactSha256,
+      compressedBytes,
+      decompressedBytes,
+      Date.now(),
+    );
+    return true;
+  }
+
+  proofDownload(artifactId: string): { objectKey: string; sha256: string } | null {
+    const job = this.job();
+    const proof = this.ctx.storage.sql.exec<ProofArtifactRow>(
+      `SELECT * FROM proof_artifacts WHERE artifact_id = ?
+       AND verification_status IN ('SERVER_CERTIFIED', 'OWNER_CHECK_REQUIRED', 'OWNER_VERIFIED')`,
+      artifactId,
+    ).toArray()[0];
+    if (!job || !proof) return null;
+    return { objectKey: unsatProofObjectKey(job.job_id, artifactId), sha256: proof.artifact_sha256 };
+  }
+
+  confirmOwnerProof(
+    ownerDigest: string,
+    artifactId: string,
+    artifactSha256: string,
+  ): { ok: boolean; state?: PublicJobStatus["state"]; code?: string } {
+    const job = this.job();
+    const proof = this.ctx.storage.sql.exec<ProofArtifactRow>(
+      "SELECT * FROM proof_artifacts WHERE artifact_id = ?",
+      artifactId,
+    ).toArray()[0];
+    if (!job || !proof) return { ok: false, code: "NOT_FOUND" };
+    if (!fixedTimeHexEqual(ownerDigest, job.owner_digest)) return { ok: false, code: "INVALID_TOKEN" };
+    if (proof.verification_status !== "OWNER_CHECK_REQUIRED" ||
+      !fixedTimeHexEqual(artifactSha256, proof.artifact_sha256)) {
+      return { ok: false, code: "INVALID_STATE" };
+    }
+    const now = Date.now();
+    let terminal: "UNSAT_CERTIFIED" | "UNSAT_OWNER_VERIFIED" | null = null;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "UPDATE proof_artifacts SET verification_status = 'OWNER_VERIFIED' WHERE artifact_id = ?",
+        artifactId,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE tasks SET state = 'UNSAT_OWNER_VERIFIED', updated_at = ? WHERE task_id = ? AND state = 'VERIFYING_UNSAT'",
+        now,
+        proof.task_id,
+      );
+      terminal = this.propagateUnsatCoverage(this.task(proof.task_id)?.parent_task_id ?? null, now);
+    });
+    if (terminal) {
+      this.broadcast({ ...this.serverBase(job.job_id), type: "JOB_RESULT", result: terminal, taskId: "root" });
+      void this.env.SWARM_DIRECTORY.getByName("global-v1").close(job.job_id);
+    }
+    return { ok: true, state: this.job()?.state ?? "RUNNING" };
   }
 
   async cancel(ownerDigest: string): Promise<OwnerActionResult> {
@@ -383,8 +535,8 @@ export class JobCoordinatorDO extends DurableObject<Env> {
         type: "JOB_CANCELLED",
         reason: "OWNER_CANCELLED",
       });
-      const modelKeys = this.modelObjectKeys(row.job_id);
-      if (modelKeys.length > 0) await this.env.FORMULAS.delete(modelKeys);
+      const artifactKeys = [...this.modelObjectKeys(row.job_id), ...this.proofObjectKeys(row.job_id)];
+      if (artifactKeys.length > 0) await this.env.FORMULAS.delete(artifactKeys);
       await this.scheduleNextAlarm();
     }
     return { ok: true, changed, objectKey: row.object_key };
@@ -484,7 +636,11 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       if (!this.env.FORMULAS || !this.env.SWARM_DIRECTORY) {
         throw new Error("Job cleanup bindings are not configured.");
       }
-      await this.env.FORMULAS.delete([row.object_key, ...this.modelObjectKeys(row.job_id)]);
+      await this.env.FORMULAS.delete([
+        row.object_key,
+        ...this.modelObjectKeys(row.job_id),
+        ...this.proofObjectKeys(row.job_id),
+      ]);
       await this.env.SWARM_DIRECTORY.getByName("global-v1").close(row.job_id);
       await this.ctx.storage.deleteAll();
       this.deleted = true;
@@ -605,14 +761,14 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       const job = this.job();
       const task = job && (job.state === "QUEUED" || job.state === "RUNNING")
         ? this.ctx.storage.sql.exec<TaskRow>(
-          "SELECT * FROM tasks WHERE state = 'READY' AND attempt_count < ? ORDER BY depth, created_at, task_id LIMIT 1",
+          "SELECT * FROM tasks WHERE state = 'READY' AND attempt_count < ? ORDER BY proof_required, depth, created_at, task_id LIMIT 1",
           COORDINATOR_MAX_TASK_ATTEMPTS,
         ).toArray()[0]
         : undefined;
       let response: CoordinatorServerMessage;
       const exhausted = job && !task && (job.state === "QUEUED" || job.state === "RUNNING")
         ? this.ctx.storage.sql.exec<TaskRow>(
-          "SELECT * FROM tasks WHERE state = 'READY' AND attempt_count >= ? ORDER BY depth, created_at, task_id LIMIT 1",
+          "SELECT * FROM tasks WHERE state = 'READY' AND attempt_count >= ? ORDER BY proof_required, depth, created_at, task_id LIMIT 1",
           COORDINATOR_MAX_TASK_ATTEMPTS,
         ).toArray()[0]
         : undefined;
@@ -668,7 +824,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
           task.task_id,
         );
         this.ctx.storage.sql.exec("UPDATE jobs SET state = 'RUNNING' WHERE state = 'QUEUED'");
-        const queue = this.queueSnapshot(task.depth);
+        const queue = this.queueSnapshot(task.depth, task.proof_required === 1);
         response = {
           ...this.serverBase(message.jobId, now),
           type: "WORK",
@@ -744,7 +900,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       const lease = this.activeLease(sessionId, message.taskId, message.leaseId, now);
       const task = lease ? this.task(message.taskId) : null;
       const job = this.job();
-      if (!lease || !task || !job || task.depth >= COORDINATOR_MAX_CUBE_DEPTH) {
+      if (!lease || !task || !job || task.depth >= COORDINATOR_MAX_CUBE_DEPTH || task.proof_required === 1) {
         return this.errorResponse(message.jobId, lease ? "INVALID_STATE" : "STALE_LEASE", false, message.messageId).serialized;
       }
       const taskCount = this.ctx.storage.sql.exec<{ total: number }>(
@@ -843,7 +999,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       !task ||
       !job ||
       now >= job.expires_at ||
-      ["CANCELLED", "INVALID", "SAT_VERIFIED", "UNKNOWN"].includes(job.state) ||
+      ["CANCELLED", "INVALID", "SAT_VERIFIED", "UNSAT_CERTIFIED", "UNSAT_OWNER_VERIFIED", "UNKNOWN"].includes(job.state) ||
       task.state === "CANCELLED"
     ) {
       return this.errorResponse(message.jobId, "INVALID_STATE", false, message.messageId);
@@ -1026,14 +1182,20 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     };
   }
 
-  private handleUnsatResult(
+  private async handleUnsatResult(
     sessionId: string,
     message: ResultMessage,
     lease: LeaseRow,
     task: TaskRow,
     stale: boolean,
     now: number,
-  ): HandledResponse {
+  ): Promise<HandledResponse> {
+    if (message.manifest.kind === "UNSAT_PROOF_V1") {
+      return this.handleUnsatProof(sessionId, message, lease, task, stale, now, message.manifest);
+    }
+    if (task.proof_required === 1 || message.manifest.kind !== "UNSAT_CANDIDATE_V1") {
+      return this.errorResponse(message.jobId, "INVALID_STATE", false, message.messageId);
+    }
     const serialized = this.ctx.storage.transactionSync(() => {
       const duplicate = this.processedResponse(sessionId, message.messageId);
       if (duplicate) return duplicate;
@@ -1059,7 +1221,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       if (task.state !== "VERIFYING_SAT") {
         if (independentSolves >= 2) {
           this.ctx.storage.sql.exec(
-            "UPDATE tasks SET state = 'UNSAT_CANDIDATE', active_lease_id = NULL, updated_at = ? WHERE task_id = ?",
+            "UPDATE tasks SET state = 'READY', proof_required = 1, active_lease_id = NULL, updated_at = ? WHERE task_id = ?",
             now,
             task.task_id,
           );
@@ -1068,7 +1230,6 @@ export class JobCoordinatorDO extends DurableObject<Env> {
             lease.lease_id,
             task.task_id,
           );
-          this.propagateUnsatCoverage(task.parent_task_id, now);
         } else if (reportingCurrentLease) {
           const nextState: TaskState =
             task.attempt_count >= COORDINATOR_MAX_TASK_ATTEMPTS ? "UNKNOWN" : "READY";
@@ -1098,16 +1259,113 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     return { serialized, deadlineChanged: true };
   }
 
-  private propagateUnsatCoverage(parentTaskId: string | null, now: number): void {
+  private async handleUnsatProof(
+    sessionId: string,
+    message: ResultMessage,
+    lease: LeaseRow,
+    task: TaskRow,
+    stale: boolean,
+    now: number,
+    manifest: UnsatProofManifest,
+  ): Promise<HandledResponse> {
+    if (task.proof_required !== 1 || manifest.artifactId !== lease.lease_id) {
+      return this.errorResponse(message.jobId, "INVALID_STATE", false, message.messageId);
+    }
+    const artifact = this.ctx.storage.sql.exec<ProofArtifactRow>(
+      "SELECT * FROM proof_artifacts WHERE artifact_id = ? AND task_id = ?",
+      manifest.artifactId,
+      task.task_id,
+    ).toArray()[0];
+    if (!artifact || artifact.artifact_sha256 !== manifest.artifactSha256 ||
+      artifact.compressed_bytes !== manifest.compressedBytes ||
+      artifact.decompressed_bytes !== manifest.decompressedBytes) {
+      return this.errorResponse(message.jobId, "INVALID_STATE", false, message.messageId);
+    }
+    const job = this.job();
+    if (!job) return this.errorResponse(message.jobId, "INVALID_STATE", false, message.messageId);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "UPDATE tasks SET state = 'VERIFYING_UNSAT', active_lease_id = NULL, updated_at = ? WHERE task_id = ?",
+        now,
+        task.task_id,
+      );
+      this.ctx.storage.sql.exec("UPDATE leases SET status = 'RESULT' WHERE lease_id = ?", lease.lease_id);
+    });
+    let verification: VerifyUnsatResult;
+    try {
+      verification = await this.env.RESULT_VERIFIERS
+        .getByName(`${job.job_id}:${task.task_id}:${manifest.artifactSha256}`)
+        .verifyUnsat({
+          jobId: job.job_id,
+          formulaObjectKey: job.object_key,
+          manifest,
+          expectedCube: parseAssumptions(task.assumptions_json),
+        });
+    } catch (error) {
+      verification = { status: "VERIFICATION_TIMEOUT", reason: `Verifier unavailable: ${String(error)}` };
+    }
+    const finishedAt = Date.now();
+    let terminal: "UNSAT_CERTIFIED" | "UNSAT_OWNER_VERIFIED" | null = null;
+    this.ctx.storage.transactionSync(() => {
+      if (verification.status === "VALID_UNSAT") {
+        this.ctx.storage.sql.exec(
+          "UPDATE proof_artifacts SET verification_status = 'SERVER_CERTIFIED' WHERE artifact_id = ?",
+          manifest.artifactId,
+        );
+        this.ctx.storage.sql.exec(
+          "UPDATE tasks SET state = 'UNSAT_CERTIFIED', updated_at = ? WHERE task_id = ?",
+          finishedAt,
+          task.task_id,
+        );
+        terminal = this.propagateUnsatCoverage(task.parent_task_id, finishedAt);
+      } else if (verification.status === "OWNER_CHECK_REQUIRED") {
+        this.ctx.storage.sql.exec(
+          "UPDATE proof_artifacts SET verification_status = 'OWNER_CHECK_REQUIRED' WHERE artifact_id = ?",
+          manifest.artifactId,
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          "UPDATE proof_artifacts SET verification_status = 'INVALID' WHERE artifact_id = ?",
+          manifest.artifactId,
+        );
+        this.ctx.storage.sql.exec(
+          "UPDATE tasks SET state = 'UNKNOWN', proof_required = 0, updated_at = ? WHERE task_id = ?",
+          finishedAt,
+          task.task_id,
+        );
+        if (task.task_id === "root") this.ctx.storage.sql.exec("UPDATE jobs SET state = 'UNKNOWN'");
+      }
+      const response: CoordinatorServerMessage = {
+        ...this.serverBase(message.jobId, finishedAt),
+        type: "ACK",
+        requestMessageId: message.messageId,
+        action: "RESULT",
+        staleLease: stale,
+      };
+      this.recordProcessed(sessionId, message.messageId, JSON.stringify(response), finishedAt);
+    });
+    if (terminal) {
+      this.broadcast({ ...this.serverBase(job.job_id), type: "JOB_RESULT", result: terminal, taskId: "root" });
+      await this.env.SWARM_DIRECTORY.getByName("global-v1").close(job.job_id);
+    }
+    return {
+      serialized: this.processedResponse(sessionId, message.messageId) ??
+        this.errorResponse(message.jobId, "INVALID_STATE", false, message.messageId).serialized,
+      deadlineChanged: true,
+    };
+  }
+
+  private propagateUnsatCoverage(parentTaskId: string | null, now: number): "UNSAT_CERTIFIED" | "UNSAT_OWNER_VERIFIED" | null {
     let parentId = parentTaskId;
     while (parentId) {
       const parent = this.task(parentId);
-      if (!parent || parent.state !== "SPLIT") return;
+      if (!parent || parent.state !== "SPLIT") return null;
       const children = this.ctx.storage.sql.exec<TaskRow>(
         "SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY task_id",
         parentId,
       ).toArray();
-      if (children.length !== 2 || children.some((child) => child.state !== "UNSAT_CANDIDATE")) return;
+      if (children.length !== 2 || children.some((child) =>
+        child.state !== "UNSAT_CERTIFIED" && child.state !== "UNSAT_OWNER_VERIFIED")) return null;
       const parentCube = parseAssumptions(parent.assumptions_json);
       const left = parseAssumptions(children[0].assumptions_json);
       const right = parseAssumptions(children[1].assumptions_json);
@@ -1116,14 +1374,38 @@ export class JobCoordinatorDO extends DurableObject<Env> {
         parentCube.every((literal, index) => left[index] === literal && right[index] === literal);
       const leftBranch = left[left.length - 1];
       const rightBranch = right[right.length - 1];
-      if (!prefixIntact || leftBranch === undefined || rightBranch === undefined || leftBranch !== -rightBranch) return;
+      if (!prefixIntact || leftBranch === undefined || rightBranch === undefined || leftBranch !== -rightBranch) return null;
+      const state: TaskState = children.some((child) => child.state === "UNSAT_OWNER_VERIFIED")
+        ? "UNSAT_OWNER_VERIFIED"
+        : "UNSAT_CERTIFIED";
       this.ctx.storage.sql.exec(
-        "UPDATE tasks SET state = 'UNSAT_CANDIDATE', updated_at = ? WHERE task_id = ? AND state = 'SPLIT'",
+        "UPDATE tasks SET state = ?, updated_at = ? WHERE task_id = ? AND state = 'SPLIT'",
+        state,
         now,
         parentId,
       );
+      if (parentId === "root") {
+        this.closeUnsatJob(state, now);
+        return state;
+      }
       parentId = parent.parent_task_id;
     }
+    const root = this.task("root");
+    if (root?.state === "UNSAT_CERTIFIED" || root?.state === "UNSAT_OWNER_VERIFIED") {
+      this.closeUnsatJob(root.state, now);
+      return root.state;
+    }
+    return null;
+  }
+
+  private closeUnsatJob(state: "UNSAT_CERTIFIED" | "UNSAT_OWNER_VERIFIED", now: number): void {
+    this.ctx.storage.sql.exec("UPDATE jobs SET state = ?", state);
+    this.ctx.storage.sql.exec(
+      `UPDATE tasks SET state = 'CANCELLED', active_lease_id = NULL, updated_at = ?
+       WHERE state IN ('READY', 'LEASED', 'YIELDED', 'PROOF_PENDING')`,
+      now,
+    );
+    this.ctx.storage.sql.exec("UPDATE leases SET status = 'SUPERSEDED' WHERE status = 'ACTIVE'");
   }
 
   private activeLease(sessionId: string, taskId: string, leaseId: string, now: number): LeaseRow | null {
@@ -1173,12 +1455,19 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     ).toArray().map((row) => satModelObjectKey(jobId, row.lease_id));
   }
 
+  private proofObjectKeys(jobId: string): string[] {
+    return this.ctx.storage.sql.exec<{ artifact_id: string }>(
+      "SELECT artifact_id FROM proof_artifacts",
+    ).toArray().map((row) => unsatProofObjectKey(jobId, row.artifact_id));
+  }
+
   private toCubeTask(row: TaskRow): CubeTask {
     return {
       taskId: row.task_id,
       parentTaskId: row.parent_task_id,
       depth: row.depth,
       assumptions: parseAssumptions(row.assumptions_json),
+      purpose: row.proof_required === 1 ? "PROOF_FINISHER" : "SEARCH",
     };
   }
 
@@ -1192,7 +1481,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     };
   }
 
-  private queueSnapshot(taskDepth: number) {
+  private queueSnapshot(taskDepth: number, proofRequired = false) {
     const readyTasks = this.ctx.storage.sql.exec<{ total: number }>(
       "SELECT COUNT(*) AS total FROM tasks WHERE state = 'READY'",
     ).one().total;
@@ -1207,7 +1496,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       activeWorkers,
       ...cubeQueueWatermarks(activeWorkers),
       taskCount,
-      canSplit: taskDepth < COORDINATOR_MAX_CUBE_DEPTH && taskCount <= COORDINATOR_MAX_TASKS - 2,
+      canSplit: !proofRequired && taskDepth < COORDINATOR_MAX_CUBE_DEPTH && taskCount <= COORDINATOR_MAX_TASKS - 2,
     };
   }
 

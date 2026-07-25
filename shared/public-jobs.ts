@@ -50,4 +50,13 @@ export interface PublicJobStatus {
   expiresAt: number;
   uploadedBytes: number | null;
   rootTaskState: TaskState;
+  certificate: null | {
+    artifactId: string;
+    artifactSha256: string;
+    compressedBytes: number;
+    decompressedBytes: number;
+    cube: number[];
+    verification: "SERVER_CERTIFIED" | "OWNER_CHECK_REQUIRED" | "OWNER_VERIFIED";
+    downloadUrl: string;
+  };
 }

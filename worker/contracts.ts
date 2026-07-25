@@ -60,6 +60,18 @@ export type ModelUploadAuthorization =
     }
   | { ok: false; code: "NOT_FOUND" | "INVALID_STATE" };
 
+export type ProofUploadAuthorization =
+  | {
+      ok: true;
+      objectKey: string;
+      jobId: string;
+      formulaHash: string;
+      task: CubeTask;
+      maximumCompressedBytes: number;
+      maximumDecompressedBytes: number;
+    }
+  | { ok: false; code: "NOT_FOUND" | "INVALID_STATE" | "PROOF_BUDGET_EXHAUSTED" };
+
 export function formulaObjectKey(jobId: string): string {
   return `jobs/${jobId}/formula.hivecnf.gz`;
 }

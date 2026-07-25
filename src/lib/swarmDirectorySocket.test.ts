@@ -27,7 +27,7 @@ class FakeWebSocket extends EventTarget {
 function serverBase(type: string) {
   return {
     type,
-    protocolVersion: 1,
+    protocolVersion: 2,
     messageId: "server-one",
     requestMessageId: "request-one",
     serverTime: 1,

@@ -160,3 +160,5 @@ propagates to the root as `UNSAT_OWNER_VERIFIED`; otherwise the root is
 Certificates remain downloadable from the public job page so another tool can
 repeat the check independently. The result label tells readers *where* the
 decisive check ran; it never hides that distinction.
+
+Next: [How launch safety contains abuse and quota pressure →](08-launch-hardening.md)

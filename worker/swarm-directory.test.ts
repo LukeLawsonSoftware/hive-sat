@@ -1,4 +1,4 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 let sequence = 0;
@@ -33,6 +33,11 @@ async function readyDirectory(jobCount = 2) {
 describe("SwarmDirectoryDO fair assignment", () => {
   it("reserves virtual worker time, reconciles actual time, and rotates jobs", async () => {
     const { stub, now } = await readyDirectory();
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ id: number }>(
+        "SELECT id FROM _sql_schema_migrations ORDER BY id",
+      ).toArray().map((row) => row.id)).toEqual([1, 2, 3]);
+    });
     const first = await stub.assign("session-a", capabilities(2), undefined, now + 10);
     expect(first).toMatchObject({ ok: true, jobId: "job-0", workers: 2 });
     if (!first.ok) return;
@@ -98,7 +103,7 @@ describe("SwarmDirectoryDO fair assignment", () => {
     });
     socket.send(JSON.stringify({
       type: "SWARM_HELLO",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "directory-request",
       sessionId: "browser-session",
       capabilities: capabilities(1),
@@ -109,5 +114,21 @@ describe("SwarmDirectoryDO fair assignment", () => {
       workers: 1,
     });
     await expect(closed).resolves.toBeUndefined();
+  });
+
+  it("consumes challenge digests once and removes them through the directory alarm", async () => {
+    const stub = env.SWARM_DIRECTORY.getByName(`replay-${++sequence}`);
+    expect(await stub.consumeTurnstile("aa".repeat(32), Date.now() + 60_000)).toBe(true);
+    expect(await stub.consumeTurnstile("aa".repeat(32), Date.now() + 60_000)).toBe(false);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE turnstile_replays SET expires_at = ?", Date.now() - 1);
+      return state.storage.setAlarm(Date.now() + 10_000);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM turnstile_replays",
+      ).one().total).toBe(0);
+    });
   });
 });

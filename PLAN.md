@@ -271,12 +271,27 @@ Exit gate: known UNSAT formulas complete only with valid proof coverage; proof c
 
 Branch: `codex/hivesat-11-launch-hardening`
 
-- Fuzz DIMACS, decompression, WebSocket, API, model, and proof parsers; enforce message, assumption, task, upload, and artifact limits.
-- Add session quarantine, Turnstile replay prevention, HMACed network identifiers, token rotation, CSP/security headers, and structured error responses.
-- Load-test several hundred intermittent clients with realistic 60-second heartbeats and long task leases; verify DO request, duration, row-write, and R2-operation projections remain below configurable safety margins.
-- Add admission and swarm kill switches, maximum active connections/jobs, exponential client backoff, quota dashboards, and operator runbooks.
-- Test expiry and R2 cleanup, schema migration, rolling deployment, older-client rejection, and recovery from partial deployment.
-- Remove simulation copy, enable the public swarm flag, publish privacy/trust limitations, and perform the final production smoke test.
+- [x] Fuzz DIMACS, decompression, WebSocket, API, model, and proof parsers; enforce message, assumption, task, upload, and artifact limits.
+- [x] Add session quarantine, Turnstile replay prevention, HMACed network identifiers, token rotation, CSP/security headers, and structured error responses.
+- [x] Load-test several hundred intermittent clients with realistic 60-second heartbeats and long task leases; verify DO request, duration, row-write, and R2-operation projections remain below configurable safety margins.
+- [x] Add admission and swarm kill switches, maximum active connections/jobs, exponential client backoff, quota dashboards, and operator runbooks.
+- [x] Test expiry and R2 cleanup, schema migration, rolling deployment, older-client rejection, and recovery from partial deployment.
+- [x] Remove simulation copy, enable the public swarm flag, and publish privacy/trust limitations.
+- [ ] Perform the final production smoke test after manual integration. This delivery run explicitly forbids deployments, so no production mutation or smoke test is performed from these stacked branches.
+
+Phase 11 implementation note: the public protocol advances to version 2 and
+rejects older clients before allocation. Swarm Directory internal migration 3
+adds a single-use Turnstile replay ledger and its alarm cleanup. Owner tokens
+can be rotated atomically; invalid models and proofs quarantine sessions;
+production responses carry a Turnstile- and Wasm-compatible restrictive CSP.
+Configurable ceilings default to 100 active jobs, 32 sockets per job, 128
+directory handoff sockets, and an 80% alert margin. `/api/v1/health` exposes a
+bounded quota/configuration snapshot, while both public features remain
+operator kill switches. Deterministic tests cover 600 intermittent clients,
+fuzzed parser inputs, migration ledgers, hibernation recovery, replay, old
+clients, cleanup, and connection saturation. The detailed learning page is
+`docs/guide/08-launch-hardening.md`; operational and trust guidance is in
+`docs/operator-runbook.md` and `docs/privacy-and-trust.md`.
 
 Exit gate: production remains usable when quotas are approached, malicious clients cannot forge terminal results, and all retained artifacts disappear after 24 hours.
 

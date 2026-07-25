@@ -76,7 +76,7 @@ async function send(
 async function hello(socket: WebSocket, jobId: string, sessionId: string) {
   return send(socket, {
     type: "HELLO",
-    protocolVersion: 1,
+    protocolVersion: 2,
     messageId: `hello-${sessionId}`,
     jobId,
     sessionId,
@@ -90,7 +90,7 @@ async function hello(socket: WebSocket, jobId: string, sessionId: string) {
 }
 
 async function requestWork(socket: WebSocket, jobId: string, messageId: string) {
-  return send(socket, { type: "REQUEST_WORK", protocolVersion: 1, messageId, jobId });
+  return send(socket, { type: "REQUEST_WORK", protocolVersion: 2, messageId, jobId });
 }
 
 function expectWork(message: CoordinatorServerMessage | "PONG") {
@@ -147,6 +147,12 @@ describe("JobCoordinatorDO leasing protocol", () => {
     await hello(firstSocket, jobId, "resumable-session");
     const work = expectWork(await requestWork(firstSocket, jobId, "request-resume"));
 
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ id: number }>(
+        "SELECT id FROM _sql_schema_migrations ORDER BY id",
+      ).toArray().map((row) => row.id)).toEqual([1, 2, 3, 4, 5]);
+    });
+
     await evictDurableObject(stub);
     const pong = nextMessage(firstSocket);
     firstSocket.send("PING");
@@ -170,7 +176,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     const heartbeat = {
       type: "HEARTBEAT",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "heartbeat-batch",
       jobId,
       taskId: "root",
@@ -208,7 +214,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     await expect(send(socket, {
       type: "YIELD",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "yield-one",
       jobId,
       taskId: "root",
@@ -225,7 +231,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     });
     await expect(send(socket, {
       type: "SPLIT",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "split-one",
       jobId,
       taskId: "root",
@@ -272,7 +278,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     await expect(send(staleSocket, {
       type: "SPLIT",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "stale-split",
       jobId,
       taskId: "root",
@@ -282,7 +288,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     const result = {
       type: "RESULT",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "stale-result",
       jobId,
       taskId: "root",
@@ -318,7 +324,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     const root = expectWork(await requestWork(splitterSocket, jobId, "root-work"));
     await send(splitterSocket, {
       type: "SPLIT",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "split-root",
       jobId,
       taskId: root.task.taskId,
@@ -368,7 +374,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     const root = expectWork(await requestWork(splitter, jobId, "coverage-root"));
     await send(splitter, {
       type: "SPLIT",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "coverage-split",
       jobId,
       taskId: root.task.taskId,
@@ -391,7 +397,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
       };
       await expect(send(socket, {
         type: "RESULT",
-        protocolVersion: 1,
+        protocolVersion: 2,
         messageId: `coverage-result-${index}`,
         jobId,
         taskId: work.task.taskId,
@@ -471,7 +477,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     await env.FORMULAS.put(satModelObjectKey(jobId, work.lease.leaseId), artifact);
     await expect(send(socket, {
       type: "RESULT",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "invalid-model-result",
       jobId,
       taskId: "root",
@@ -583,5 +589,25 @@ describe("JobCoordinatorDO leasing protocol", () => {
     expect(await runDurableObjectAlarm(ceiling.stub)).toBe(true);
     await expect(ceiling.stub.getStatus()).resolves.toMatchObject({ state: "UNKNOWN", rootTaskState: "UNKNOWN" });
     socket.close(1000, "done");
+  });
+
+  it("fails closed at the configured per-job WebSocket ceiling", async () => {
+    const { stub } = await initializedCoordinator();
+    const sockets: WebSocket[] = [];
+    for (let index = 0; index < 32; index += 1) {
+      const response = await stub.fetch("https://hive-sat.test/socket", {
+        headers: { upgrade: "websocket" },
+      });
+      expect(response.status).toBe(101);
+      if (!response.webSocket) throw new Error("Expected a WebSocket response.");
+      response.webSocket.accept();
+      sockets.push(response.webSocket);
+    }
+    const rejected = await stub.fetch("https://hive-sat.test/socket", {
+      headers: { upgrade: "websocket" },
+    });
+    expect(rejected.status).toBe(503);
+    expect(rejected.headers.get("retry-after")).toBe("30");
+    sockets.forEach((socket) => socket.close(1000, "done"));
   });
 });

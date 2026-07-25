@@ -41,6 +41,9 @@ stops reconnection.
   to decide whether lookahead is useful. The coordinator accepts a split
   literal—not browser-authored children—and constructs both children itself
   after enforcing depth 64 and 10,000-task caps.
+- `WORK.task.purpose` distinguishes ordinary search from a fresh
+  `PROOF_FINISHER`. Proof-finisher work cannot split and must enable LRAT before
+  loading clauses.
 - The default lease is 15 minutes, capped by job expiry. Attempts are capped at
   five. A task whose fifth lease expires becomes `UNKNOWN` instead of being
   retried indefinitely.
@@ -78,5 +81,5 @@ cleanup.
 
 The existing Wrangler namespace migration remains
 `v0001_job_platform` because no Durable Object class was added. Coordinator
-schema migration 2 is append-only inside each SQLite-backed object and adds
-lease, result, processed-message, and task-transition fields.
+internal migrations remain append-only. The current ledger includes leasing,
+result verification, calibrated profiles, and proof-required artifact state.

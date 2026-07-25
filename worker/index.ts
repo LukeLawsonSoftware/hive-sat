@@ -23,6 +23,37 @@ const JOB_ID_PATTERN = /^[A-Za-z0-9_-]{32}$/u;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{20,128}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const SMALL_JSON_LIMIT = 8 * 1024;
+const TURNSTILE_REPLAY_RETENTION_MS = 10 * 60_000;
+
+function withSecurityHeaders(response: Response, production: boolean): Response {
+  if (response.status === 101) return response;
+  const headers = new Headers(response.headers);
+  headers.set("content-security-policy", [
+    "default-src 'self'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com",
+    "frame-src https://challenges.cloudflare.com",
+    "connect-src 'self' https://challenges.cloudflare.com wss:",
+    "img-src 'self' data:",
+    "style-src 'self'",
+    "worker-src 'self' blob:",
+  ].join("; "));
+  headers.set("referrer-policy", "no-referrer");
+  headers.set("permissions-policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("x-frame-options", "DENY");
+  headers.set("cross-origin-opener-policy", "same-origin");
+  headers.set("cross-origin-resource-policy", "same-origin");
+  if (production) headers.set("strict-transport-security", "max-age=31536000; includeSubDomains");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 class ApiError extends Error {
   constructor(
@@ -193,10 +224,17 @@ async function createJob(request: Request, env: Env): Promise<Response> {
   const remoteIp = request.headers.get("cf-connecting-ip") ?? "unknown";
   await validateTurnstile(input.turnstileToken, remoteIp, env);
 
-  const [deviceDigest, networkDigest] = await Promise.all([
+  const [deviceDigest, networkDigest, turnstileDigest] = await Promise.all([
     sha256Hex(input.deviceId),
     hmacSha256Hex(requiredString(env.NETWORK_DIGEST_KEY, "NETWORK_DIGEST_KEY"), remoteIp),
+    sha256Hex(input.turnstileToken),
   ]);
+  if (!await directoryStub(env).consumeTurnstile(
+    turnstileDigest,
+    Date.now() + TURNSTILE_REPLAY_RETENTION_MS,
+  )) {
+    throw new ApiError(403, "TURNSTILE_REPLAY", "This anti-abuse challenge was already used.");
+  }
   const jobId = randomToken(24);
   const ownerToken = randomToken();
   const uploadToken = randomToken();
@@ -470,13 +508,34 @@ async function cancelJob(request: Request, env: Env, jobId: string): Promise<Res
   return json({ jobId, state: "CANCELLED", changed: result.changed });
 }
 
+async function rotateOwnerToken(request: Request, env: Env, jobId: string): Promise<Response> {
+  const currentDigest = await sha256Hex(bearerToken(request));
+  const ownerToken = randomToken();
+  const nextDigest = await sha256Hex(ownerToken);
+  if (!await jobStub(env, jobId).rotateOwnerToken(currentDigest, nextDigest)) {
+    throw new ApiError(403, "INVALID_TOKEN", "The current owner token is not valid.");
+  }
+  return json({ jobId, ownerToken });
+}
+
 async function handleApiRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "GET" && url.pathname === "/api/v1/health") {
-    const directory = await directoryStub(env).snapshot();
+    const directory = await directoryStub(env).quotaSnapshot();
+    const maxActiveJobs = Number.parseInt(env.MAX_ACTIVE_JOBS, 10);
+    const maxJobConnections = Number.parseInt(env.MAX_JOB_CONNECTIONS, 10);
+    const maxDirectoryConnections = Number.parseInt(env.MAX_DIRECTORY_CONNECTIONS, 10);
+    const safetyMarginPercent = Number.parseInt(env.SAFETY_MARGIN_PERCENT, 10);
+    const nearSafetyMargin = directory.activeJobs >= Math.floor(maxActiveJobs * safetyMarginPercent / 100) ||
+      directory.directoryConnections >= Math.floor(maxDirectoryConnections * safetyMarginPercent / 100);
     return json({
       ok: true,
       environment: env.ENVIRONMENT,
+      configuration: {
+        publicJobsReady: Boolean(env.TURNSTILE_SECRET && env.NETWORK_DIGEST_KEY),
+        turnstileConfigured: Boolean(env.TURNSTILE_SECRET),
+        networkDigestConfigured: Boolean(env.NETWORK_DIGEST_KEY),
+      },
       features: {
         publicJobs: isEnabled(env.FEATURE_PUBLIC_JOBS),
         publicSwarm: isEnabled(env.FEATURE_PUBLIC_SWARM),
@@ -484,6 +543,13 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
       turnstileSiteKey: env.TURNSTILE_SITE_KEY,
       activeJobs: directory.activeJobs,
       activeWorkers: directory.activeWorkers,
+      quota: {
+        state: !isEnabled(env.FEATURE_PUBLIC_JOBS) && !isEnabled(env.FEATURE_PUBLIC_SWARM)
+          ? "DISABLED"
+          : nearSafetyMargin ? "NEAR_LIMIT" : "NORMAL",
+        limits: { maxActiveJobs, maxJobConnections, maxDirectoryConnections, safetyMarginPercent },
+        usage: directory,
+      },
     });
   }
   if (request.method === "POST" && url.pathname === "/api/v1/jobs") return createJob(request, env);
@@ -521,7 +587,7 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  const match = url.pathname.match(/^\/api\/v1\/jobs\/([^/]+)(?:\/(formula|cancel|socket))?$/u);
+  const match = url.pathname.match(/^\/api\/v1\/jobs\/([^/]+)(?:\/(formula|cancel|socket|rotate-owner))?$/u);
   if (match) {
     const jobId = match[1];
     if (!JOB_ID_PATTERN.test(jobId)) throw new ApiError(404, "JOB_NOT_FOUND", "The job was not found.");
@@ -537,6 +603,7 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
     if (request.method === "PUT" && action === "formula") return uploadFormula(request, env, jobId);
     if (request.method === "GET" && action === "formula") return downloadFormula(env, jobId);
     if (request.method === "POST" && action === "cancel") return cancelJob(request, env, jobId);
+    if (request.method === "POST" && action === "rotate-owner") return rotateOwnerToken(request, env, jobId);
   }
   throw new ApiError(404, "NOT_FOUND", "API route not found");
 }
@@ -544,7 +611,9 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (!url.pathname.startsWith(API_PREFIX)) return env.ASSETS.fetch(request);
+    if (!url.pathname.startsWith(API_PREFIX)) {
+      return withSecurityHeaders(await env.ASSETS.fetch(request), env.ENVIRONMENT === "production");
+    }
 
     let response: Response;
     try {
@@ -562,6 +631,6 @@ export default {
       path: url.pathname,
       status: response.status,
     }));
-    return response;
+    return withSecurityHeaders(response, env.ENVIRONMENT === "production");
   },
 } satisfies ExportedHandler<Env>;

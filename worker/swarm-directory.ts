@@ -23,6 +23,7 @@ import {
   type FairJob,
 } from "./fair-scheduler";
 import { calibratedTaskProfile } from "../shared/capability-profile";
+import { PUBLIC_JOB_PROTOCOL_VERSION } from "../shared/public-jobs";
 
 interface CreationRow {
   [key: string]: SqlStorageValue;
@@ -129,11 +130,32 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
         INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (2, unixepoch('now') * 1000);
       `);
     }
+    if (version < 3) {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE turnstile_replays (
+          token_digest TEXT PRIMARY KEY,
+          expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX turnstile_replays_expiry ON turnstile_replays(expires_at);
+        INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (3, unixepoch('now') * 1000);
+      `);
+    }
+  }
+
+  async consumeTurnstile(tokenDigest: string, expiresAt: number, now = Date.now()): Promise<boolean> {
+    this.ctx.storage.sql.exec("DELETE FROM turnstile_replays WHERE expires_at <= ?", now);
+    const inserted = this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO turnstile_replays (token_digest, expires_at) VALUES (?, ?)",
+      tokenDigest,
+      expiresAt,
+    );
+    await this.scheduleNextAlarm();
+    return inserted.rowsWritten > 0;
   }
 
   async admit(input: AdmissionInput): Promise<AdmissionResult> {
     const windowStart = input.createdAt - CREATION_WINDOW_MS;
-    this.ctx.storage.sql.exec("DELETE FROM creation_events WHERE created_at < ?", windowStart);
+    this.ctx.storage.sql.exec("DELETE FROM creation_events WHERE created_at <= ?", windowStart);
 
     const active = this.ctx.storage.sql.exec<{ total: number }>("SELECT COUNT(*) AS total FROM active_jobs").one().total;
     if (active >= input.globalCeiling) return { ok: false, code: "GLOBAL_JOB_LIMIT" };
@@ -235,6 +257,35 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
     ).one();
   }
 
+  quotaSnapshot(): {
+    activeJobs: number;
+    activeWorkers: number;
+    activeAssignments: number;
+    reservedWorkerMs: number;
+    directoryConnections: number;
+    creationsInWindow: number;
+  } {
+    const active = this.snapshot();
+    const assignments = this.ctx.storage.sql.exec<{
+      activeAssignments: number;
+      reservedWorkerMs: number;
+    }>(
+      `SELECT COUNT(*) AS activeAssignments,
+              COALESCE(SUM(reserved_worker_ms), 0) AS reservedWorkerMs
+       FROM assignments WHERE status = 'ACTIVE'`,
+    ).one();
+    const creationsInWindow = this.ctx.storage.sql.exec<{ total: number }>(
+      "SELECT COUNT(*) AS total FROM creation_events WHERE created_at >= ?",
+      Date.now() - CREATION_WINDOW_MS,
+    ).one().total;
+    return {
+      ...active,
+      ...assignments,
+      directoryConnections: this.ctx.getWebSockets().length,
+      creationsInWindow,
+    };
+  }
+
   async assign(
     sessionId: string,
     capabilities: WorkerCapabilities,
@@ -301,6 +352,14 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
+    }
+    const maximumConnections = Number.parseInt(this.env.MAX_DIRECTORY_CONNECTIONS, 10);
+    if (!Number.isSafeInteger(maximumConnections) || maximumConnections < 1 ||
+      this.ctx.getWebSockets().length >= maximumConnections) {
+      return new Response("Directory connection capacity reached", {
+        status: 503,
+        headers: { "retry-after": "10" },
+      });
     }
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
@@ -386,7 +445,8 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
     const now = Date.now();
     this.ctx.storage.transactionSync(() => this.expireAssignments(now));
     this.ctx.storage.sql.exec("DELETE FROM active_jobs WHERE expires_at <= ?", now);
-    this.ctx.storage.sql.exec("DELETE FROM creation_events WHERE created_at < ?", now - CREATION_WINDOW_MS);
+    this.ctx.storage.sql.exec("DELETE FROM creation_events WHERE created_at <= ?", now - CREATION_WINDOW_MS);
+    this.ctx.storage.sql.exec("DELETE FROM turnstile_replays WHERE expires_at <= ?", now);
     await this.scheduleNextAlarm();
   }
 
@@ -396,6 +456,10 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
         SELECT expires_at FROM active_jobs
         UNION ALL
         SELECT expires_at FROM assignments WHERE status = 'ACTIVE'
+        UNION ALL
+        SELECT expires_at FROM turnstile_replays
+        UNION ALL
+        SELECT created_at + ${CREATION_WINDOW_MS} AS expires_at FROM creation_events
       )`,
     ).one();
     if (row.expires_at === null) await this.ctx.storage.deleteAlarm();
@@ -477,7 +541,7 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
 
   private serverBase(requestMessageId: string, snapshot: ReturnType<SwarmDirectoryDO["snapshot"]>) {
     return {
-      protocolVersion: 1 as const,
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: crypto.randomUUID(),
       requestMessageId,
       serverTime: Date.now(),

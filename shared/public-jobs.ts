@@ -9,6 +9,7 @@ export type PublicJobState =
   | "SAT_VERIFIED"
   | "UNSAT_CERTIFIED"
   | "UNSAT_OWNER_VERIFIED"
+  | "INVALID"
   | "UNKNOWN"
   | "CANCELLED";
 

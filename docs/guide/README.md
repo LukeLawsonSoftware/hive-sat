@@ -9,7 +9,7 @@ Read the pages in order:
 1. [SAT solving from the beginning](01-sat-solving.md)
 2. [From a DIMACS file to verified browser memory](02-formula-pipeline.md)
 3. [How cube-and-conquer distributes one search](03-distributed-cubes.md)
-4. Result verification and trust boundaries *(Phase 7)*
+4. [Why results are not trusted on arrival](04-result-correctness.md)
 5. Fair public-swarm scheduling *(Phase 8)*
 6. The Swarm Mode user experience *(Phase 9)*
 

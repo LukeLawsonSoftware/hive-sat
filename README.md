@@ -7,7 +7,8 @@ HiveSAT is an experimental web-based SAT solver designed to distribute search
 work across participating browsers. The Phase 4 runtime strictly parses,
 hashes, caches, and solves DIMACS formulas locally, and can submit an explicitly
 public formula to the feature-flagged Cloudflare job platform. Phase 6 adds the
-owner-side cube worker pool and distributed coordinator runtime; public swarm
+owner-side cube worker pool and distributed coordinator runtime. Phase 7 adds
+compact model artifacts and independent server verification; public swarm
 admission remains disabled until Phase 8.
 
 ## Development

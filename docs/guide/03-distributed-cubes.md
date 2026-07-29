@@ -48,8 +48,11 @@ stateDiagram-v2
   READY --> LEASED: persist lease, then send work
   LEASED --> SPLIT: exact complementary split
   LEASED --> READY: safe yield or expired lease
-  LEASED --> SAT_CANDIDATE: candidate model
-  LEASED --> UNSAT_CANDIDATE: candidate exhaustion
+  LEASED --> VERIFYING_SAT: candidate model + artifact
+  VERIFYING_SAT --> SAT_VERIFIED: independent verification
+  VERIFYING_SAT --> READY: invalid or timed-out verification
+  LEASED --> READY: first UNSAT candidate
+  LEASED --> UNSAT_CANDIDATE: independent repeat
   READY --> UNKNOWN: retry ceiling exhausted
 ```
 
@@ -98,6 +101,6 @@ Each worker:
 A SAT model is checked against both the original formula and cube assumptions
 in ordinary TypeScript before the browser reports it. A verified candidate lets
 that browser stop its other cube workers early. Server-side terminal correctness
-is the next layer, covered in Phase 7.
+is the next layer.
 
-Next: result verification and trust boundaries *(added in Phase 7)*.
+Next: [Why results are not trusted on arrival →](04-result-correctness.md)

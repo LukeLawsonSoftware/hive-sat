@@ -10,8 +10,10 @@ import { PUBLIC_JOB_PROTOCOL_VERSION } from "../shared/public-jobs";
 import { hmacSha256Hex, randomToken, sha256Hex } from "./crypto";
 import { JobCoordinatorDO } from "./job-coordinator";
 import { SwarmDirectoryDO } from "./swarm-directory";
+import { ResultVerifierDO } from "./result-verifier";
+import { MAX_SAT_MODEL_ARTIFACT_BYTES } from "../shared/result-manifest";
 
-export { JobCoordinatorDO, SwarmDirectoryDO };
+export { JobCoordinatorDO, ResultVerifierDO, SwarmDirectoryDO };
 
 const API_PREFIX = "/api/";
 const JOB_ID_PATTERN = /^[A-Za-z0-9_-]{32}$/u;
@@ -265,7 +267,11 @@ async function uploadFormula(request: Request, env: Env, jobId: string): Promise
     const status = authorization.code === "INVALID_TOKEN" ? 403 : authorization.code === "NOT_FOUND" ? 404 : 409;
     throw new ApiError(status, authorization.code, "Formula upload is not authorized for this job.");
   }
-  const contentLength = Number(request.headers.get("content-length") ?? "NaN");
+  const contentLength = Number(
+    request.headers.get("content-length") ??
+    request.headers.get("x-hivesat-content-length") ??
+    "NaN",
+  );
   if (!Number.isSafeInteger(contentLength) || contentLength !== authorization.compressedBytes) {
     throw new ApiError(400, "CONTENT_LENGTH_MISMATCH", "Content-Length must match the declared compressed size.");
   }
@@ -300,7 +306,7 @@ async function getStatus(env: Env, jobId: string): Promise<Response> {
 
 async function downloadFormula(env: Env, jobId: string): Promise<Response> {
   const status = await jobStub(env, jobId).getStatus();
-  if (!status || status.state === "UPLOADING" || status.state === "CANCELLED") {
+  if (!status || ["UPLOADING", "CANCELLED", "INVALID"].includes(status.state)) {
     throw new ApiError(404, "FORMULA_NOT_FOUND", "The public formula is not available.");
   }
   const object = await requiredBinding(env.FORMULAS, "FORMULAS").get(formulaObjectKey(jobId));
@@ -312,6 +318,59 @@ async function downloadFormula(env: Env, jobId: string): Promise<Response> {
   headers.set("x-hivesat-formula-sha256", status.formula.hash);
   headers.set("x-content-type-options", "nosniff");
   return new Response(object.body, { headers });
+}
+
+async function uploadSatModel(
+  request: Request,
+  env: Env,
+  jobId: string,
+  leaseId: string,
+): Promise<Response> {
+  if (bearerToken(request) !== leaseId) {
+    throw new ApiError(403, "INVALID_TOKEN", "The model upload token does not match this lease.");
+  }
+  const coordinator = jobStub(env, jobId);
+  const authorization = await coordinator.authorizeModelUpload(leaseId);
+  if (!authorization.ok) {
+    throw new ApiError(
+      authorization.code === "NOT_FOUND" ? 404 : 409,
+      authorization.code,
+      "This lease cannot upload a SAT model.",
+    );
+  }
+  const contentLength = Number(
+    request.headers.get("content-length") ??
+    request.headers.get("x-hivesat-content-length") ??
+    "NaN",
+  );
+  if (
+    !Number.isSafeInteger(contentLength) ||
+    contentLength < 12 ||
+    contentLength > authorization.maximumBytes ||
+    contentLength > MAX_SAT_MODEL_ARTIFACT_BYTES ||
+    !request.body
+  ) {
+    throw new ApiError(400, "INVALID_MODEL_BODY", "A bounded SAT model body with Content-Length is required.");
+  }
+  const stored = await requiredBinding(env.FORMULAS, "FORMULAS").put(
+    authorization.objectKey,
+    request.body,
+    {
+      onlyIf: { etagDoesNotMatch: "*" },
+      httpMetadata: { contentType: "application/vnd.hivesat.model" },
+      customMetadata: {
+        jobId,
+        taskId: authorization.task.taskId,
+        formulaHash: authorization.formulaHash,
+      },
+    },
+  );
+  if (!stored) throw new ApiError(409, "MODEL_ALREADY_UPLOADED", "This lease already uploaded a model.");
+  if (stored.size !== contentLength) {
+    await requiredBinding(env.FORMULAS, "FORMULAS").delete(authorization.objectKey);
+    throw new ApiError(400, "UPLOAD_SIZE_MISMATCH", "The model size changed while streaming.");
+  }
+  return json({ jobId, taskId: authorization.task.taskId, leaseId, bytes: stored.size }, { status: 201 });
 }
 
 async function cancelJob(request: Request, env: Env, jobId: string): Promise<Response> {
@@ -341,6 +400,16 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
     });
   }
   if (request.method === "POST" && url.pathname === "/api/v1/jobs") return createJob(request, env);
+
+  const modelMatch = url.pathname.match(
+    /^\/api\/v1\/jobs\/([^/]+)\/results\/([^/]+)\/model$/u,
+  );
+  if (modelMatch) {
+    const [, jobId, leaseId] = modelMatch;
+    if (!JOB_ID_PATTERN.test(jobId)) throw new ApiError(404, "JOB_NOT_FOUND", "The job was not found.");
+    await requireKnownJob(env, jobId);
+    if (request.method === "PUT") return uploadSatModel(request, env, jobId, leaseId);
+  }
 
   const match = url.pathname.match(/^\/api\/v1\/jobs\/([^/]+)(?:\/(formula|cancel|socket))?$/u);
   if (match) {

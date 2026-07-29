@@ -1,5 +1,10 @@
 export const SAT_MODEL_ARTIFACT_VERSION = 1 as const;
 export const MAX_SAT_MODEL_ARTIFACT_BYTES = 512 * 1024;
+export const UNSAT_PROOF_ARTIFACT_VERSION = 1 as const;
+export const MAX_UNSAT_PROOF_COMPRESSED_BYTES = 32 * 1024 * 1024;
+export const MAX_UNSAT_PROOF_DECOMPRESSED_BYTES = 128 * 1024 * 1024;
+export const MAX_SERVER_PROOF_COMPRESSED_BYTES = 2 * 1024 * 1024;
+export const MAX_SERVER_PROOF_DECOMPRESSED_BYTES = 8 * 1024 * 1024;
 const MAGIC = Uint8Array.from([0x48, 0x53, 0x4d, 0x4f, 0x44, 0x4c, 0x30, 0x31]); // HSMODL01
 const FIXED_HEADER_BYTES = 12;
 const MAX_METADATA_BYTES = 8 * 1024;
@@ -32,7 +37,19 @@ export interface UnsatCandidateManifest {
   solverVersion: string;
 }
 
-export type ResultManifest = SatResultManifest | UnsatCandidateManifest;
+export interface UnsatProofManifest extends Omit<UnsatCandidateManifest, "kind"> {
+  kind: "UNSAT_PROOF_V1";
+  version: typeof UNSAT_PROOF_ARTIFACT_VERSION;
+  artifactId: string;
+  artifactSha256: string;
+  compressedBytes: number;
+  decompressedBytes: number;
+  originalClauseCount: number;
+  cubeClauseIds: number[];
+  checker: "drat-trim-lrat-check";
+}
+
+export type ResultManifest = SatResultManifest | UnsatCandidateManifest | UnsatProofManifest;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -66,6 +83,34 @@ export function parseResultManifest(value: unknown): ResultManifest | null {
   const common = commonMetadata(value);
   if (!common) return null;
   if (value.kind === "UNSAT_CANDIDATE_V1") return { kind: value.kind, ...common };
+  if (value.kind === "UNSAT_PROOF_V1") {
+    if (
+      value.version !== UNSAT_PROOF_ARTIFACT_VERSION ||
+      typeof value.artifactId !== "string" || !ID_PATTERN.test(value.artifactId) ||
+      typeof value.artifactSha256 !== "string" || !SHA256_PATTERN.test(value.artifactSha256) ||
+      !Number.isSafeInteger(value.compressedBytes) || Number(value.compressedBytes) < 1 ||
+      Number(value.compressedBytes) > MAX_UNSAT_PROOF_COMPRESSED_BYTES ||
+      !Number.isSafeInteger(value.decompressedBytes) || Number(value.decompressedBytes) < 1 ||
+      Number(value.decompressedBytes) > MAX_UNSAT_PROOF_DECOMPRESSED_BYTES ||
+      !Number.isSafeInteger(value.originalClauseCount) || Number(value.originalClauseCount) < 0 ||
+      !Array.isArray(value.cubeClauseIds) || value.cubeClauseIds.length !== common.cube.length ||
+      !value.cubeClauseIds.every((id, index) =>
+        Number.isSafeInteger(id) && id === Number(value.originalClauseCount) + index + 1) ||
+      value.checker !== "drat-trim-lrat-check"
+    ) return null;
+    return {
+      kind: value.kind,
+      version: UNSAT_PROOF_ARTIFACT_VERSION,
+      ...common,
+      artifactId: value.artifactId,
+      artifactSha256: value.artifactSha256,
+      compressedBytes: Number(value.compressedBytes),
+      decompressedBytes: Number(value.decompressedBytes),
+      originalClauseCount: Number(value.originalClauseCount),
+      cubeClauseIds: [...value.cubeClauseIds] as number[],
+      checker: value.checker,
+    };
+  }
   if (
     value.kind !== "SAT_MODEL_V1" ||
     value.version !== SAT_MODEL_ARTIFACT_VERSION ||
@@ -196,4 +241,8 @@ export async function resultPathHash(cube: readonly number[]): Promise<string> {
 
 export function satModelObjectKey(jobId: string, artifactId: string): string {
   return `jobs/${jobId}/models/${artifactId}.hsmodel`;
+}
+
+export function unsatProofObjectKey(jobId: string, artifactId: string): string {
+  return `jobs/${jobId}/proofs/${artifactId}.lrat.gz`;
 }

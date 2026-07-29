@@ -5,6 +5,8 @@ import {
   resultPathHash,
   satModelObjectKey,
   type SatResultManifest,
+  unsatProofObjectKey,
+  type UnsatProofManifest,
 } from "../shared/result-manifest";
 
 function encodeFormula(variableCount: number, clauses: number[][]): Uint8Array {
@@ -91,6 +93,56 @@ describe("ResultVerifierDO", () => {
       checkedClauses: 2,
       checkedLiterals: 5,
     });
+  });
+
+  it("certifies a bounded LRAT proof and fails closed on corruption or limits", async () => {
+    const jobId = crypto.randomUUID();
+    const encoded = encodeFormula(1, [[1], [-1]]);
+    const formulaHash = await sha256Hex(encoded);
+    const proofText = "3 0 1 2 0\n";
+    const proofBytes = new TextEncoder().encode(proofText);
+    const compressed = new Uint8Array(await gzip(proofBytes));
+    const artifactSha256 = await sha256Hex(compressed);
+    const formulaObjectKey = `jobs/${jobId}/formula.hivecnf.gz`;
+    const artifactId = "proof-lease";
+    await env.FORMULAS.put(formulaObjectKey, await gzip(encoded));
+    await env.FORMULAS.put(unsatProofObjectKey(jobId, artifactId), compressed);
+    const manifest: UnsatProofManifest = {
+      kind: "UNSAT_PROOF_V1",
+      version: 1,
+      formulaHash,
+      taskId: "root",
+      cube: [],
+      pathHash: await resultPathHash([]),
+      solverVersion: "cadical-3.0.1",
+      artifactId,
+      artifactSha256,
+      compressedBytes: compressed.byteLength,
+      decompressedBytes: proofBytes.byteLength,
+      originalClauseCount: 2,
+      cubeClauseIds: [],
+      checker: "drat-trim-lrat-check",
+    };
+    const verifier = env.RESULT_VERIFIERS.getByName(`proof-${jobId}`);
+    await expect(verifier.verifyUnsat({
+      jobId,
+      formulaObjectKey,
+      manifest,
+      expectedCube: [],
+    })).resolves.toMatchObject({ status: "VALID_UNSAT", derivedClauses: 1 });
+    await expect(verifier.verifyUnsat({
+      jobId,
+      formulaObjectKey,
+      manifest: { ...manifest, artifactSha256: "00".repeat(32) },
+      expectedCube: [],
+    })).resolves.toMatchObject({ status: "INVALID_PROOF" });
+    await expect(verifier.verifyUnsat({
+      jobId,
+      formulaObjectKey,
+      manifest,
+      expectedCube: [],
+      maxCompressedBytes: compressed.byteLength - 1,
+    })).resolves.toMatchObject({ status: "OWNER_CHECK_REQUIRED" });
   });
 
   it("fails closed for an invalid model and an exhausted verifier budget", async () => {

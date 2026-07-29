@@ -3,6 +3,10 @@ import type {
   CubeWorkerResponse,
 } from "../lib/distributed/cubeWorkerProtocol";
 import type { SolverMetrics } from "../lib/formula/workerProtocol";
+import {
+  MAX_UNSAT_PROOF_COMPRESSED_BYTES,
+  MAX_UNSAT_PROOF_DECOMPRESSED_BYTES,
+} from "../../shared/result-manifest";
 
 const UNKNOWN = 0;
 const SAT = 10;
@@ -15,6 +19,8 @@ interface CaDiCaLSolver {
   lookahead(): number;
   model(firstVariable: number, count: number): number[];
   metric(metric: number): number;
+  enableLrat(path?: string): void;
+  closeLrat(path?: string): string;
   dispose(): void;
 }
 
@@ -35,6 +41,7 @@ let requestId: string | null = null;
 let variableCount = 0;
 let stopped: "PAUSED" | "SHUTDOWN" | null = null;
 let operation = Promise.resolve();
+let formulaBatches: Int32Array[] = [];
 
 function send(message: CubeWorkerResponse): void {
   globalThis.postMessage(message);
@@ -65,13 +72,115 @@ async function initialize(message: Extract<CubeWorkerRequest, { type: "initializ
   requestId = message.requestId;
   variableCount = message.metadata.variableCount;
   stopped = null;
+  formulaBatches = [];
   if (message.metadata.clauseCount === 0) send({ type: "ready", requestId });
+}
+
+async function gzipText(text: string): Promise<Uint8Array> {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength > MAX_UNSAT_PROOF_DECOMPRESSED_BYTES) {
+    throw new Error("The LRAT proof exceeds the decompressed job limit.");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
+  const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
+  if (compressed.byteLength > MAX_UNSAT_PROOF_COMPRESSED_BYTES) {
+    throw new Error("The LRAT proof exceeds the compressed job limit.");
+  }
+  return compressed;
+}
+
+async function runProofFinisher(
+  message: Extract<CubeWorkerRequest, { type: "run" }>,
+  startedAt: number,
+): Promise<void> {
+  const runtime = await (await loadModule()).loadCaDiCaL();
+  const proofSolver = runtime.createSolver();
+  try {
+    proofSolver.enableLrat("/proof.lrat");
+    for (const batch of formulaBatches) proofSolver.addClauses(batch);
+    for (const literal of message.task.assumptions) {
+      proofSolver.addClauses(Int32Array.of(literal, 0));
+    }
+    for (let slices = 1; slices <= message.maxSlices; slices += 1) {
+      if (stopped) {
+        send({
+          type: "yield",
+          requestId: message.requestId,
+          taskId: message.task.taskId,
+          leaseId: message.lease.leaseId,
+          reason: stopped,
+          activeMs: Math.max(0, performance.now() - startedAt),
+          metrics: await readMetrics(),
+        });
+        return;
+      }
+      const status = proofSolver.solve(message.conflictBudget);
+      if (status === SAT) {
+        const model = proofSolver.model(1, variableCount)
+          .map((literal, index) => literal === 0 ? -(index + 1) : literal);
+        send({
+          type: "result",
+          requestId: message.requestId,
+          taskId: message.task.taskId,
+          leaseId: message.lease.leaseId,
+          verdict: "SAT",
+          model,
+          activeMs: Math.max(0, performance.now() - startedAt),
+          metrics: await readMetrics(),
+        });
+        return;
+      }
+      if (status === UNSAT) {
+        const text = proofSolver.closeLrat("/proof.lrat");
+        const proof = await gzipText(text);
+        send({
+          type: "result",
+          requestId: message.requestId,
+          taskId: message.task.taskId,
+          leaseId: message.lease.leaseId,
+          verdict: "UNSAT",
+          proof,
+          proofBytes: new TextEncoder().encode(text).byteLength,
+          activeMs: Math.max(0, performance.now() - startedAt),
+          metrics: await readMetrics(),
+        });
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    send({
+      type: "yield",
+      requestId: message.requestId,
+      taskId: message.task.taskId,
+      leaseId: message.lease.leaseId,
+      reason: "BUDGET",
+      activeMs: Math.max(0, performance.now() - startedAt),
+      metrics: await readMetrics(),
+    });
+  } catch (error) {
+    send({
+      type: "yield",
+      requestId: message.requestId,
+      taskId: message.task.taskId,
+      leaseId: message.lease.leaseId,
+      reason: "UNSUPPORTED",
+      activeMs: Math.max(0, performance.now() - startedAt),
+      metrics: await readMetrics(),
+    });
+    console.error(error);
+  } finally {
+    proofSolver.dispose();
+  }
 }
 
 async function runCube(message: Extract<CubeWorkerRequest, { type: "run" }>): Promise<void> {
   if (!solver || requestId !== message.requestId) return;
   stopped = null;
   const startedAt = performance.now();
+  if (message.task.purpose === "PROOF_FINISHER") {
+    await runProofFinisher(message, startedAt);
+    return;
+  }
   for (let slices = 1; slices <= message.maxSlices; slices += 1) {
     if (stopped) {
       send({
@@ -166,6 +275,7 @@ async function handle(message: CubeWorkerRequest): Promise<void> {
   if (message.type === "clause-batch") {
     if (!solver) throw new Error("Cube solver is not initialized.");
     solver.addClauses(message.literals);
+    formulaBatches.push(message.literals.slice());
     if (message.last) send({ type: "ready", requestId: message.requestId });
     return;
   }

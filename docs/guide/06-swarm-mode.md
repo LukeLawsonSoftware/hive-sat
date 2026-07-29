@@ -143,3 +143,5 @@ Imagine a desktop configured for two workers:
 At every step, the user can distinguish configured capacity, active work,
 solver operations, network transfer, and Wasm allocation without being shown a
 number the browser cannot honestly measure.
+
+Next: [How proof-carrying UNSAT becomes a certificate →](07-proof-carrying-unsat.md)

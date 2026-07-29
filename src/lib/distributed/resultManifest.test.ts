@@ -48,4 +48,26 @@ describe("SAT model artifact", () => {
       solverVersion: "cadical-3.0.1",
     })).toBeNull();
   });
+
+  it("binds LRAT proof manifests to exact formula and cube clause IDs", async () => {
+    const cube = [2, -4];
+    const manifest = parseResultManifest({
+      kind: "UNSAT_PROOF_V1",
+      version: 1,
+      formulaHash: "ab".repeat(32),
+      taskId: "leaf-proof",
+      cube,
+      pathHash: await resultPathHash(cube),
+      solverVersion: "cadical-3.0.1",
+      artifactId: "proof-lease",
+      artifactSha256: "cd".repeat(32),
+      compressedBytes: 120,
+      decompressedBytes: 500,
+      originalClauseCount: 10,
+      cubeClauseIds: [11, 12],
+      checker: "drat-trim-lrat-check",
+    });
+    expect(manifest).toMatchObject({ kind: "UNSAT_PROOF_V1", cubeClauseIds: [11, 12] });
+    expect(parseResultManifest({ ...manifest, cubeClauseIds: [11, 13] })).toBeNull();
+  });
 });

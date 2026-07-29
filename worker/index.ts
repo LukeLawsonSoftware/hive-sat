@@ -11,7 +11,10 @@ import { hmacSha256Hex, randomToken, sha256Hex } from "./crypto";
 import { JobCoordinatorDO } from "./job-coordinator";
 import { SwarmDirectoryDO } from "./swarm-directory";
 import { ResultVerifierDO } from "./result-verifier";
-import { MAX_SAT_MODEL_ARTIFACT_BYTES } from "../shared/result-manifest";
+import {
+  MAX_SAT_MODEL_ARTIFACT_BYTES,
+  MAX_UNSAT_PROOF_COMPRESSED_BYTES,
+} from "../shared/result-manifest";
 
 export { JobCoordinatorDO, ResultVerifierDO, SwarmDirectoryDO };
 
@@ -374,6 +377,88 @@ async function uploadSatModel(
   return json({ jobId, taskId: authorization.task.taskId, leaseId, bytes: stored.size }, { status: 201 });
 }
 
+async function uploadUnsatProof(
+  request: Request,
+  env: Env,
+  jobId: string,
+  leaseId: string,
+): Promise<Response> {
+  if (bearerToken(request) !== leaseId) {
+    throw new ApiError(403, "INVALID_TOKEN", "The proof upload token does not match this lease.");
+  }
+  const decompressedBytes = Number(request.headers.get("x-hivesat-decompressed-length") ?? "NaN");
+  const artifactSha256 = request.headers.get("x-hivesat-sha256") ?? "";
+  const coordinator = jobStub(env, jobId);
+  const authorization = await coordinator.authorizeProofUpload(leaseId, decompressedBytes);
+  if (!authorization.ok) {
+    throw new ApiError(
+      authorization.code === "NOT_FOUND" ? 404 : authorization.code === "PROOF_BUDGET_EXHAUSTED" ? 413 : 409,
+      authorization.code,
+      "This lease cannot upload an UNSAT proof.",
+    );
+  }
+  const contentLength = Number(
+    request.headers.get("content-length") ?? request.headers.get("x-hivesat-content-length") ?? "NaN",
+  );
+  if (!Number.isSafeInteger(contentLength) || contentLength < 1 ||
+    contentLength > authorization.maximumCompressedBytes ||
+    contentLength > MAX_UNSAT_PROOF_COMPRESSED_BYTES ||
+    !SHA256_PATTERN.test(artifactSha256) || !request.body) {
+    throw new ApiError(400, "INVALID_PROOF_BODY", "A bounded gzip LRAT proof with exact metadata is required.");
+  }
+  const formulas = requiredBinding(env.FORMULAS, "FORMULAS");
+  const stored = await formulas.put(authorization.objectKey, request.body, {
+    onlyIf: { etagDoesNotMatch: "*" },
+    httpMetadata: { contentType: "application/vnd.hivesat.lrat+gzip" },
+    customMetadata: {
+      jobId,
+      taskId: authorization.task.taskId,
+      formulaHash: authorization.formulaHash,
+      artifactSha256,
+      decompressedBytes: String(decompressedBytes),
+    },
+  });
+  if (!stored) throw new ApiError(409, "PROOF_ALREADY_UPLOADED", "This lease already uploaded a proof.");
+  if (stored.size !== contentLength ||
+    !await coordinator.recordProofUpload(leaseId, artifactSha256, stored.size, decompressedBytes)) {
+    await formulas.delete(authorization.objectKey);
+    throw new ApiError(409, "PROOF_UPLOAD_REJECTED", "The proof upload did not match its authorization.");
+  }
+  return json({ jobId, taskId: authorization.task.taskId, leaseId, bytes: stored.size }, { status: 201 });
+}
+
+async function downloadUnsatProof(env: Env, jobId: string, artifactId: string): Promise<Response> {
+  const authorization = await jobStub(env, jobId).proofDownload(artifactId);
+  if (!authorization) throw new ApiError(404, "PROOF_NOT_FOUND", "The proof certificate is not available.");
+  const object = await requiredBinding(env.FORMULAS, "FORMULAS").get(authorization.objectKey);
+  if (!object?.body) throw new ApiError(404, "PROOF_NOT_FOUND", "The proof certificate is missing.");
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("content-disposition", `attachment; filename="${artifactId}.lrat.gz"`);
+  headers.set("x-hivesat-proof-sha256", authorization.sha256);
+  headers.set("x-content-type-options", "nosniff");
+  return new Response(object.body, { headers });
+}
+
+async function confirmOwnerProof(
+  request: Request,
+  env: Env,
+  jobId: string,
+  artifactId: string,
+): Promise<Response> {
+  const ownerDigest = await sha256Hex(bearerToken(request));
+  const body = await readSmallJson(request);
+  if (!isRecord(body) || typeof body.artifactSha256 !== "string" || !SHA256_PATTERN.test(body.artifactSha256)) {
+    throw new ApiError(400, "INVALID_PROOF_CONFIRMATION", "The checked proof hash is required.");
+  }
+  const result = await jobStub(env, jobId).confirmOwnerProof(ownerDigest, artifactId, body.artifactSha256);
+  if (!result.ok) {
+    throw new ApiError(result.code === "NOT_FOUND" ? 404 : result.code === "INVALID_TOKEN" ? 403 : 409,
+      result.code ?? "INVALID_STATE", "The owner proof confirmation was rejected.");
+  }
+  return json({ jobId, artifactId, state: result.state });
+}
+
 async function cancelJob(request: Request, env: Env, jobId: string): Promise<Response> {
   const ownerDigest = await sha256Hex(bearerToken(request));
   const result = await jobStub(env, jobId).cancel(ownerDigest);
@@ -420,6 +505,20 @@ async function handleApiRequest(request: Request, env: Env): Promise<Response> {
     if (!JOB_ID_PATTERN.test(jobId)) throw new ApiError(404, "JOB_NOT_FOUND", "The job was not found.");
     await requireKnownJob(env, jobId);
     if (request.method === "PUT") return uploadSatModel(request, env, jobId, leaseId);
+  }
+
+  const proofMatch = url.pathname.match(
+    /^\/api\/v1\/jobs\/([^/]+)\/proofs\/([^/]+)(?:\/(owner-verify))?$/u,
+  );
+  if (proofMatch) {
+    const [, jobId, artifactId, action] = proofMatch;
+    if (!JOB_ID_PATTERN.test(jobId)) throw new ApiError(404, "JOB_NOT_FOUND", "The job was not found.");
+    await requireKnownJob(env, jobId);
+    if (request.method === "PUT" && !action) return uploadUnsatProof(request, env, jobId, artifactId);
+    if (request.method === "GET" && !action) return downloadUnsatProof(env, jobId, artifactId);
+    if (request.method === "POST" && action === "owner-verify") {
+      return confirmOwnerProof(request, env, jobId, artifactId);
+    }
   }
 
   const match = url.pathname.match(/^\/api\/v1\/jobs\/([^/]+)(?:\/(formula|cancel|socket))?$/u);

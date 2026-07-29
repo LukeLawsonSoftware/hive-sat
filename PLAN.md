@@ -12,8 +12,8 @@ Every phase is one independently mergeable branch and PR:
 4. Merge only after CI passes.
 5. Let the connected Cloudflare project automatically deploy `main`, smoke-test production, then begin the next phase.
 
-Phases 6–9 in this implementation run use a stacked-branch delivery override:
-Phase 7 starts from Phase 6, Phase 8 from Phase 7, and Phase 9 from Phase 8.
+Phases 6–11 in this implementation run use a stacked-branch delivery override:
+each phase starts from the immediately preceding phase branch.
 No additional pull requests are created; the stack is left for manual
 integration in reverse order.
 
@@ -242,15 +242,28 @@ Exit gate: responsive and accessible behavior is verified on modern desktop brow
 
 Branch: `codex/hivesat-10-unsat-proofs`
 
-- Reassign an UNSAT candidate to a fresh proof-finisher CaDiCaL instance with tracing enabled before clauses are loaded.
-- Produce gzip-compressed LRAT for `F ∧ cube`, with a manifest binding the proof to the formula hash, cube assumptions, path hash, clause IDs, solver version, and artifact hash.
-- Stream proofs to R2 under lease-scoped upload tokens. Cap each job at 32 MiB compressed and 128 MiB decompressed proof data; split further or return `UNKNOWN` when exceeded.
-- Pin and compile the independent MIT-licensed `lrat-check.c` checker from DRAT-trim for browser and bounded Durable Object use. [DRAT-trim/LRAT checker](https://github.com/marijnheule/drat-trim).
-- Server-certify small proofs within conservative verifier limits. Larger allowed proofs are checked in the owner’s browser:
+- [x] Reassign an UNSAT candidate to a fresh proof-finisher CaDiCaL instance with tracing enabled before clauses are loaded.
+- [x] Produce gzip-compressed LRAT for `F ∧ cube`, with a manifest binding the proof to the formula hash, cube assumptions, path hash, clause IDs, solver version, and artifact hash.
+- [x] Stream proofs to R2 under lease-scoped upload tokens. Cap each job at 32 MiB compressed and 128 MiB decompressed proof data; split further or return `UNKNOWN` when exceeded.
+- [x] Pin and compile the independent MIT-licensed `lrat-check.c` checker from DRAT-trim for browser and bounded Durable Object use. [DRAT-trim/LRAT checker](https://github.com/marijnheule/drat-trim).
+- [x] Server-certify small proofs within conservative verifier limits. Larger allowed proofs are checked in the owner’s browser:
   - successful local checks produce `UNSAT_OWNER_VERIFIED`;
   - public status distinguishes this from server-side `UNSAT_CERTIFIED`;
   - certificates remain downloadable for independent checking.
-- Verify every certified leaf and complementary split before propagating UNSAT to the root. Oversized, timed-out, missing, or invalid proofs result in `UNKNOWN`, never UNSAT.
+- [x] Verify every certified leaf and complementary split before propagating UNSAT to the root. Oversized, timed-out, missing, or invalid proofs result in `UNKNOWN`, never UNSAT.
+
+Phase 10 implementation note: Job Coordinator internal schema migration 5
+adds proof-required tasks and proof artifact state without changing the
+deployed Durable Object namespace. A proof finisher always allocates a new
+CaDiCaL instance, enables LRAT before loading canonical clauses, appends cube
+assumptions as unit clauses with recorded IDs, and uploads gzip evidence under
+its lease. The job-wide limits are 32 MiB compressed and 128 MiB decompressed;
+the conservative server checker limits are 2 MiB/8 MiB. Larger allowed proofs
+remain `OWNER_CHECK_REQUIRED` until the owner runs the pinned C checker in a
+Dedicated Worker. Server and owner certification remain distinct public
+states, and only exact complementary certified leaves propagate. The pinned
+checker build, artifact layout, state transitions, examples, and failure
+semantics are documented in `docs/guide/07-proof-carrying-unsat.md`.
 
 Exit gate: known UNSAT formulas complete only with valid proof coverage; proof corruption, omitted branches, checker timeout, and proof-size overflow all fail closed.
 

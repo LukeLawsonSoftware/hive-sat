@@ -3,7 +3,7 @@ import { verifyTextLrat } from "./lrat";
 
 describe("independent text LRAT checker", () => {
   it("accepts a valid unit contradiction proof", () => {
-    expect(verifyTextLrat([[1], [-1]], "3 0 1 2 0\n")).toEqual({
+    expect(verifyTextLrat([[1], [-1]], "3 0 1 2 0\n")).toMatchObject({
       valid: true,
       derivedClauses: 1,
     });

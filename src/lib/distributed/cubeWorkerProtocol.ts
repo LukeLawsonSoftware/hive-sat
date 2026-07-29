@@ -47,7 +47,7 @@ export type CubeWorkerResponse =
       type: "yield";
       taskId: string;
       leaseId: string;
-      reason: "BUDGET" | "PAUSED" | "SHUTDOWN";
+      reason: "BUDGET" | "PAUSED" | "SHUTDOWN" | "UNSUPPORTED";
       activeMs: number;
       metrics: SolverMetrics;
     })
@@ -65,6 +65,8 @@ export type CubeWorkerResponse =
       taskId: string;
       leaseId: string;
       verdict: "UNSAT";
+      proof?: Uint8Array;
+      proofBytes?: number;
       activeMs: number;
       metrics: SolverMetrics;
     })

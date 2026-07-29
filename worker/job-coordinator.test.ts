@@ -404,14 +404,21 @@ describe("JobCoordinatorDO leasing protocol", () => {
     }
 
     await runInDurableObject(stub, (_instance, state) => {
-      const tasks = state.storage.sql.exec<{ task_id: string; state: string }>(
-        "SELECT task_id, state FROM tasks ORDER BY depth, task_id",
+      const tasks = state.storage.sql.exec<{ task_id: string; state: string; proof_required: number }>(
+        "SELECT task_id, state, proof_required FROM tasks ORDER BY depth, task_id",
       ).toArray();
       expect(tasks).toHaveLength(3);
-      expect(tasks.every((task) => task.state === "UNSAT_CANDIDATE")).toBe(true);
+      expect(tasks[0]).toMatchObject({ task_id: "root", state: "SPLIT", proof_required: 0 });
+      expect(tasks.slice(1).every((task) => task.state === "READY" && task.proof_required === 1)).toBe(true);
       expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM jobs").one().state)
         .toBe("RUNNING");
     });
+    const finisherSocket = await openSocket(stub);
+    await hello(finisherSocket, jobId, "fresh-proof-finisher");
+    const finisher = expectWork(await requestWork(finisherSocket, jobId, "proof-work"));
+    expect(finisher.task.purpose).toBe("PROOF_FINISHER");
+    expect(finisher.queue.canSplit).toBe(false);
+    finisherSocket.close(1000, "done");
     splitter.close(1000, "done");
   });
 

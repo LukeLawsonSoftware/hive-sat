@@ -260,11 +260,33 @@ test.describe("CaDiCaL WebAssembly feasibility gate", () => {
       const status = solver.solve(-1);
       const proof = solver.closeLrat();
       solver.dispose();
-      return { status, proof, unsat: SolverStatus.UNSAT };
+      const output: string[] = [];
+      const { default: createChecker } = await import("/solver/lrat-check.mjs");
+      const checker = await createChecker({
+        print: (line: string) => output.push(line),
+        printErr: (line: string) => output.push(line),
+      });
+      checker.FS.writeFile("/formula.cnf", "p cnf 1 2\n1 0\n-1 0\n");
+      checker.FS.writeFile("/proof.lrat", proof);
+      let checkerStatus: number;
+      try {
+        checkerStatus = checker.callMain(["/formula.cnf", "/proof.lrat"]);
+      } catch (error) {
+        checkerStatus = typeof error === "object" && error !== null && "status" in error
+          ? Number((error as { status: unknown }).status)
+          : -1;
+      }
+      return {
+        status,
+        proof,
+        unsat: SolverStatus.UNSAT,
+        cVerified: checkerStatus === 0 && output.some((line) => line.includes("VERIFIED")),
+      };
     });
 
     expect(result.status).toBe(result.unsat);
     expect(result.proof).not.toBe("");
     expect(verifyTextLrat([[1], [-1]], result.proof)).toMatchObject({ valid: true });
+    expect(result.cVerified).toBe(true);
   });
 });

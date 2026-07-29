@@ -19,6 +19,10 @@ export type TaskState =
   | "VERIFYING_SAT"
   | "SAT_VERIFIED"
   | "UNSAT_CANDIDATE"
+  | "PROOF_PENDING"
+  | "VERIFYING_UNSAT"
+  | "UNSAT_CERTIFIED"
+  | "UNSAT_OWNER_VERIFIED"
   | "UNKNOWN"
   | "CANCELLED";
 
@@ -35,6 +39,7 @@ export interface CubeTask {
   parentTaskId: string | null;
   depth: number;
   assumptions: number[];
+  purpose: "SEARCH" | "PROOF_FINISHER";
 }
 
 export interface Lease {
@@ -183,7 +188,7 @@ export interface JobCancelledMessage extends ServerMessageBase {
 
 export interface JobResultMessage extends ServerMessageBase {
   type: "JOB_RESULT";
-  result: "SAT_VERIFIED";
+  result: "SAT_VERIFIED" | "UNSAT_CERTIFIED" | "UNSAT_OWNER_VERIFIED";
   taskId: string;
 }
 
@@ -315,8 +320,9 @@ export function parseCoordinatorClientMessage(value: unknown): CoordinatorMessag
       !manifest ||
       manifest.taskId !== value.taskId ||
       (value.result === "SAT" && manifest.kind !== "SAT_MODEL_V1") ||
-      (value.result === "UNSAT" && manifest.kind !== "UNSAT_CANDIDATE_V1") ||
+      (value.result === "UNSAT" && manifest.kind !== "UNSAT_CANDIDATE_V1" && manifest.kind !== "UNSAT_PROOF_V1") ||
       (manifest.kind === "SAT_MODEL_V1" && manifest.artifactSha256 !== value.evidenceSha256)
+      || (manifest.kind === "UNSAT_PROOF_V1" && manifest.artifactSha256 !== value.evidenceSha256)
     ) {
       return { ok: false, code: "INVALID_MESSAGE" };
     }
@@ -341,6 +347,7 @@ function parseCubeTask(value: unknown): CubeTask | null {
     (value.parentTaskId !== null && !isId(value.parentTaskId)) ||
     !isBoundedInteger(value.depth, 0, 64) || !Array.isArray(value.assumptions) ||
     value.assumptions.length > 64 ||
+    (value.purpose !== "SEARCH" && value.purpose !== "PROOF_FINISHER") ||
     !value.assumptions.every((literal) => isBoundedInteger(literal, -0x7fff_ffff, 0x7fff_ffff) && literal !== 0)
   ) return null;
   return {
@@ -348,6 +355,7 @@ function parseCubeTask(value: unknown): CubeTask | null {
     parentTaskId: value.parentTaskId,
     depth: value.depth,
     assumptions: [...value.assumptions] as number[],
+    purpose: value.purpose,
   };
 }
 
@@ -474,8 +482,18 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
   if (value.type === "JOB_CANCELLED" && (value.reason === "OWNER_CANCELLED" || value.reason === "EXPIRED")) {
     return { ok: true, message: { ...base, type: "JOB_CANCELLED", reason: value.reason } };
   }
-  if (value.type === "JOB_RESULT" && value.result === "SAT_VERIFIED" && isId(value.taskId)) {
-    return { ok: true, message: { ...base, type: "JOB_RESULT", result: value.result, taskId: value.taskId } };
+  if (value.type === "JOB_RESULT" &&
+    (["SAT_VERIFIED", "UNSAT_CERTIFIED", "UNSAT_OWNER_VERIFIED"] as const).includes(value.result as JobResultMessage["result"]) &&
+    isId(value.taskId)) {
+    return {
+      ok: true,
+      message: {
+        ...base,
+        type: "JOB_RESULT",
+        result: value.result as JobResultMessage["result"],
+        taskId: value.taskId,
+      },
+    };
   }
   return { ok: false, code: "INVALID_MESSAGE" };
 }

@@ -172,4 +172,4 @@ Everything else remains a candidate, is requeued, becomes `UNKNOWN`, or marks
 the input invalid. That invariant is what lets later swarm scheduling improve
 throughput without weakening the meaning of an answer.
 
-Next: fair public-swarm scheduling *(added in Phase 8)*.
+Next: [How the public swarm shares compute fairly →](05-fair-swarm-scheduling.md)

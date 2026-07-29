@@ -27,6 +27,7 @@ export interface WorkerCapabilities {
   maxWorkers: number;
   mobile: boolean;
   solverVersion: string;
+  calibratedConflictsPerSecond?: number;
 }
 
 export interface CubeTask {
@@ -222,7 +223,7 @@ function hasBase(value: Record<string, unknown>): boolean {
   return isId(value.messageId) && isId(value.jobId);
 }
 
-function parseCapabilities(value: unknown): WorkerCapabilities | null {
+export function parseWorkerCapabilities(value: unknown): WorkerCapabilities | null {
   if (!isRecord(value)) return null;
   if (
     !isBoundedInteger(value.hardwareConcurrency, 1, 256) ||
@@ -230,13 +231,18 @@ function parseCapabilities(value: unknown): WorkerCapabilities | null {
     typeof value.mobile !== "boolean" ||
     typeof value.solverVersion !== "string" ||
     value.solverVersion.length < 1 ||
-    value.solverVersion.length > 64
+    value.solverVersion.length > 64 ||
+    (value.calibratedConflictsPerSecond !== undefined &&
+      !isBoundedInteger(value.calibratedConflictsPerSecond, 1, 10_000_000))
   ) return null;
   return {
     hardwareConcurrency: value.hardwareConcurrency,
     maxWorkers: value.maxWorkers,
     mobile: value.mobile,
     solverVersion: value.solverVersion,
+    ...(typeof value.calibratedConflictsPerSecond === "number"
+      ? { calibratedConflictsPerSecond: value.calibratedConflictsPerSecond }
+      : {}),
   };
 }
 
@@ -254,7 +260,7 @@ export function parseCoordinatorClientMessage(value: unknown): CoordinatorMessag
     jobId: value.jobId as string,
   };
   if (value.type === "HELLO") {
-    const capabilities = parseCapabilities(value.capabilities);
+    const capabilities = parseWorkerCapabilities(value.capabilities);
     if (!isId(value.sessionId) || !capabilities) return { ok: false, code: "INVALID_MESSAGE" };
     return { ok: true, message: { ...base, type: "HELLO", sessionId: value.sessionId, capabilities } };
   }

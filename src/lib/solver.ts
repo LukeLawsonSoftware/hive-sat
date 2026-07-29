@@ -1,4 +1,4 @@
-import { decodeHiveCnfV1, sha256Hex, type HiveCnfV1 } from "./formula/hiveCnf";
+import { createClauseBatches, decodeHiveCnfV1, sha256Hex, type HiveCnfV1 } from "./formula/hiveCnf";
 import {
   MAX_COMPRESSED_FORMULA_BYTES,
   MAX_DECOMPRESSED_DIMACS_BYTES,
@@ -16,7 +16,8 @@ import type {
 export type SolverPhase =
   | "empty"
   | "ready"
-  | "queued"
+  | "preparing"
+  | "prepared"
   | "distributing"
   | "solving"
   | "result"
@@ -53,6 +54,7 @@ export interface SolverProgress {
 export interface SolverSnapshot {
   phase: SolverPhase;
   file: SelectedFile | null;
+  prepared: FormulaMetadata | null;
   result: SolverResult | null;
   message: string | null;
   progress: SolverProgress | null;
@@ -63,6 +65,8 @@ export type SolverListener = () => void;
 export interface SolverClient {
   getSnapshot(): SolverSnapshot;
   select(file: File): void;
+  prepare(): void;
+  solveLocally(): void;
   start(): void;
   cancel(): void;
   reset(): void;
@@ -81,6 +85,7 @@ export type SolverWorkerFactory = (kind: "formula" | "solver") => WorkerLike;
 const EMPTY_SNAPSHOT: SolverSnapshot = {
   phase: "empty",
   file: null,
+  prepared: null,
   result: null,
   message: null,
   progress: null,
@@ -135,35 +140,23 @@ export class BrowserSolverClient implements SolverClient {
     this.update({
       phase: "ready",
       file: selectedFile(file),
+      prepared: null,
       result: null,
       message: null,
       progress: null,
     });
   }
 
-  start(): void {
-    if (!this.file || !["ready", "result", "error"].includes(this.snapshot.phase)) return;
-
-    if (this.solverWorker && this.solverLoaded && !this.solverFinished && this.requestId) {
-      this.solveStartedAt ||= performance.now();
-      this.update({
-        ...this.snapshot,
-        phase: "solving",
-        result: null,
-        message: null,
-        progress: { stage: "solving" },
-      });
-      this.postSolver({ type: "solve", requestId: this.requestId });
-      return;
-    }
+  prepare(): void {
+    if (!this.file || !["ready", "error"].includes(this.snapshot.phase)) return;
 
     this.disposeRuntime();
     const requestId = `local-${Date.now().toString(36)}-${++this.requestSequence}`;
     this.requestId = requestId;
-    this.solveStartedAt = performance.now();
     this.update({
-      phase: "queued",
+      phase: "preparing",
       file: selectedFile(this.file),
+      prepared: null,
       result: null,
       message: "Reading and validating DIMACS input…",
       progress: { stage: "reading", bytesRead: 0, totalBytes: this.file.size },
@@ -181,6 +174,68 @@ export class BrowserSolverClient implements SolverClient {
     }
   }
 
+  solveLocally(): void {
+    if (!this.file) return;
+
+    if (this.solverWorker && this.solverLoaded && !this.solverFinished && this.requestId) {
+      this.solveStartedAt ||= performance.now();
+      this.update({
+        ...this.snapshot,
+        phase: "solving",
+        result: null,
+        message: null,
+        progress: { stage: "solving" },
+      });
+      this.postSolver({ type: "solve", requestId: this.requestId });
+      return;
+    }
+
+    if (!this.formula || !this.metadata) {
+      this.prepare();
+      return;
+    }
+
+    this.solverWorker?.terminate();
+    this.solverWorker = null;
+    this.solverLoaded = false;
+    this.solverFinished = false;
+    this.solveStartedAt = performance.now();
+    this.update({
+      phase: "distributing",
+      file: selectedFile(this.file),
+      prepared: this.metadata,
+      result: null,
+      message: "Loading the prepared formula into CaDiCaL…",
+      progress: { stage: "loading" },
+    });
+
+    try {
+      const worker = this.workerFactory("solver");
+      this.solverWorker = worker;
+      worker.onmessage = (event) => this.onSolverMessage(event.data as SolverWorkerResponse);
+      worker.onerror = (event) => this.fail(event.message || "Solver worker failed.");
+      const requestId = this.requestId ?? `local-${Date.now().toString(36)}-${++this.requestSequence}`;
+      this.requestId = requestId;
+      this.postSolver({ type: "initialize", requestId, metadata: this.metadata });
+      const batches = createClauseBatches(this.formula.clauses);
+      batches.forEach((batch, sequence) => {
+        this.postSolver({
+          type: "clause-batch",
+          requestId,
+          sequence,
+          last: sequence === batches.length - 1,
+          literals: batch,
+        }, [batch.buffer as ArrayBuffer]);
+      });
+    } catch (error) {
+      this.fail(error instanceof Error ? error.message : "Unable to start the local solver.");
+    }
+  }
+
+  start(): void {
+    this.solveLocally();
+  }
+
   cancel(): void {
     if (!this.file) return;
     if (this.requestId && this.formulaWorker) {
@@ -192,6 +247,7 @@ export class BrowserSolverClient implements SolverClient {
       this.update({
         phase: "ready",
         file: selectedFile(this.file),
+        prepared: null,
         result: null,
         message: "Formula processing cancelled. The file is still ready.",
         progress: null,
@@ -202,8 +258,9 @@ export class BrowserSolverClient implements SolverClient {
     if (this.requestId && this.solverWorker && !this.solverFinished) {
       this.postSolver({ type: "pause", requestId: this.requestId });
       this.update({
-        phase: "ready",
+        phase: "prepared",
         file: selectedFile(this.file),
+        prepared: this.metadata,
         result: null,
         message: "Solve paused. Resume continues the current bounded CaDiCaL search.",
         progress: null,
@@ -214,8 +271,9 @@ export class BrowserSolverClient implements SolverClient {
     if (this.snapshot.phase === "result" || this.snapshot.phase === "error") {
       this.disposeRuntime();
       this.update({
-        phase: "ready",
+        phase: this.metadata ? "prepared" : "ready",
         file: selectedFile(this.file),
+        prepared: this.metadata,
         result: null,
         message: null,
         progress: null,
@@ -232,7 +290,7 @@ export class BrowserSolverClient implements SolverClient {
   private async onFormulaMessage(message: FormulaWorkerResponse): Promise<void> {
     if (message.requestId !== this.requestId) return;
     if (message.type === "progress") {
-      if (this.snapshot.phase !== "queued") return;
+      if (this.snapshot.phase !== "preparing") return;
       const labels = {
         reading: "Reading and validating DIMACS input…",
         encoding: "Creating deterministic HiveCnfV1 bytes…",
@@ -268,29 +326,12 @@ export class BrowserSolverClient implements SolverClient {
       this.formulaWorker = null;
       this.update({
         ...this.snapshot,
-        phase: "distributing",
+        phase: "prepared",
+        prepared: message.metadata,
         message: message.metadata.cacheHit
-          ? "Verified cache hit. Loading CaDiCaL…"
-          : "Formula verified and cached. Loading CaDiCaL…",
-        progress: { stage: "loading" },
-      });
-
-      const worker = this.workerFactory("solver");
-      this.solverWorker = worker;
-      worker.onmessage = (event) => this.onSolverMessage(event.data as SolverWorkerResponse);
-      worker.onerror = (event) => this.fail(event.message || "Solver worker failed.");
-      this.postSolver({ type: "initialize", requestId: message.requestId, metadata: message.metadata });
-      message.batches.forEach((batch, sequence) => {
-        this.postSolver(
-          {
-            type: "clause-batch",
-            requestId: message.requestId,
-            sequence,
-            last: sequence === message.batches.length - 1,
-            literals: batch,
-          },
-          [batch.buffer as ArrayBuffer],
-        );
+          ? "Formula verified from the local cache. Ready to submit."
+          : "Formula verified and cached. Ready to submit.",
+        progress: null,
       });
     } catch (error) {
       this.fail(error instanceof Error ? error.message : "Formula verification failed.");
@@ -344,6 +385,7 @@ export class BrowserSolverClient implements SolverClient {
     this.update({
       phase: "result",
       file: this.snapshot.file,
+      prepared: this.metadata,
       result: {
         verdict: message.verdict,
         elapsedMs: Math.max(0, performance.now() - this.solveStartedAt),
@@ -376,6 +418,7 @@ export class BrowserSolverClient implements SolverClient {
     this.update({
       phase: "error",
       file: this.file ? selectedFile(this.file) : this.snapshot.file,
+      prepared: this.metadata,
       result: null,
       message,
       progress: null,

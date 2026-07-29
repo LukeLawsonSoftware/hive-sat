@@ -3,6 +3,7 @@ import { devices, expect, test } from "@playwright/test";
 test.describe("Phase 9 Swarm Mode", () => {
   test("defaults paused and labels contribution telemetry honestly", async ({ page }) => {
     await page.goto("/swarm");
+    await expect(page.getByRole("link", { name: "Exit Swarm Mode" })).toHaveAttribute("href", "/");
     await expect(page.getByRole("button", { name: "Start contributing" })).toBeVisible();
     await expect(page.getByRole("checkbox", { name: /Pause when hidden/i })).toBeChecked();
     await expect(page.getByText("Wasm allocation now")).toBeVisible();

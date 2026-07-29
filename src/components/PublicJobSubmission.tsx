@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { VerifiedFormulaCache } from "../lib/formula/cache";
 import { submitPublicJob } from "../lib/publicJobs";
+import type { FormulaMetadata } from "../lib/formula/workerProtocol";
 
 interface TurnstileApi {
   render(container: HTMLElement, options: {
@@ -23,7 +24,13 @@ interface HealthResponse {
   turnstileSiteKey?: string;
 }
 
-export function PublicJobSubmission({ formulaHash }: { formulaHash: string }) {
+export function PublicJobSubmission({
+  formula,
+  filename,
+}: {
+  formula: FormulaMetadata;
+  filename: string;
+}) {
   const [siteKey, setSiteKey] = useState<string | null>(null);
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [consent, setConsent] = useState(false);
@@ -84,12 +91,13 @@ export function PublicJobSubmission({ formulaHash }: { formulaHash: string }) {
     setSubmitting(true);
     setMessage(null);
     try {
-      const cachedFormula = await new VerifiedFormulaCache().get(formulaHash);
+      const cachedFormula = await new VerifiedFormulaCache().get(formula.hash);
       if (!cachedFormula) throw new Error("The verified local formula is no longer cached. Run the solve again.");
       const job = await submitPublicJob({
         turnstileToken,
         publicConsent: true,
         cachedFormula,
+        filename,
       });
       window.location.assign(job.ownerUrl);
     } catch (error) {
@@ -105,11 +113,11 @@ export function PublicJobSubmission({ formulaHash }: { formulaHash: string }) {
 
   return (
     <section className="public-submit" aria-labelledby="public-submit-title">
-      <p className="eyebrow">Optional public job</p>
-      <h4 id="public-submit-title">Send this formula to the browser swarm</h4>
+      <p className="eyebrow">Public swarm job</p>
+      <h3 id="public-submit-title">Ready to submit</h3>
       <p>
-        Every server-submitted formula is public to participating browsers for 24 hours.
-        Confidential and private jobs are not supported.
+        This formula will be downloadable by participating browsers for up to 24 hours.
+        Do not submit confidential or sensitive instances.
       </p>
       <label className="consent-row">
         <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />
@@ -123,7 +131,7 @@ export function PublicJobSubmission({ formulaHash }: { formulaHash: string }) {
         disabled={!consent || !turnstileToken || submitting}
         onClick={() => void submit()}
       >
-        {submitting ? "Creating public job…" : "Create public job"}
+        {submitting ? "Submitting to swarm…" : "Submit to swarm"}
       </button>
     </section>
   );

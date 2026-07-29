@@ -1,7 +1,6 @@
 import {
   type ChangeEvent,
   type DragEvent,
-  useEffect,
   useRef,
   useState,
 } from "react";
@@ -12,9 +11,9 @@ import {
   FileIcon,
   HexIcon,
   NetworkIcon,
-  ShieldIcon,
   XIcon,
 } from "../components/Icons";
+import { AppHeader } from "../components/AppHeader";
 import { useBrowserSolver } from "../hooks/useBrowserSolver";
 import {
   formatFileSize,
@@ -24,13 +23,11 @@ import {
 import { formatDimacsSatModel, modelDownloadFilename } from "../lib/formula/modelOutput";
 import { PublicJobSubmission } from "../components/PublicJobSubmission";
 
-const HIVE_PREFERENCE_KEY = "hivesat:hive-enabled";
-
 const phaseDetails: Record<
-  Extract<SolverPhase, "queued" | "distributing" | "solving">,
+  Extract<SolverPhase, "preparing" | "distributing" | "solving">,
   { eyebrow: string; title: string; body: string; step: number }
 > = {
-  queued: {
+  preparing: {
     eyebrow: "Step 1 of 3",
     title: "Validating the formula",
     body: "Strictly parsing DIMACS and creating a deterministic, hashed encoding.",
@@ -50,33 +47,13 @@ const phaseDetails: Record<
   },
 };
 
-function readHivePreference(): boolean {
-  try {
-    const stored = window.localStorage.getItem(HIVE_PREFERENCE_KEY);
-    return stored === null ? true : stored === "true";
-  } catch {
-    return true;
-  }
-}
-
 function HomePage() {
   const { client, snapshot } = useBrowserSolver();
-  const [hiveEnabled, setHiveEnabled] = useState(readHivePreference);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const isActive = ["queued", "distributing", "solving"].includes(snapshot.phase);
-  const hasPersonalJob = isActive || snapshot.phase === "result" || snapshot.phase === "error";
-  const helpingCount = hiveEnabled ? (hasPersonalJob ? 2 : 4) : 0;
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(HIVE_PREFERENCE_KEY, String(hiveEnabled));
-    } catch {
-      // The preference stays in memory when storage is unavailable.
-    }
-  }, [hiveEnabled]);
+  const isActive = ["preparing", "distributing", "solving"].includes(snapshot.phase);
 
   function selectFile(file: File | undefined) {
     if (!file) return;
@@ -89,6 +66,7 @@ function HomePage() {
 
     setValidationError(null);
     client.select(file);
+    client.prepare();
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -107,59 +85,25 @@ function HomePage() {
     client.reset();
   }
 
-  function toggleHive() {
-    setHiveEnabled((enabled) => !enabled);
-  }
-
   return (
     <div className="site-shell">
-      <header className="site-header">
-        <a className="brand" href="#top" aria-label="HiveSAT home">
-          <span className="brand-mark" aria-hidden="true">
-            <HexIcon />
-          </span>
-          <span>HiveSAT</span>
-        </a>
-
-        <div className="header-actions">
-          <a className="text-link header-link" href="#how-it-works">
-            How it works
-          </a>
-          <div className={`header-hive ${hiveEnabled ? "is-on" : ""}`}>
-            <span className="status-dot" aria-hidden="true" />
-            <span className="header-hive-copy">
-              <strong>{hiveEnabled ? "Hive active" : "Hive paused"}</strong>
-              <small>{hiveEnabled ? `Helping ${helpingCount}` : "Not contributing"}</small>
-            </span>
-            <button
-              className="switch"
-              type="button"
-              role="switch"
-              aria-checked={hiveEnabled}
-              aria-label="Join the hive"
-              onClick={toggleHive}
-            >
-              <span />
-            </button>
-          </div>
-        </div>
-      </header>
+      <AppHeader current="home" />
 
       <main id="top">
-        <section className="hero section-wrap" aria-labelledby="hero-title">
+        <section className="hero home-hero section-wrap" aria-labelledby="hero-title">
           <div className="hero-copy">
             <div className="kicker">
               <span className="kicker-line" />
               Browser-native distributed compute
             </div>
             <h1 id="hero-title">
-              Many browsers.
+              Send one hard problem.
               <br />
-              <span>One hard problem.</span>
+              <span>Let the swarm explore.</span>
             </h1>
             <p className="hero-lede">
-              Submit a Boolean satisfiability problem and let a hive of browsers
-              explore the search space together.
+              Upload a DIMACS formula, submit it as a public job, and follow the
+              verified result from this browser.
             </p>
             <div className="hero-notes" aria-label="Product details">
               <span><CheckIcon /> DIMACS CNF input</span>
@@ -168,21 +112,21 @@ function HomePage() {
             </div>
           </div>
 
-          <div className="demo-banner" role="note">
-            <span className="demo-tag">Local solver</span>
+          <div className="demo-banner home-hero-note" role="note">
+            <span className="demo-tag">Public by design</span>
             <p>
-              DIMACS parsing, SHA-256 hashing, model verification, and bounded
-              CaDiCaL solving all run in dedicated workers in this browser.
+              Swarm jobs are downloadable by participating browsers for up to 24 hours.
+              Keep sensitive formulas on your device with the local solver.
             </p>
           </div>
         </section>
 
-        <section className="workbench section-wrap" aria-label="SAT solver workspace">
-          <div className="solver-card">
+        <section className="workbench home-workbench section-wrap" aria-label="SAT job submission">
+          <div className="solver-card submit-card">
             <div className="card-heading">
               <div>
-                <p className="eyebrow">Your instance</p>
-                <h2>{hasPersonalJob ? "Your solve" : "Start a solve"}</h2>
+                <p className="eyebrow">New public job</p>
+                <h2>{snapshot.file ? "Prepare your formula" : "Submit to the swarm"}</h2>
               </div>
               <span className="card-index">01</span>
             </div>
@@ -247,36 +191,55 @@ function HomePage() {
                   <p className="inline-notice" role="status">{snapshot.message}</p>
                 )}
 
-                <div className="solver-actions">
-                  {snapshot.file && (
-                    <button
-                      className="text-button"
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                    >
+                {snapshot.file && (
+                  <div className="solver-actions">
+                    <button className="text-button" type="button" onClick={() => fileInputRef.current?.click()}>
                       Replace file
                     </button>
-                  )}
-                  <button
-                    className="primary-button"
-                    type="button"
-                    disabled={!snapshot.file}
-                    onClick={() => client.start()}
-                  >
-                    <span>Solve instance</span>
-                    <ArrowUpIcon />
-                  </button>
-                </div>
+                    <button className="primary-button" type="button" onClick={() => client.prepare()}>
+                      Prepare formula <ArrowUpIcon />
+                    </button>
+                  </div>
+                )}
+
               </>
             )}
 
             {isActive && snapshot.file && (
               <SolveProgress
-                phase={snapshot.phase as "queued" | "distributing" | "solving"}
+                phase={snapshot.phase as "preparing" | "distributing" | "solving"}
                 filename={snapshot.file.name}
                 progress={snapshot.progress}
                 onCancel={() => client.cancel()}
               />
+            )}
+
+            {snapshot.phase === "prepared" && snapshot.file && snapshot.prepared && (
+              <div className="prepared-panel">
+                <div className="selected-file prepared-file">
+                  <div className="file-icon"><FileIcon /></div>
+                  <div className="file-copy">
+                    <strong>{snapshot.file.name}</strong>
+                    <span>
+                      {snapshot.prepared.variableCount.toLocaleString()} vars · {snapshot.prepared.clauseCount.toLocaleString()} clauses
+                    </span>
+                  </div>
+                  <button className="icon-button" type="button" aria-label={`Remove ${snapshot.file.name}`} onClick={resetFile}>
+                    <XIcon />
+                  </button>
+                </div>
+                {snapshot.message && <p className="inline-notice" role="status">{snapshot.message}</p>}
+                <PublicJobSubmission formula={snapshot.prepared} filename={snapshot.file.name} />
+                <div className="local-solve-option">
+                  <div>
+                    <strong>Prefer to keep it on this device?</strong>
+                    <span>Run the prepared formula locally without uploading it.</span>
+                  </div>
+                  <button className="secondary-button" type="button" onClick={() => client.solveLocally()}>
+                    Solve locally
+                  </button>
+                </div>
+              </div>
             )}
 
             {snapshot.phase === "result" && snapshot.file && snapshot.result && (
@@ -292,25 +255,18 @@ function HomePage() {
                 model={snapshot.result.model}
                 cacheHit={snapshot.result.cacheHit}
                 onReset={resetFile}
-                onSolveAgain={() => client.start()}
+                onSolveAgain={() => client.solveLocally()}
               />
             )}
 
             {snapshot.phase === "error" && snapshot.file && (
               <ErrorPanel
                 message={snapshot.message ?? "The local solve did not complete."}
-                onRetry={() => client.start()}
+                onRetry={() => snapshot.prepared ? client.solveLocally() : client.prepare()}
                 onReset={resetFile}
               />
             )}
           </div>
-
-          <HiveCard
-            enabled={hiveEnabled}
-            helpingCount={helpingCount}
-            hasPersonalJob={hasPersonalJob}
-            onToggle={toggleHive}
-          />
         </section>
 
         <section className="how section-wrap" id="how-it-works" aria-labelledby="how-title">
@@ -338,8 +294,8 @@ function HomePage() {
               <NetworkIcon />
               <h3>Divide the search</h3>
               <p>
-                A later phase will let a Cloudflare Durable Object coordinate the
-                job and distribute independent branches across browsers.
+                A Cloudflare Durable Object coordinates each job and distributes
+                independent search branches across participating browsers.
               </p>
             </article>
             <article className="step-card">
@@ -354,38 +310,16 @@ function HomePage() {
           </div>
         </section>
 
-        <section className="explainer section-wrap" aria-label="About SAT and privacy">
-          <article className="explainer-copy">
-            <p className="eyebrow">Why SAT?</p>
-            <h2>A compact language for difficult decisions.</h2>
-            <p>
-              Boolean satisfiability asks whether variables can be assigned true or
-              false so that every constraint is satisfied. It sits underneath
-              planning, verification, scheduling, circuit design, and countless
-              other computational problems.
-            </p>
-            <p>
-              SAT is also famously hard in the general case. That makes it an ideal
-              laboratory for cooperative browser compute: many independent search
-              branches can be explored at the same time.
-            </p>
-          </article>
-
-          <aside className="privacy-card">
-            <div className="privacy-icon"><ShieldIcon /></div>
-            <p className="eyebrow">Before you upload</p>
-            <h2>Assume hive work is visible.</h2>
-            <p>
-              In the future distributed version, formulas or derived work units may
-              be sent to other participating browsers. Do not submit confidential or
-              sensitive instances.
-            </p>
-            <div className="privacy-rule" />
-            <p className="privacy-footnote">
-              <strong>Right now:</strong> the selected formula is parsed and solved
-              locally. It is cached by hash in this browser and is not uploaded.
-            </p>
-          </aside>
+        <section className="home-disclosure section-wrap" aria-label="Public formula notice">
+          <div>
+            <p className="eyebrow">Know where your formula runs</p>
+            <h2>Public swarm or private local solve—you choose.</h2>
+          </div>
+          <p>
+            Public jobs are uploaded for up to 24 hours and can be downloaded by
+            participating browsers. Local solving keeps the formula on this device.
+            <a className="text-link" href="https://github.com/LukeLawsonSoftware/hive-sat/blob/main/docs/privacy-and-trust.md"> Read the privacy model</a>.
+          </p>
         </section>
       </main>
 
@@ -402,7 +336,7 @@ function HomePage() {
 }
 
 interface SolveProgressProps {
-  phase: "queued" | "distributing" | "solving";
+  phase: "preparing" | "distributing" | "solving";
   filename: string;
   progress: import("../lib/solver").SolverProgress | null;
   onCancel: () => void;
@@ -423,7 +357,7 @@ function SolveProgress({ phase, filename, progress, onCancel }: SolveProgressPro
       <p className="eyebrow">{details.eyebrow} · Local browser worker</p>
       <h3>{details.title}</h3>
       <p>{details.body}</p>
-      {phase === "queued" && (
+      {phase === "preparing" && (
         <p className="progress-detail">
           {percentage !== null ? `${percentage}% read` : "Reading stream"}
           {progress?.line ? ` · line ${progress.line.toLocaleString()}` : ""}
@@ -519,7 +453,6 @@ function ResultPanel({
           New instance <ArrowUpIcon />
         </button>
       </div>
-      <PublicJobSubmission formulaHash={formulaHash} />
     </div>
   );
 }
@@ -542,62 +475,6 @@ function ErrorPanel({ message, onRetry, onReset }: ErrorPanelProps) {
         <button className="primary-button" type="button" onClick={onRetry}>Try again</button>
       </div>
     </div>
-  );
-}
-
-interface HiveCardProps {
-  enabled: boolean;
-  helpingCount: number;
-  hasPersonalJob: boolean;
-  onToggle: () => void;
-}
-
-function HiveCard({ enabled, helpingCount, hasPersonalJob, onToggle }: HiveCardProps) {
-  return (
-    <aside className={`hive-card ${enabled ? "is-active" : ""}`} aria-labelledby="hive-card-title">
-      <div className="hive-visual" aria-hidden="true">
-        <span className="hive-cell cell-one"><HexIcon /></span>
-        <span className="hive-cell cell-two"><HexIcon /></span>
-        <span className="hive-cell cell-three"><HexIcon /></span>
-        <span className="hive-pulse" />
-      </div>
-      <div className="hive-content">
-        <p className="eyebrow">Your browser</p>
-        <h2 id="hive-card-title">
-          {enabled ? (
-            <>Helping <span>{helpingCount}</span> other {helpingCount === 1 ? "instance" : "instances"}</>
-          ) : (
-            "Contribution paused"
-          )}
-        </h2>
-        <p>
-          {enabled
-            ? hasPersonalJob
-              ? "Your local solve has priority. Public contribution starts only on the Swarm Mode page."
-              : "Your contribution preference is enabled. Open Swarm Mode when you want to start public work."
-            : "Your browser is not accepting hive work. You can rejoin at any time."}
-        </p>
-      </div>
-      <div className="hive-control">
-        <div>
-          <strong>Join the hive</strong>
-          <span>{enabled ? "Contribution enabled" : "Contribution disabled"}</span>
-        </div>
-        <button
-          className="switch large"
-          type="button"
-          role="switch"
-          aria-checked={enabled}
-          aria-label="Join the hive from contribution panel"
-          onClick={onToggle}
-        >
-          <span />
-        </button>
-      </div>
-      <p className="hive-disclosure">
-        Public work runs only on <a href="/swarm">Swarm Mode</a> · Preference saved on this device
-      </p>
-    </aside>
   );
 }
 

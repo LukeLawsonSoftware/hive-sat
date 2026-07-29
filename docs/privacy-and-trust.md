@@ -12,8 +12,8 @@ creates a public job and completes the consent checkbox.
 
 ## Data retained
 
-- R2 stores the canonical gzip formula and any model or proof artifacts under
-  a job-scoped prefix.
+- Workers KV stores the canonical gzip formula and any model or proof artifacts
+  under unique job-scoped keys with the job's absolute expiration.
 - Job coordinator SQL stores formula metadata, cube tasks, leases, candidate
   manifests, verification state, and aggregate session reliability.
 - The directory stores HMACed network identifiers, SHA-256 device identifiers,
@@ -27,8 +27,9 @@ server. Public share links exclude the owner token.
 
 ## Retention
 
-Jobs and their R2 artifacts are designed to expire after 24 hours. Alarms
-delete formula, model, proof, coordinator, and directory state. Local browser
+Jobs and their KV artifacts are designed to expire after 24 hours. KV expiration
+is the backstop, while coordinator alarms delete formula, model, proof,
+coordinator, and directory state. Local browser
 caches and aggregate contribution totals remain on that device until their
 normal cache lifecycle or the user's reset action.
 

@@ -2,7 +2,7 @@
 
 ## Summary
 
-HiveSAT will evolve from the current simulated UI into an anonymous, public browser-compute SAT platform built around CaDiCaL WebAssembly, per-job Durable Objects, R2 formula storage, and a credit-free fair scheduler.
+HiveSAT will evolve from the current simulated UI into an anonymous, public browser-compute SAT platform built around CaDiCaL WebAssembly, per-job Durable Objects, Workers KV formula storage, and a credit-free fair scheduler.
 
 Every phase is one independently mergeable branch and PR:
 
@@ -17,7 +17,7 @@ each phase starts from the immediately preceding phase branch.
 No additional pull requests are created; the stack is left for manual
 integration in reverse order.
 
-Incomplete user-facing behavior remains behind feature flags. The architecture is intentionally conservative because Workers Free permits 100,000 dynamic requests/day and 10 ms CPU per Worker request; Durable Objects and R2 have separate free allowances. Static assets should remain assets-first, while parsing, hashing, SAT solving, and large verification happen in browsers or bounded verifier Durable Objects. [Workers limits](https://developers.cloudflare.com/workers/platform/limits/), [Static Assets billing](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), [R2 pricing](https://developers.cloudflare.com/r2/pricing/).
+Incomplete user-facing behavior remains behind feature flags. The architecture is intentionally conservative because Workers Free permits 100,000 dynamic requests/day and 10 ms CPU per Worker request; Durable Objects and Workers KV have separate free allowances. Static assets should remain assets-first, while parsing, hashing, SAT solving, and large verification happen in browsers or bounded verifier Durable Objects. [Workers limits](https://developers.cloudflare.com/workers/platform/limits/), [Static Assets billing](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), [Workers KV pricing](https://developers.cloudflare.com/kv/platform/pricing/).
 
 ## Target Architecture and Interfaces
 
@@ -28,16 +28,16 @@ Incomplete user-facing behavior remains behind feature flags. The architecture i
   - Web Locks plus `BroadcastChannel` elect one active runtime per browser profile to prevent tabs from oversubscribing the device.
 
 - Cloudflare runtime:
-  - The stateless Worker handles `/api/v1/*`, Turnstile, validation, token checks, streaming R2 transfers, and routing.
-  - `JobCoordinatorDO`: one SQLite-backed object per job; owns task state, leases, cube coverage, aggregate status, WebSockets, and expiry.
+  - The stateless Worker handles `/api/v1/*`, Turnstile, validation, token checks, and routing.
+  - `JobCoordinatorDO`: one SQLite-backed object per job; owns task state, leases, cube coverage, aggregate status, WebSockets, artifact streaming, and expiry.
   - `SwarmDirectoryDO`: one lightweight directory for admission and equal-service job selection. It never handles solver heartbeats or task queues and remains shard-ready.
   - `ResultVerifierDO`: one short-lived object per bounded SAT/proof verification so expensive checking never blocks job coordination.
-  - R2 Standard stores compressed formulas, models, and proof artifacts; all are deleted after 24 hours.
+  - Workers KV stores compressed formulas, models, and proof artifacts; all expire after 24 hours.
   - Hibernating WebSockets, attachments, auto-responses, and sparse messages are mandatory. [Cloudflare WebSocket guidance](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
 
 - Public HTTP surface:
   - `POST /api/v1/jobs`: validate Turnstile and metadata; return `jobId`, one-use upload token, owner token, and expiry.
-  - `PUT /api/v1/jobs/{jobId}/formula`: stream the compressed canonical formula into R2.
+  - `PUT /api/v1/jobs/{jobId}/formula`: stream the compressed canonical formula into Workers KV.
   - `GET /api/v1/jobs/{jobId}`: public aggregate status without owner secrets.
   - `POST /api/v1/jobs/{jobId}/cancel`: owner-token protected.
   - `GET /api/v1/jobs/{jobId}/socket`: lease-scoped Job Coordinator WebSocket.
@@ -46,7 +46,7 @@ Incomplete user-facing behavior remains behind feature flags. The architecture i
 
 - Versioned shared contracts:
   - `HiveCnfV1`, `JobState`, `TaskState`, `CubeTask`, `WorkerCapabilities`, `Lease`, `ResultManifest`, `ProofManifest`, and `SwarmSnapshot`.
-  - JSON control messages use discriminated unions and runtime validation; large payloads live in R2.
+  - JSON control messages use discriminated unions and runtime validation; large payloads live in Workers KV.
   - Every message includes `protocolVersion`, `messageId`, `jobId`, and applicable `taskId`/`leaseId`.
   - Unsupported clients receive `UPGRADE_REQUIRED`; duplicate messages and results are idempotent.
 
@@ -107,14 +107,14 @@ Branch: `codex/hivesat-04-job-platform`
 
 - [x] Add anonymous device IDs, Turnstile-protected job creation, unguessable job IDs, and cryptographic owner/upload tokens. Store only token digests server-side. Device identity is retained in IndexedDB; network identifiers use an HMAC digest before admission storage.
 - [x] Store the owner token in IndexedDB and an owner-only URL fragment; public share links exclude it.
-- [x] Stream formulas to job-scoped R2 keys and verify their declared hash in every solver browser after download. Downloads are gzip-expanded under the canonical-size cap, decoded as HiveCnfV1, and SHA-256 checked before use.
+- [x] Stream formulas to job-scoped Workers KV keys and verify their declared hash in every solver browser after download. Downloads are gzip-expanded under the canonical-size cap, decoded as HiveCnfV1, and SHA-256 checked before use.
 - [x] Create `JobCoordinatorDO` and `SwarmDirectoryDO` SQLite schemas, root-task initialization, public status reads, cancellation, and 24-hour alarms. The append-only namespace migration is `v0001_job_platform`.
 - [x] Enforce one active job and three creations per rolling day per device/network digest, plus a configurable global active-job ceiling.
 - [x] Require explicit consent that every submitted formula is public to swarm participants; there is no private server-job mode. The existing browser-only solver remains separate and uploads nothing.
 
 Phase 4 implementation note: local development uses Cloudflare's published
 Turnstile test widget/secret and enables public jobs. Production stays disabled
-until the R2 bucket, production Turnstile widget, `TURNSTILE_SECRET`, and
+until the Workers KV namespace, production Turnstile widget, `TURNSTILE_SECRET`, and
 `NETWORK_DIGEST_KEY` are configured and the exit-gate smoke test is performed.
 The public API and trust boundary are documented in
 `docs/public-job-platform.md`.
@@ -167,7 +167,7 @@ Exit gate: several browser contexts can solve complementary cubes, recover from 
 Branch: `codex/hivesat-07-results`
 
 - [x] Encode SAT models as compact bitsets with formula, cube, path, and solver-version metadata. `HSMODL01` artifacts carry bounded JSON metadata plus one truth bit per variable and are uploaded under their lease ID.
-- [x] Verify final SAT models independently inside a `ResultVerifierDO`; invalid results quarantine that session and requeue the task. The verifier re-reads and hashes both R2 objects, decodes both formats, and checks the cube and every clause.
+- [x] Verify final SAT models independently inside a `ResultVerifierDO`; invalid results quarantine that session and requeue the task. The coordinator reads both KV values and streams them to the verifier, which hashes and decodes both formats before checking the cube and every clause.
 - [x] Treat browser-reported UNSAT as a candidate only. Require an independent repeated solve before requesting proof production, but never promote consensus alone to final UNSAT.
 - [x] Propagate task completion through the tree only when complementary coverage is intact. Upward propagation requires exactly two completed children with the parent prefix and opposite final literals.
 - [x] Define invalid-formula, invalid-model, verification-timeout, exhausted-budget, and conflicting-result behavior explicitly. The fail-closed state table and SAT/UNSAT asymmetry are documented in the sequential guide.
@@ -244,7 +244,7 @@ Branch: `codex/hivesat-10-unsat-proofs`
 
 - [x] Reassign an UNSAT candidate to a fresh proof-finisher CaDiCaL instance with tracing enabled before clauses are loaded.
 - [x] Produce gzip-compressed LRAT for `F ∧ cube`, with a manifest binding the proof to the formula hash, cube assumptions, path hash, clause IDs, solver version, and artifact hash.
-- [x] Stream proofs to R2 under lease-scoped upload tokens. Cap each job at 32 MiB compressed and 128 MiB decompressed proof data; split further or return `UNKNOWN` when exceeded.
+- [x] Stream proofs to Workers KV under lease-scoped upload tokens. Cap each job at 25 MiB compressed and 128 MiB decompressed proof data; split further or return `UNKNOWN` when exceeded.
 - [x] Pin and compile the independent MIT-licensed `lrat-check.c` checker from DRAT-trim for browser and bounded Durable Object use. [DRAT-trim/LRAT checker](https://github.com/marijnheule/drat-trim).
 - [x] Server-certify small proofs within conservative verifier limits. Larger allowed proofs are checked in the owner’s browser:
   - successful local checks produce `UNSAT_OWNER_VERIFIED`;
@@ -257,7 +257,7 @@ adds proof-required tasks and proof artifact state without changing the
 deployed Durable Object namespace. A proof finisher always allocates a new
 CaDiCaL instance, enables LRAT before loading canonical clauses, appends cube
 assumptions as unit clauses with recorded IDs, and uploads gzip evidence under
-its lease. The job-wide limits are 32 MiB compressed and 128 MiB decompressed;
+its lease. The job-wide limits are 25 MiB compressed and 128 MiB decompressed;
 the conservative server checker limits are 2 MiB/8 MiB. Larger allowed proofs
 remain `OWNER_CHECK_REQUIRED` until the owner runs the pinned C checker in a
 Dedicated Worker. Server and owner certification remain distinct public
@@ -273,9 +273,9 @@ Branch: `codex/hivesat-11-launch-hardening`
 
 - [x] Fuzz DIMACS, decompression, WebSocket, API, model, and proof parsers; enforce message, assumption, task, upload, and artifact limits.
 - [x] Add session quarantine, Turnstile replay prevention, HMACed network identifiers, token rotation, CSP/security headers, and structured error responses.
-- [x] Load-test several hundred intermittent clients with realistic 60-second heartbeats and long task leases; verify DO request, duration, row-write, and R2-operation projections remain below configurable safety margins.
+- [x] Load-test several hundred intermittent clients with realistic 60-second heartbeats and long task leases; verify DO request, duration, row-write, and Workers KV-operation projections remain below configurable safety margins.
 - [x] Add admission and swarm kill switches, maximum active connections/jobs, exponential client backoff, quota dashboards, and operator runbooks.
-- [x] Test expiry and R2 cleanup, schema migration, rolling deployment, older-client rejection, and recovery from partial deployment.
+- [x] Test expiry and Workers KV cleanup, schema migration, rolling deployment, older-client rejection, and recovery from partial deployment.
 - [x] Remove simulation copy, enable the public swarm flag, and publish privacy/trust limitations.
 - [ ] Perform the final production smoke test after manual integration. This delivery run explicitly forbids deployments, so no production mutation or smoke test is performed from these stacked branches.
 
@@ -312,5 +312,5 @@ Exit gate: production remains usable when quotas are approached, malicious clien
 - Users may submit jobs without contributing. Other-user computation is explicit opt-in and runs only on `/swarm`.
 - Personal jobs preempt public work on the same device.
 - The roadmap stops at a robust proof-capable core. Learned-clause sharing, full solver checkpoints, adaptive portfolio selection, research-grade scheduling, and a full search-tree UI are deferred.
-- R2 Standard must be enabled through Cloudflare’s subscription flow, although usage is intended to remain inside the free allowance.
+- Workers KV must be available on the Cloudflare account, although usage is intended to remain inside the included allowance.
 - Free-plan operation is a fail-closed target, not a guarantee: capacity is rejected or work returns `UNKNOWN` instead of silently incurring unsupported behavior or weakening correctness.

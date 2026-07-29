@@ -2,10 +2,10 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
   encodeSatModelArtifact,
+  MAX_UNSAT_PROOF_COMPRESSED_BYTES,
+  parseResultManifest,
   resultPathHash,
-  satModelObjectKey,
   type SatResultManifest,
-  unsatProofObjectKey,
   type UnsatProofManifest,
 } from "../shared/result-manifest";
 
@@ -40,6 +40,11 @@ async function gzip(bytes: Uint8Array): Promise<ArrayBuffer> {
   return new Response(stream).arrayBuffer();
 }
 
+function stream(bytes: Uint8Array | ArrayBuffer): ReadableStream {
+  const body = bytes instanceof Uint8Array ? bytes.slice().buffer as ArrayBuffer : bytes;
+  return new Response(body).body!;
+}
+
 async function fixture(model: number[]) {
   const jobId = crypto.randomUUID();
   const taskId = "leaf";
@@ -71,20 +76,43 @@ async function fixture(model: number[]) {
     artifactSha256,
     artifactBytes: artifact.byteLength,
   };
-  const formulaObjectKey = `jobs/${jobId}/formula.hivecnf.gz`;
-  const modelObjectKey = satModelObjectKey(jobId, leaseId);
-  await env.FORMULAS.put(formulaObjectKey, await gzip(encoded));
-  await env.FORMULAS.put(modelObjectKey, artifact);
-  return { jobId, formulaObjectKey, modelObjectKey, manifest, cube };
+  const compressedFormula = await gzip(encoded);
+  return { jobId, compressedFormula, artifact, manifest, cube };
 }
 
 describe("ResultVerifierDO", () => {
+  it("caps compressed proof manifests at the Workers KV value limit", async () => {
+    const base = {
+      kind: "UNSAT_PROOF_V1",
+      version: 1,
+      formulaHash: "ab".repeat(32),
+      taskId: "root",
+      cube: [],
+      pathHash: await resultPathHash([]),
+      solverVersion: "cadical-3.0.1",
+      artifactId: "proof",
+      artifactSha256: "cd".repeat(32),
+      decompressedBytes: 1,
+      originalClauseCount: 0,
+      cubeClauseIds: [],
+      checker: "drat-trim-lrat-check",
+    };
+    expect(parseResultManifest({
+      ...base,
+      compressedBytes: MAX_UNSAT_PROOF_COMPRESSED_BYTES,
+    })).not.toBeNull();
+    expect(parseResultManifest({
+      ...base,
+      compressedBytes: MAX_UNSAT_PROOF_COMPRESSED_BYTES + 1,
+    })).toBeNull();
+  });
+
   it("independently verifies the formula hash, cube, and every SAT clause", async () => {
     const item = await fixture([1, 2]);
     const verifier = env.RESULT_VERIFIERS.getByName(`valid-${item.jobId}`);
     await expect(verifier.verifySat({
-      formulaObjectKey: item.formulaObjectKey,
-      modelObjectKey: item.modelObjectKey,
+      formulaStream: stream(item.compressedFormula),
+      modelStream: stream(item.artifact),
       manifest: item.manifest,
       expectedCube: item.cube,
       expectedVariableCount: 2,
@@ -103,10 +131,8 @@ describe("ResultVerifierDO", () => {
     const proofBytes = new TextEncoder().encode(proofText);
     const compressed = new Uint8Array(await gzip(proofBytes));
     const artifactSha256 = await sha256Hex(compressed);
-    const formulaObjectKey = `jobs/${jobId}/formula.hivecnf.gz`;
     const artifactId = "proof-lease";
-    await env.FORMULAS.put(formulaObjectKey, await gzip(encoded));
-    await env.FORMULAS.put(unsatProofObjectKey(jobId, artifactId), compressed);
+    const compressedFormula = await gzip(encoded);
     const manifest: UnsatProofManifest = {
       kind: "UNSAT_PROOF_V1",
       version: 1,
@@ -125,20 +151,20 @@ describe("ResultVerifierDO", () => {
     };
     const verifier = env.RESULT_VERIFIERS.getByName(`proof-${jobId}`);
     await expect(verifier.verifyUnsat({
-      jobId,
-      formulaObjectKey,
+      formulaStream: stream(compressedFormula),
+      proofStream: stream(compressed),
       manifest,
       expectedCube: [],
     })).resolves.toMatchObject({ status: "VALID_UNSAT", derivedClauses: 1 });
     await expect(verifier.verifyUnsat({
-      jobId,
-      formulaObjectKey,
+      formulaStream: stream(compressedFormula),
+      proofStream: stream(compressed),
       manifest: { ...manifest, artifactSha256: "00".repeat(32) },
       expectedCube: [],
     })).resolves.toMatchObject({ status: "INVALID_PROOF" });
     await expect(verifier.verifyUnsat({
-      jobId,
-      formulaObjectKey,
+      formulaStream: stream(compressedFormula),
+      proofStream: stream(compressed),
       manifest,
       expectedCube: [],
       maxCompressedBytes: compressed.byteLength - 1,
@@ -149,8 +175,8 @@ describe("ResultVerifierDO", () => {
     const invalid = await fixture([1, -2]);
     const verifier = env.RESULT_VERIFIERS.getByName(`invalid-${invalid.jobId}`);
     await expect(verifier.verifySat({
-      formulaObjectKey: invalid.formulaObjectKey,
-      modelObjectKey: invalid.modelObjectKey,
+      formulaStream: stream(invalid.compressedFormula),
+      modelStream: stream(invalid.artifact),
       manifest: invalid.manifest,
       expectedCube: invalid.cube,
       expectedVariableCount: 2,
@@ -158,8 +184,8 @@ describe("ResultVerifierDO", () => {
 
     const valid = await fixture([1, 2]);
     await expect(verifier.verifySat({
-      formulaObjectKey: valid.formulaObjectKey,
-      modelObjectKey: valid.modelObjectKey,
+      formulaStream: stream(valid.compressedFormula),
+      modelStream: stream(valid.artifact),
       manifest: valid.manifest,
       expectedCube: valid.cube,
       expectedVariableCount: 2,

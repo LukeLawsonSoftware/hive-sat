@@ -4,7 +4,6 @@ import {
   MAX_ENCODED_FORMULA_BYTES,
   type CreateJobInput,
   type FormulaDeclaration,
-  formulaObjectKey,
 } from "./contracts";
 import { PUBLIC_JOB_PROTOCOL_VERSION } from "../shared/public-jobs";
 import { hmacSha256Hex, randomToken, sha256Hex } from "./crypto";
@@ -78,10 +77,14 @@ function json(data: unknown, init: ResponseInit = {}): Response {
 }
 
 function apiError(error: ApiError): Response {
-  return json(
+  const response = json(
     { error: { code: error.code, message: error.message, ...error.details } },
     { status: error.status },
   );
+  if (error.code === "ARTIFACT_UNAVAILABLE") {
+    response.headers.set("retry-after", "30");
+  }
+  return response;
 }
 
 async function readSmallJson(request: Request): Promise<unknown> {
@@ -277,7 +280,6 @@ async function createJob(request: Request, env: Env): Promise<Response> {
       formula: input.formula,
       createdAt,
       expiresAt,
-      objectKey: formulaObjectKey(jobId),
     });
   } catch (error) {
     await directory.rollback(jobId);
@@ -303,41 +305,24 @@ async function uploadFormula(request: Request, env: Env, jobId: string): Promise
   }
   const uploadDigest = await sha256Hex(bearerToken(request));
   const coordinator = jobStub(env, jobId);
-  const authorization = await coordinator.authorizeUpload(uploadDigest);
-  if (!authorization.ok) {
-    const status = authorization.code === "INVALID_TOKEN" ? 403 : authorization.code === "NOT_FOUND" ? 404 : 409;
-    throw new ApiError(status, authorization.code, "Formula upload is not authorized for this job.");
-  }
   const contentLength = Number(
     request.headers.get("content-length") ??
     request.headers.get("x-hivesat-content-length") ??
     "NaN",
   );
-  if (!Number.isSafeInteger(contentLength) || contentLength !== authorization.compressedBytes) {
-    throw new ApiError(400, "CONTENT_LENGTH_MISMATCH", "Content-Length must match the declared compressed size.");
-  }
-  if (!request.body || contentLength > MAX_COMPRESSED_FORMULA_BYTES) {
+  if (!Number.isSafeInteger(contentLength) || contentLength < 1 ||
+    !request.body || contentLength > MAX_COMPRESSED_FORMULA_BYTES) {
     throw new ApiError(400, "INVALID_FORMULA_BODY", "A bounded gzip formula body is required.");
   }
 
-  const formulas = requiredBinding(env.FORMULAS, "FORMULAS");
-  const stored = await formulas.put(authorization.objectKey, request.body, {
-    onlyIf: { etagDoesNotMatch: "*" },
-    httpMetadata: { contentType: "application/vnd.hivesat.cnf+gzip" },
-    customMetadata: { formulaHash: authorization.formulaHash, jobId },
-  });
-  if (!stored) throw new ApiError(409, "FORMULA_ALREADY_UPLOADED", "A formula already exists for this job.");
-  if (stored.size !== authorization.compressedBytes) {
-    await formulas.delete(authorization.objectKey);
-    throw new ApiError(400, "UPLOAD_SIZE_MISMATCH", "The uploaded formula size did not match its declaration.");
-  }
-  const completed = await coordinator.completeUpload(uploadDigest, stored.size);
-  if (!completed.ok) {
-    await formulas.delete(authorization.objectKey);
-    throw new ApiError(409, completed.code, "The job could not accept the completed upload.");
+  const stored = await coordinator.storeFormula(uploadDigest, request.body, contentLength);
+  if (!stored.ok) {
+    const status = stored.code === "INVALID_TOKEN" ? 403 : stored.code === "NOT_FOUND" ? 404 :
+      stored.code === "INVALID_BODY" ? 400 : stored.code === "STORAGE_UNAVAILABLE" ? 503 : 409;
+    throw new ApiError(status, stored.code, "The formula could not be stored for this job.");
   }
   await directoryStub(env).markReady(jobId);
-  return json({ jobId, state: "QUEUED", formulaHash: authorization.formulaHash }, { status: 201 });
+  return json({ jobId, state: "QUEUED", formulaHash: stored.formulaHash }, { status: 201 });
 }
 
 async function getStatus(env: Env, jobId: string): Promise<Response> {
@@ -347,19 +332,22 @@ async function getStatus(env: Env, jobId: string): Promise<Response> {
 }
 
 async function downloadFormula(env: Env, jobId: string): Promise<Response> {
-  const status = await jobStub(env, jobId).getStatus();
-  if (!status || ["UPLOADING", "CANCELLED", "INVALID"].includes(status.state)) {
+  const artifact = await jobStub(env, jobId).formulaDownload();
+  if (!artifact.ok) {
+    if (artifact.code === "ARTIFACT_UNAVAILABLE") {
+      throw new ApiError(503, artifact.code, "The public formula is temporarily unavailable.");
+    }
     throw new ApiError(404, "FORMULA_NOT_FOUND", "The public formula is not available.");
   }
-  const object = await requiredBinding(env.FORMULAS, "FORMULAS").get(formulaObjectKey(jobId));
-  if (!object?.body) throw new ApiError(404, "FORMULA_NOT_FOUND", "The public formula is not available.");
-  const headers = new Headers();
-  object.writeHttpMetadata(headers);
-  headers.set("etag", object.httpEtag);
+  const headers = new Headers({
+    "content-type": "application/vnd.hivesat.cnf+gzip",
+    "content-length": String(artifact.bytes),
+  });
+  headers.set("etag", `W/"${artifact.hash}"`);
   headers.set("cache-control", "public, max-age=300, immutable");
-  headers.set("x-hivesat-formula-sha256", status.formula.hash);
+  headers.set("x-hivesat-formula-sha256", artifact.hash);
   headers.set("x-content-type-options", "nosniff");
-  return new Response(object.body, { headers });
+  return new Response(artifact.body, { headers });
 }
 
 async function uploadSatModel(
@@ -372,14 +360,6 @@ async function uploadSatModel(
     throw new ApiError(403, "INVALID_TOKEN", "The model upload token does not match this lease.");
   }
   const coordinator = jobStub(env, jobId);
-  const authorization = await coordinator.authorizeModelUpload(leaseId);
-  if (!authorization.ok) {
-    throw new ApiError(
-      authorization.code === "NOT_FOUND" ? 404 : 409,
-      authorization.code,
-      "This lease cannot upload a SAT model.",
-    );
-  }
   const contentLength = Number(
     request.headers.get("content-length") ??
     request.headers.get("x-hivesat-content-length") ??
@@ -388,31 +368,18 @@ async function uploadSatModel(
   if (
     !Number.isSafeInteger(contentLength) ||
     contentLength < 12 ||
-    contentLength > authorization.maximumBytes ||
     contentLength > MAX_SAT_MODEL_ARTIFACT_BYTES ||
     !request.body
   ) {
     throw new ApiError(400, "INVALID_MODEL_BODY", "A bounded SAT model body with Content-Length is required.");
   }
-  const stored = await requiredBinding(env.FORMULAS, "FORMULAS").put(
-    authorization.objectKey,
-    request.body,
-    {
-      onlyIf: { etagDoesNotMatch: "*" },
-      httpMetadata: { contentType: "application/vnd.hivesat.model" },
-      customMetadata: {
-        jobId,
-        taskId: authorization.task.taskId,
-        formulaHash: authorization.formulaHash,
-      },
-    },
-  );
-  if (!stored) throw new ApiError(409, "MODEL_ALREADY_UPLOADED", "This lease already uploaded a model.");
-  if (stored.size !== contentLength) {
-    await requiredBinding(env.FORMULAS, "FORMULAS").delete(authorization.objectKey);
-    throw new ApiError(400, "UPLOAD_SIZE_MISMATCH", "The model size changed while streaming.");
+  const stored = await coordinator.storeModel(leaseId, request.body, contentLength);
+  if (!stored.ok) {
+    const status = stored.code === "NOT_FOUND" ? 404 : stored.code === "INVALID_BODY" ? 400 :
+      stored.code === "STORAGE_UNAVAILABLE" ? 503 : 409;
+    throw new ApiError(status, stored.code, "The SAT model could not be stored for this lease.");
   }
-  return json({ jobId, taskId: authorization.task.taskId, leaseId, bytes: stored.size }, { status: 201 });
+  return json({ jobId, taskId: stored.taskId, leaseId, bytes: stored.bytes }, { status: 201 });
 }
 
 async function uploadUnsatProof(
@@ -427,55 +394,46 @@ async function uploadUnsatProof(
   const decompressedBytes = Number(request.headers.get("x-hivesat-decompressed-length") ?? "NaN");
   const artifactSha256 = request.headers.get("x-hivesat-sha256") ?? "";
   const coordinator = jobStub(env, jobId);
-  const authorization = await coordinator.authorizeProofUpload(leaseId, decompressedBytes);
-  if (!authorization.ok) {
-    throw new ApiError(
-      authorization.code === "NOT_FOUND" ? 404 : authorization.code === "PROOF_BUDGET_EXHAUSTED" ? 413 : 409,
-      authorization.code,
-      "This lease cannot upload an UNSAT proof.",
-    );
-  }
   const contentLength = Number(
     request.headers.get("content-length") ?? request.headers.get("x-hivesat-content-length") ?? "NaN",
   );
   if (!Number.isSafeInteger(contentLength) || contentLength < 1 ||
-    contentLength > authorization.maximumCompressedBytes ||
     contentLength > MAX_UNSAT_PROOF_COMPRESSED_BYTES ||
     !SHA256_PATTERN.test(artifactSha256) || !request.body) {
     throw new ApiError(400, "INVALID_PROOF_BODY", "A bounded gzip LRAT proof with exact metadata is required.");
   }
-  const formulas = requiredBinding(env.FORMULAS, "FORMULAS");
-  const stored = await formulas.put(authorization.objectKey, request.body, {
-    onlyIf: { etagDoesNotMatch: "*" },
-    httpMetadata: { contentType: "application/vnd.hivesat.lrat+gzip" },
-    customMetadata: {
-      jobId,
-      taskId: authorization.task.taskId,
-      formulaHash: authorization.formulaHash,
-      artifactSha256,
-      decompressedBytes: String(decompressedBytes),
-    },
-  });
-  if (!stored) throw new ApiError(409, "PROOF_ALREADY_UPLOADED", "This lease already uploaded a proof.");
-  if (stored.size !== contentLength ||
-    !await coordinator.recordProofUpload(leaseId, artifactSha256, stored.size, decompressedBytes)) {
-    await formulas.delete(authorization.objectKey);
-    throw new ApiError(409, "PROOF_UPLOAD_REJECTED", "The proof upload did not match its authorization.");
+  const stored = await coordinator.storeProof(
+    leaseId,
+    request.body,
+    contentLength,
+    artifactSha256,
+    decompressedBytes,
+  );
+  if (!stored.ok) {
+    const status = stored.code === "NOT_FOUND" ? 404 : stored.code === "PROOF_BUDGET_EXHAUSTED" ? 413 :
+      stored.code === "INVALID_BODY" ? 400 : stored.code === "STORAGE_UNAVAILABLE" ? 503 : 409;
+    throw new ApiError(status, stored.code, "The UNSAT proof could not be stored for this lease.");
   }
-  return json({ jobId, taskId: authorization.task.taskId, leaseId, bytes: stored.size }, { status: 201 });
+  return json({ jobId, taskId: stored.taskId, leaseId, bytes: stored.bytes }, { status: 201 });
 }
 
 async function downloadUnsatProof(env: Env, jobId: string, artifactId: string): Promise<Response> {
-  const authorization = await jobStub(env, jobId).proofDownload(artifactId);
-  if (!authorization) throw new ApiError(404, "PROOF_NOT_FOUND", "The proof certificate is not available.");
-  const object = await requiredBinding(env.FORMULAS, "FORMULAS").get(authorization.objectKey);
-  if (!object?.body) throw new ApiError(404, "PROOF_NOT_FOUND", "The proof certificate is missing.");
-  const headers = new Headers();
-  object.writeHttpMetadata(headers);
+  const artifact = await jobStub(env, jobId).proofArtifactDownload(artifactId);
+  if (!artifact.ok) {
+    if (artifact.code === "ARTIFACT_UNAVAILABLE") {
+      throw new ApiError(503, artifact.code, "The proof certificate is temporarily unavailable.");
+    }
+    throw new ApiError(404, "PROOF_NOT_FOUND", "The proof certificate is not available.");
+  }
+  const headers = new Headers({
+    "content-type": "application/vnd.hivesat.lrat+gzip",
+    "content-length": String(artifact.bytes),
+    etag: `"${artifact.sha256}"`,
+  });
   headers.set("content-disposition", `attachment; filename="${artifactId}.lrat.gz"`);
-  headers.set("x-hivesat-proof-sha256", authorization.sha256);
+  headers.set("x-hivesat-proof-sha256", artifact.sha256);
   headers.set("x-content-type-options", "nosniff");
-  return new Response(object.body, { headers });
+  return new Response(artifact.body, { headers });
 }
 
 async function confirmOwnerProof(
@@ -503,7 +461,6 @@ async function cancelJob(request: Request, env: Env, jobId: string): Promise<Res
   if (!result.ok) {
     throw new ApiError(result.code === "NOT_FOUND" ? 404 : 403, result.code, "Job cancellation is not authorized.");
   }
-  await requiredBinding(env.FORMULAS, "FORMULAS").delete(result.objectKey);
   await directoryStub(env).close(jobId);
   return json({ jobId, state: "CANCELLED", changed: result.changed });
 }

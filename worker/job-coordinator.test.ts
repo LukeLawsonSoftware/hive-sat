@@ -13,8 +13,8 @@ import {
 import {
   encodeSatModelArtifact,
   resultPathHash,
-  satModelObjectKey,
 } from "../shared/result-manifest";
+import { ARTIFACT_DELETE_BATCH_SIZE } from "./job-artifacts";
 import type { JobCoordinatorDO } from "./job-coordinator";
 
 let sequence = 0;
@@ -38,7 +38,6 @@ async function initializedCoordinator() {
     },
     createdAt: now,
     expiresAt: now + 24 * 60 * 60_000,
-    objectKey: `jobs/${jobId}/formula.hivecnf.gz`,
   });
   expect(await stub.completeUpload("22".repeat(32), 4)).toMatchObject({ ok: true });
   return { jobId, stub };
@@ -76,7 +75,7 @@ async function send(
 async function hello(socket: WebSocket, jobId: string, sessionId: string) {
   return send(socket, {
     type: "HELLO",
-    protocolVersion: 2,
+    protocolVersion: 3,
     messageId: `hello-${sessionId}`,
     jobId,
     sessionId,
@@ -90,7 +89,7 @@ async function hello(socket: WebSocket, jobId: string, sessionId: string) {
 }
 
 async function requestWork(socket: WebSocket, jobId: string, messageId: string) {
-  return send(socket, { type: "REQUEST_WORK", protocolVersion: 2, messageId, jobId });
+  return send(socket, { type: "REQUEST_WORK", protocolVersion: 3, messageId, jobId });
 }
 
 function expectWork(message: CoordinatorServerMessage | "PONG") {
@@ -150,7 +149,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     await runInDurableObject(stub, (_instance, state) => {
       expect(state.storage.sql.exec<{ id: number }>(
         "SELECT id FROM _sql_schema_migrations ORDER BY id",
-      ).toArray().map((row) => row.id)).toEqual([1, 2, 3, 4, 5]);
+      ).toArray().map((row) => row.id)).toEqual([1, 2, 3, 4, 5, 6]);
     });
 
     await evictDurableObject(stub);
@@ -176,7 +175,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     const heartbeat = {
       type: "HEARTBEAT",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "heartbeat-batch",
       jobId,
       taskId: "root",
@@ -214,7 +213,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     await expect(send(socket, {
       type: "YIELD",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "yield-one",
       jobId,
       taskId: "root",
@@ -231,7 +230,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     });
     await expect(send(socket, {
       type: "SPLIT",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "split-one",
       jobId,
       taskId: "root",
@@ -278,7 +277,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     await expect(send(staleSocket, {
       type: "SPLIT",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "stale-split",
       jobId,
       taskId: "root",
@@ -288,7 +287,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     const result = {
       type: "RESULT",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "stale-result",
       jobId,
       taskId: "root",
@@ -324,7 +323,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     const root = expectWork(await requestWork(splitterSocket, jobId, "root-work"));
     await send(splitterSocket, {
       type: "SPLIT",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "split-root",
       jobId,
       taskId: root.task.taskId,
@@ -374,7 +373,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     const root = expectWork(await requestWork(splitter, jobId, "coverage-root"));
     await send(splitter, {
       type: "SPLIT",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "coverage-split",
       jobId,
       taskId: root.task.taskId,
@@ -397,7 +396,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
       };
       await expect(send(socket, {
         type: "RESULT",
-        protocolVersion: 2,
+        protocolVersion: 3,
         messageId: `coverage-result-${index}`,
         jobId,
         taskId: work.task.taskId,
@@ -455,10 +454,12 @@ describe("JobCoordinatorDO leasing protocol", () => {
       },
       createdAt: now,
       expiresAt: now + 24 * 60 * 60_000,
-      objectKey: `jobs/${jobId}/formula.hivecnf.gz`,
     });
-    await env.FORMULAS.put(`jobs/${jobId}/formula.hivecnf.gz`, compressed);
-    expect(await stub.completeUpload("22".repeat(32), compressed.byteLength)).toMatchObject({ ok: true });
+    expect(await stub.storeFormula(
+      "22".repeat(32),
+      new Response(compressed).body!,
+      compressed.byteLength,
+    )).toMatchObject({ ok: true });
 
     const socket = await openSocket(stub);
     await hello(socket, jobId, "dishonest-session");
@@ -474,10 +475,34 @@ describe("JobCoordinatorDO leasing protocol", () => {
       variableCount: 1,
     }, [-1]);
     const artifactSha256 = await digest(artifact);
-    await env.FORMULAS.put(satModelObjectKey(jobId, work.lease.leaseId), artifact);
+    const storedModel = await stub.storeModel(
+      work.lease.leaseId,
+      new Response(artifact.slice().buffer as ArrayBuffer).body!,
+      artifact.byteLength,
+    );
+    const storedModels = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{ lease_id: string; object_key: string }>(
+        "SELECT lease_id, object_key FROM model_artifacts",
+      ).toArray());
+    expect({ storedModel, storedModels }).toEqual({
+      storedModel: { ok: true, taskId: "root", bytes: artifact.byteLength },
+      storedModels: [{ lease_id: work.lease.leaseId, object_key: expect.any(String) }],
+    });
+    const storedModelMetadata = await env.JOB_ARTIFACTS.getWithMetadata<{
+      kind: string;
+      taskId: string;
+      formulaHash: string;
+      bytes: number;
+    }>(storedModels[0]!.object_key, "arrayBuffer");
+    expect(storedModelMetadata.metadata).toMatchObject({
+      kind: "sat-model",
+      taskId: "root",
+      formulaHash,
+      bytes: artifact.byteLength,
+    });
     await expect(send(socket, {
       type: "RESULT",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "invalid-model-result",
       jobId,
       taskId: "root",
@@ -506,14 +531,84 @@ describe("JobCoordinatorDO leasing protocol", () => {
       expect(state.storage.sql.exec<{ quarantined: number }>(
         "SELECT quarantined FROM session_reliability WHERE session_id = 'dishonest-session'",
       ).one().quarantined).toBe(1);
+      expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM model_artifacts",
+      ).one().total).toBe(0);
     });
-    expect(await env.FORMULAS.get(satModelObjectKey(jobId, work.lease.leaseId))).toBeNull();
 
     const reconnect = await openSocket(stub);
     await expect(hello(reconnect, jobId, "dishonest-session"))
       .resolves.toMatchObject({ type: "ERROR", code: "SESSION_QUARANTINED" });
     socket.close(1000, "done");
     reconnect.close(1000, "done");
+  });
+
+  it("requeues verification when committed KV data is temporarily missing without penalizing the session", async () => {
+    const { jobId, stub } = await initializedCoordinator();
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE jobs SET object_key = ?", `jobs/${jobId}/formula/missing.hivecnf.gz`);
+    });
+    const socket = await openSocket(stub);
+    await hello(socket, jobId, "kv-miss-session");
+    const work = expectWork(await requestWork(socket, jobId, "kv-miss-work"));
+    const pathHash = await resultPathHash([]);
+    const artifact = encodeSatModelArtifact({
+      version: 1,
+      formulaHash: "ab".repeat(32),
+      taskId: "root",
+      cube: [],
+      pathHash,
+      solverVersion: "cadical-3.0.1",
+      variableCount: 10,
+    }, Array.from({ length: 10 }, (_, index) => -(index + 1)));
+    const artifactSha256 = await digest(artifact);
+    await expect(stub.storeModel(
+      work.lease.leaseId,
+      new Response(artifact.slice().buffer as ArrayBuffer).body!,
+      artifact.byteLength,
+    )).resolves.toMatchObject({ ok: true });
+
+    await expect(send(socket, {
+      type: "RESULT",
+      protocolVersion: 3,
+      messageId: "kv-miss-result",
+      jobId,
+      taskId: "root",
+      leaseId: work.lease.leaseId,
+      result: "SAT",
+      evidenceSha256: artifactSha256,
+      manifest: {
+        kind: "SAT_MODEL_V1",
+        version: 1,
+        formulaHash: "ab".repeat(32),
+        taskId: "root",
+        cube: [],
+        pathHash,
+        solverVersion: "cadical-3.0.1",
+        variableCount: 10,
+        artifactId: work.lease.leaseId,
+        artifactSha256,
+        artifactBytes: artifact.byteLength,
+      },
+    })).resolves.toMatchObject({ type: "ACK", action: "RESULT" });
+
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ state: string }>(
+        "SELECT state FROM tasks WHERE task_id = 'root'",
+      ).one().state).toBe("READY");
+      expect(state.storage.sql.exec<{
+        invalid_results: number;
+        verification_timeouts: number;
+        quarantined: number;
+      }>(
+        `SELECT invalid_results, verification_timeouts, quarantined
+         FROM session_reliability WHERE session_id = 'kv-miss-session'`,
+      ).one()).toEqual({ invalid_results: 0, verification_timeouts: 1, quarantined: 0 });
+      expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM model_artifacts",
+      ).one().total).toBe(1);
+    });
+    socket.close(1000, "done");
   });
 
   it("broadcasts owner cancellation without eagerly recovering disconnected leases", async () => {
@@ -530,6 +625,54 @@ describe("JobCoordinatorDO leasing protocol", () => {
       expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM leases").one().status).toBe("CANCELLED");
     });
     socket.close(1000, "done");
+  });
+
+  it("continues bounded cancellation cleanup across formula, model, and proof keys", async () => {
+    const { stub } = await initializedCoordinator();
+    const formulaKey = `cleanup/formula-${sequence}`;
+    const modelKeys = Array.from(
+      { length: ARTIFACT_DELETE_BATCH_SIZE - 1 },
+      (_, index) => `cleanup/model-${sequence}-${index}`,
+    );
+    const proofKeys = [`cleanup/proof-${sequence}-0`, `cleanup/proof-${sequence}-1`];
+    const keys = [formulaKey, ...modelKeys, ...proofKeys];
+    await Promise.all(keys.map((key) => env.JOB_ARTIFACTS.put(key, "x")));
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("UPDATE jobs SET object_key = ?", formulaKey);
+        modelKeys.forEach((key, index) => state.storage.sql.exec(
+          "INSERT INTO model_artifacts (lease_id, object_key, artifact_bytes, created_at) VALUES (?, ?, 1, ?)",
+          `cleanup-model-lease-${index}`,
+          key,
+          index,
+        ));
+        proofKeys.forEach((key, index) => state.storage.sql.exec(
+          `INSERT INTO proof_artifacts (
+            artifact_id, task_id, lease_id, artifact_sha256, compressed_bytes,
+            decompressed_bytes, verification_status, created_at, object_key
+          ) VALUES (?, 'root', ?, ?, 1, 1, 'UPLOADED', ?, ?)`,
+          `cleanup-proof-${index}`,
+          `cleanup-proof-lease-${index}`,
+          "cd".repeat(32),
+          index,
+          key,
+        ));
+      });
+    });
+
+    await expect(stub.cancel("11".repeat(32))).resolves.toMatchObject({ ok: true, changed: true });
+    expect((await env.JOB_ARTIFACTS.list({ prefix: "cleanup/" })).keys).toHaveLength(2);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect((await env.JOB_ARTIFACTS.list({ prefix: "cleanup/" })).keys).toHaveLength(0);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ object_key: string }>("SELECT object_key FROM jobs").one().object_key).toBe("");
+      expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM model_artifacts",
+      ).one().total).toBe(0);
+      expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM proof_artifacts WHERE object_key != ''",
+      ).one().total).toBe(0);
+    });
   });
 
   it("bounds alarm recovery batches and fails closed after the attempt ceiling", async () => {

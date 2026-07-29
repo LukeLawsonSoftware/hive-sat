@@ -24,22 +24,23 @@ addresses are not persisted by Durable Objects.
 
 ## API lifecycle
 
-All JSON job requests use `protocolVersion: 2`. Older versions fail with
+All JSON job requests use `protocolVersion: 3`. Older versions fail with
 `UPGRADE_REQUIRED` before Turnstile validation or allocation.
 
 1. `POST /api/v1/jobs` validates bounded metadata, explicit public consent,
    and a single-use Turnstile token. `SwarmDirectoryDO` atomically applies
    admission limits before a job coordinator is initialized.
 2. `PUT /api/v1/jobs/{jobId}/formula` requires the upload bearer token and an
-   exact `Content-Length`. The request body is passed directly to R2 at
-   `jobs/{jobId}/formula.hivecnf.gz`; the Worker does not buffer it.
+   exact `Content-Length`. The request body streams through the job coordinator
+   to a unique, expiring Workers KV key; the Worker does not buffer it.
 3. A successful upload consumes the upload digest and changes the job from
    `UPLOADING` to `QUEUED`. The root cube task is created as `READY` with an
    empty assumption list.
 4. `GET /api/v1/jobs/{jobId}` is public and returns aggregate metadata only.
-   `GET /api/v1/jobs/{jobId}/formula` streams the public gzip object.
+   `GET /api/v1/jobs/{jobId}/formula` streams the public gzip value through the
+   same coordinator consistency boundary.
 5. `POST /api/v1/jobs/{jobId}/cancel` requires the owner bearer token, cancels
-   the root task, deletes the R2 object, and releases admission capacity.
+   the root task, starts bounded KV cleanup, and releases admission capacity.
 6. `POST /api/v1/jobs/{jobId}/rotate-owner` atomically replaces the owner-token
    digest and invalidates the previous owner URL.
 7. `GET /api/v1/jobs/{jobId}/socket` upgrades to the hibernating, versioned
@@ -60,8 +61,9 @@ remain shard-ready and must not route solver heartbeats through this directory.
 
 Both objects use `_sql_schema_migrations`; the Wrangler namespace migration is
 the append-only `v0001_job_platform` entry. A job alarm is scheduled for exactly
-24 hours after creation. It deletes the R2 object, releases the directory row,
-and atomically deletes coordinator storage. The directory maintains its own
+24 hours after creation. Every KV value also carries that absolute expiration;
+the alarm deletes committed values in bounded batches, releases the directory
+row, and atomically deletes coordinator storage. The directory maintains its own
 earliest-expiry alarm as a fail-safe.
 
 Admission is fail-closed:
@@ -72,8 +74,9 @@ Admission is fail-closed:
 
 ## Deployment configuration
 
-Create/configure the `hivesat-formulas` R2 Standard bucket and a production
-Turnstile widget. Set secrets outside version control:
+Wrangler automatically provisions the `JOB_ARTIFACTS` KV namespace declared in
+`wrangler.jsonc`. Configure a production Turnstile widget and set secrets outside
+version control:
 
 ```bash
 pnpm exec wrangler secret put TURNSTILE_SECRET --env production

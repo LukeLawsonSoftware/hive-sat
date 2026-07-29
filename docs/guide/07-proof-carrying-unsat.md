@@ -18,7 +18,7 @@ sequenceDiagram
   participant B as "Browser B"
   participant J as "JobCoordinatorDO"
   participant F as "Fresh proof finisher"
-  participant R as "R2"
+  participant K as "Workers KV"
   participant V as "ResultVerifierDO"
   participant O as "Owner browser"
 
@@ -29,7 +29,7 @@ sequenceDiagram
   J->>F: "WORK(C, PROOF_FINISHER)"
   F->>F: "Enable tracing before loading clauses"
   F->>F: "Load F, then cube literals as unit clauses"
-  F->>R: "Upload gzip LRAT with lease token"
+  F->>K: "Upload gzip LRAT with lease token"
   F->>J: "RESULT + bound proof manifest"
   J->>V: "Check small proof under server limits"
   alt bounded proof
@@ -37,7 +37,7 @@ sequenceDiagram
     J->>J: "Certify leaf and propagate coverage"
   else allowed but larger proof
     V-->>J: "OWNER_CHECK_REQUIRED"
-    O->>R: "Download formula and certificate"
+    O->>K: "Download formula and certificate"
     O->>O: "Run pinned lrat-check.c Wasm"
     O->>J: "Owner-token confirmation + exact hash"
   end
@@ -81,19 +81,20 @@ different clause IDs breaks at least one binding before proof checking begins.
 ## Artifact transport and limits
 
 Proof text does not travel through WebSockets. The browser compresses it with
-gzip and streams it to a job-scoped R2 key under the active lease ID. The
-control message contains only the bounded manifest.
+gzip and streams it through the coordinator to a unique, job-scoped Workers KV
+key associated with the active lease. The control message contains only the
+bounded manifest.
 
 | Limit | Value | Failure behavior |
 | --- | ---: | --- |
-| Compressed proof data per job | 32 MiB | reject upload or return `UNKNOWN` |
+| Compressed proof data per job | 25 MiB | reject upload or return `UNKNOWN` |
 | Decompressed proof artifact | 128 MiB | reject before checking |
 | Server-check compressed proof | 2 MiB | route to owner-browser check |
 | Server-check decompressed proof | 8 MiB | route to owner-browser check |
 | Cube depth | 64 literals | reject malformed binding |
 
 The job-wide compressed limit is cumulative across proof artifacts, not a
-per-upload loophole. R2 stores the gzip object, while the coordinator stores
+per-upload loophole. Workers KV stores the gzip object, while the coordinator stores
 only its manifest and verification state.
 
 An oversized proof is never truncated. Truncation could remove the empty

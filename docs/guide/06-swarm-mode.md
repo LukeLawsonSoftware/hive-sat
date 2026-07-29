@@ -68,7 +68,7 @@ a web page cannot accurately inspect the operating system process.
 | Unique jobs helped | local set of assigned public job IDs | jobs touched during this page session |
 | Verified SAT contribution | coordinator `JOB_RESULT: SAT_VERIFIED` | this session's candidate became a checked public answer |
 | Certified UNSAT contribution | proof-backed terminal message | zero until proof-carrying UNSAT exists |
-| Formula bytes transferred | network cache misses only | compressed formula bytes downloaded from R2 |
+| Formula bytes transferred | network cache misses only | compressed formula bytes downloaded from Workers KV |
 | Wasm allocation now | `HIVESAT_MEMORY_BYTES` | current Wasm linear-memory allocation across solver workers |
 | Wasm high-water | `HIVESAT_MEMORY_HIGH_WATER_BYTES` | highest observed Wasm allocation, not browser-process RAM |
 | Global jobs/workers | bounded directory snapshot | aggregate scheduling state, not individual participants |

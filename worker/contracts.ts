@@ -21,7 +21,6 @@ export interface InitializeJobInput {
   formula: FormulaDeclaration;
   createdAt: number;
   expiresAt: number;
-  objectKey: string;
 }
 
 export interface AdmissionInput {
@@ -46,7 +45,7 @@ export type UploadAuthorization =
   | { ok: false; code: "NOT_FOUND" | "INVALID_TOKEN" | "INVALID_STATE" };
 
 export type OwnerActionResult =
-  | { ok: true; changed: boolean; objectKey: string }
+  | { ok: true; changed: boolean }
   | { ok: false; code: "NOT_FOUND" | "INVALID_TOKEN" };
 
 export type ModelUploadAuthorization =
@@ -72,6 +71,6 @@ export type ProofUploadAuthorization =
     }
   | { ok: false; code: "NOT_FOUND" | "INVALID_STATE" | "PROOF_BUDGET_EXHAUSTED" };
 
-export function formulaObjectKey(jobId: string): string {
-  return `jobs/${jobId}/formula.hivecnf.gz`;
+export function formulaObjectKey(jobId: string, uploadId = "canonical"): string {
+  return `jobs/${jobId}/formula/${uploadId}.hivecnf.gz`;
 }

@@ -6,7 +6,6 @@ import {
   type SatResultManifest,
   MAX_SERVER_PROOF_COMPRESSED_BYTES,
   MAX_SERVER_PROOF_DECOMPRESSED_BYTES,
-  unsatProofObjectKey,
   type UnsatProofManifest,
 } from "../shared/result-manifest";
 import { verifyTextLrat } from "../shared/lrat-check";
@@ -16,8 +15,8 @@ const MAX_LITERAL_CHECKS = 2_000_064;
 const HIVECNF_MAGIC = Uint8Array.from([0x48, 0x49, 0x56, 0x45, 0x43, 0x4e, 0x46, 0x31]);
 
 export interface VerifySatInput {
-  formulaObjectKey: string;
-  modelObjectKey: string;
+  formulaStream: ReadableStream;
+  modelStream: ReadableStream;
   manifest: SatResultManifest;
   expectedCube: number[];
   expectedVariableCount: number;
@@ -32,8 +31,8 @@ export type VerifySatResult =
     };
 
 export interface VerifyUnsatInput {
-  jobId: string;
-  formulaObjectKey: string;
+  formulaStream: ReadableStream;
+  proofStream: ReadableStream;
   manifest: UnsatProofManifest;
   expectedCube: number[];
   maxCompressedBytes?: number;
@@ -127,12 +126,9 @@ function decodeHiveCnfV1(bytes: Uint8Array): DecodedFormula {
 
 export class ResultVerifierDO extends DurableObject<Env> {
   async verifySat(input: VerifySatInput): Promise<VerifySatResult> {
-    const modelObject = await this.env.FORMULAS.get(input.modelObjectKey);
-    if (!modelObject?.body) return { status: "INVALID_MODEL", reason: "The model artifact is missing." };
-
     let artifact: Uint8Array;
     try {
-      artifact = await collectBounded(modelObject.body, MAX_SAT_MODEL_ARTIFACT_BYTES, "SAT model");
+      artifact = await collectBounded(input.modelStream, MAX_SAT_MODEL_ARTIFACT_BYTES, "SAT model");
     } catch (error) {
       return { status: "INVALID_MODEL", reason: String(error) };
     }
@@ -163,12 +159,10 @@ export class ResultVerifierDO extends DurableObject<Env> {
       return { status: "INVALID_MODEL", reason: "The model metadata is not bound to the leased cube." };
     }
 
-    const formulaObject = await this.env.FORMULAS.get(input.formulaObjectKey);
-    if (!formulaObject?.body) return { status: "INVALID_FORMULA", reason: "The formula artifact is missing." };
     let encoded: Uint8Array;
     try {
       encoded = await collectBounded(
-        formulaObject.body.pipeThrough(new DecompressionStream("gzip")),
+        input.formulaStream.pipeThrough(new DecompressionStream("gzip")),
         MAX_ENCODED_FORMULA_BYTES,
         "HiveCnfV1 formula",
       );
@@ -225,14 +219,10 @@ export class ResultVerifierDO extends DurableObject<Env> {
       return { status: "OWNER_CHECK_REQUIRED", reason: "The proof exceeds conservative server verification limits." };
     }
 
-    const proofObject = await this.env.FORMULAS.get(
-      unsatProofObjectKey(input.jobId, input.manifest.artifactId),
-    );
-    if (!proofObject?.body) return { status: "INVALID_PROOF", reason: "The proof artifact is missing." };
     let compressed: Uint8Array;
     try {
       compressed = await collectBounded(
-        proofObject.body,
+        input.proofStream,
         input.maxCompressedBytes ?? MAX_SERVER_PROOF_COMPRESSED_BYTES,
         "LRAT proof",
       );
@@ -258,12 +248,10 @@ export class ResultVerifierDO extends DurableObject<Env> {
       return { status: "INVALID_PROOF", reason: "The decompressed proof length does not match its manifest." };
     }
 
-    const formulaObject = await this.env.FORMULAS.get(input.formulaObjectKey);
-    if (!formulaObject?.body) return { status: "INVALID_FORMULA", reason: "The formula artifact is missing." };
     let formula: DecodedFormula;
     try {
       const encoded = await collectBounded(
-        formulaObject.body.pipeThrough(new DecompressionStream("gzip")),
+        input.formulaStream.pipeThrough(new DecompressionStream("gzip")),
         MAX_ENCODED_FORMULA_BYTES,
         "HiveCnfV1 formula",
       );

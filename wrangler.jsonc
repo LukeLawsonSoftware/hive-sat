@@ -9,6 +9,9 @@
     "FEATURE_PUBLIC_JOBS": "true",
     "FEATURE_PUBLIC_SWARM": "true",
     "MAX_ACTIVE_JOBS": "100",
+    "MAX_JOB_CONNECTIONS": "32",
+    "MAX_DIRECTORY_CONNECTIONS": "128",
+    "SAFETY_MARGIN_PERCENT": "80",
     "TURNSTILE_SITE_KEY": "1x00000000000000000000AA",
     "TURNSTILE_SECRET": "1x0000000000000000000000000000000AA",
     "NETWORK_DIGEST_KEY": "development-only-network-digest-key"
@@ -91,9 +94,12 @@
       },
       "vars": {
         "ENVIRONMENT": "production",
-        "FEATURE_PUBLIC_JOBS": "false",
-        "FEATURE_PUBLIC_SWARM": "false",
+        "FEATURE_PUBLIC_JOBS": "true",
+        "FEATURE_PUBLIC_SWARM": "true",
         "MAX_ACTIVE_JOBS": "100",
+        "MAX_JOB_CONNECTIONS": "32",
+        "MAX_DIRECTORY_CONNECTIONS": "128",
+        "SAFETY_MARGIN_PERCENT": "80",
         "TURNSTILE_SITE_KEY": "configure-in-cloudflare-dashboard"
       }
     }

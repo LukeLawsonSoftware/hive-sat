@@ -28,8 +28,8 @@ async function createJob(overrides: Record<string, unknown> = {}): Promise<Creat
     },
     body: JSON.stringify({
       deviceId: `device_${String(sequence).padStart(24, "0")}`,
-      protocolVersion: 1,
-      turnstileToken: "test-turnstile-token",
+      protocolVersion: 2,
+      turnstileToken: `test-turnstile-token-${sequence}`,
       publicConsent: true,
       formula: FORMULA,
       ...overrides,
@@ -61,12 +61,71 @@ describe("HiveSAT Worker", () => {
     const response = await SELF.fetch("https://hive-sat.test/api/v1/health");
 
     expect(response.status).toBe(200);
+    expect(response.headers.get("content-security-policy")).toContain("wasm-unsafe-eval");
+    expect(response.headers.get("x-frame-options")).toBe("DENY");
     await expect(response.json()).resolves.toMatchObject({
       ok: true,
       features: { publicJobs: true, publicSwarm: true },
+      configuration: { publicJobsReady: true },
       activeJobs: 0,
       activeWorkers: 0,
+      quota: { state: "NORMAL", limits: { maxActiveJobs: 100, safetyMarginPercent: 80 } },
     });
+  });
+
+  it("rejects older protocol clients before anti-abuse validation", async () => {
+    const response = await SELF.fetch("https://hive-sat.test/api/v1/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        deviceId: "device_000000000000000000000099",
+        protocolVersion: 1,
+        turnstileToken: "old-client-token",
+        publicConsent: true,
+        formula: FORMULA,
+      }),
+    });
+    expect(response.status).toBe(426);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "UPGRADE_REQUIRED" } });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("prevents Turnstile replay even across distinct device and network identities", async () => {
+    const replayToken = `replay-${++sequence}`;
+    const first = await createJob({ turnstileToken: replayToken });
+    expect(first.jobId).toBeTruthy();
+    const response = await SELF.fetch("https://hive-sat.test/api/v1/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.220" },
+      body: JSON.stringify({
+        deviceId: "device_replay_000000000000000002",
+        protocolVersion: 2,
+        turnstileToken: replayToken,
+        publicConsent: true,
+        formula: FORMULA,
+      }),
+    });
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "TURNSTILE_REPLAY" } });
+  });
+
+  it("rotates owner tokens atomically and invalidates the previous credential", async () => {
+    const job = await createJob();
+    const rotated = await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/rotate-owner`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${job.ownerToken}` },
+    });
+    expect(rotated.status).toBe(200);
+    const next = await rotated.json<{ ownerToken: string }>();
+    expect(next.ownerToken).not.toBe(job.ownerToken);
+    expect((await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/cancel`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${job.ownerToken}` },
+    })).status).toBe(403);
+    expect((await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/cancel`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${next.ownerToken}` },
+    })).status).toBe(200);
   });
 
   it("requires explicit public consent before validating Turnstile", async () => {
@@ -75,7 +134,7 @@ describe("HiveSAT Worker", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         deviceId: "device_000000000000000000000001",
-        protocolVersion: 1,
+        protocolVersion: 2,
         turnstileToken: "token",
         publicConsent: false,
         formula: FORMULA,
@@ -164,7 +223,7 @@ describe("HiveSAT Worker", () => {
     });
     socket.send(JSON.stringify({
       type: "SWARM_HELLO",
-      protocolVersion: 1,
+      protocolVersion: 2,
       messageId: "swarm-index-request",
       sessionId: "swarm-index-session",
       capabilities: {
@@ -209,14 +268,15 @@ describe("HiveSAT Worker", () => {
   it("enforces active and rolling-day admission per device/network digest", async () => {
     const deviceId = "device_999999999999999999999999";
     const ip = "198.51.100.9";
+    let attemptSequence = 0;
     async function attempt(): Promise<Response> {
       return SELF.fetch("https://hive-sat.test/api/v1/jobs", {
         method: "POST",
         headers: { "content-type": "application/json", "cf-connecting-ip": ip },
         body: JSON.stringify({
           deviceId,
-          protocolVersion: 1,
-          turnstileToken: "token",
+          protocolVersion: 2,
+          turnstileToken: `token-${++attemptSequence}`,
           publicConsent: true,
           formula: FORMULA,
         }),
@@ -287,6 +347,31 @@ describe("HiveSAT Worker", () => {
     await expect(response.json()).resolves.toEqual({
       error: { code: "NOT_FOUND", message: "API route not found" },
     });
+  });
+
+  it("fuzzes bounded API JSON without leaking unstructured failures", async () => {
+    for (let index = 0; index < 100; index += 1) {
+      const body = index % 2 === 0
+        ? `{${"x".repeat(index)}}`
+        : JSON.stringify({ protocolVersion: index % 2, noise: "y".repeat(index) });
+      const response = await SELF.fetch("https://hive-sat.test/api/v1/jobs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(response.status).toBeLessThan(500);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: expect.any(String), message: expect.any(String) },
+      });
+    }
+    const oversized = await SELF.fetch("https://hive-sat.test/api/v1/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ padding: "z".repeat(9 * 1024) }),
+    });
+    expect(oversized.status).toBe(413);
+    await expect(oversized.json()).resolves.toMatchObject({ error: { code: "REQUEST_TOO_LARGE" } });
   });
 
   it("rejects unknown well-formed job IDs at the directory without coordinator allocation", async () => {

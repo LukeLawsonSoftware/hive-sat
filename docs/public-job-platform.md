@@ -1,9 +1,8 @@
 # Public job platform
 
-Phase 4 adds the feature-flagged, anonymous public-job lifecycle. Local
-development enables `FEATURE_PUBLIC_JOBS`; the production environment keeps it
-off until its R2 bucket, Turnstile widget, secrets, and deployment smoke test
-are configured.
+HiveSAT's anonymous public-job lifecycle remains controlled by
+`FEATURE_PUBLIC_JOBS`. Production configuration enables it for launch, while
+the same variable remains the immediate admission kill switch.
 
 ## Trust and privacy boundary
 
@@ -25,7 +24,8 @@ addresses are not persisted by Durable Objects.
 
 ## API lifecycle
 
-All JSON job requests use `protocolVersion: 1`.
+All JSON job requests use `protocolVersion: 2`. Older versions fail with
+`UPGRADE_REQUIRED` before Turnstile validation or allocation.
 
 1. `POST /api/v1/jobs` validates bounded metadata, explicit public consent,
    and a single-use Turnstile token. `SwarmDirectoryDO` atomically applies
@@ -40,7 +40,9 @@ All JSON job requests use `protocolVersion: 1`.
    `GET /api/v1/jobs/{jobId}/formula` streams the public gzip object.
 5. `POST /api/v1/jobs/{jobId}/cancel` requires the owner bearer token, cancels
    the root task, deletes the R2 object, and releases admission capacity.
-6. `GET /api/v1/jobs/{jobId}/socket` upgrades to the hibernating, versioned
+6. `POST /api/v1/jobs/{jobId}/rotate-owner` atomically replaces the owner-token
+   digest and invalidates the previous owner URL.
+7. `GET /api/v1/jobs/{jobId}/socket` upgrades to the hibernating, versioned
    coordinator protocol documented in [coordinator-protocol.md](coordinator-protocol.md).
 
 Every solver-browser formula download compares the response hash with public
@@ -79,6 +81,6 @@ pnpm exec wrangler secret put NETWORK_DIGEST_KEY --env production
 ```
 
 Set the production `TURNSTILE_SITE_KEY` variable to that widget's public site
-key, then enable `FEATURE_PUBLIC_JOBS` only for the smoke test. The values in
+key. The values in
 the top-level development config are Cloudflare's published always-pass test
 keys and a local-only digest key; they are not production credentials.

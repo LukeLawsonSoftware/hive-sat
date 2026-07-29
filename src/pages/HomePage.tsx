@@ -497,7 +497,7 @@ function ResultPanel({
       <p>
         Solve complete for <strong>{filename}</strong>. {verdict === "SAT"
           ? "An independent TypeScript pass verified the returned model against every clause."
-          : "CaDiCaL exhausted the formula locally; proof certification is planned for Phase 10."}
+          : "CaDiCaL exhausted the formula locally. Local UNSAT is not proof-certified; public jobs require checked LRAT coverage."}
       </p>
       <dl className="result-meta">
         <div><dt>Local runtime</dt><dd>{(elapsedMs / 1_000).toFixed(2)} s</dd></div>
@@ -573,8 +573,8 @@ function HiveCard({ enabled, helpingCount, hasPersonalJob, onToggle }: HiveCardP
         <p>
           {enabled
             ? hasPersonalJob
-              ? "Your instance has priority. Spare capacity continues helping the wider hive."
-              : "Your spare browser capacity is ready to explore work from the hive."
+              ? "Your local solve has priority. Public contribution starts only on the Swarm Mode page."
+              : "Your contribution preference is enabled. Open Swarm Mode when you want to start public work."
             : "Your browser is not accepting hive work. You can rejoin at any time."}
         </p>
       </div>
@@ -595,7 +595,7 @@ function HiveCard({ enabled, helpingCount, hasPersonalJob, onToggle }: HiveCardP
         </button>
       </div>
       <p className="hive-disclosure">
-        Public contribution arrives in Phase 9 · Preference saved on this device
+        Public work runs only on <a href="/swarm">Swarm Mode</a> · Preference saved on this device
       </p>
     </aside>
   );

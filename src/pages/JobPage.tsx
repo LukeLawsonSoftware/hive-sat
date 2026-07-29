@@ -6,6 +6,7 @@ import {
   getPublicJob,
   ownerTokenFromFragment,
   publicJobUrl,
+  rotatePublicJobOwnerToken,
   verifyAndConfirmOwnerProof,
 } from "../lib/publicJobs";
 import { useDistributedCubeRuntime } from "../hooks/useDistributedCubeRuntime";
@@ -74,6 +75,20 @@ export default function JobPage({ jobId }: { jobId: string }) {
     }
   }
 
+  async function rotateOwner() {
+    if (!ownerToken || !status) return;
+    setBusy(true);
+    try {
+      const next = await rotatePublicJobOwnerToken(jobId, ownerToken, status.expiresAt);
+      setOwnerToken(next);
+      setMessage("Owner credential rotated. The previous token and previous URL fragment no longer authorize changes.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The owner credential could not be rotated.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="route-shell">
       <header className="route-header">
@@ -118,7 +133,7 @@ export default function JobPage({ jobId }: { jobId: string }) {
             <p>
               HiveSAT loads the verified formula into {cubeRuntime.capacity} conservative local
               worker{cubeRuntime.capacity === 1 ? "" : "s"}. Your own job receives every local
-              worker before any future public-swarm work.
+              worker before public-swarm work.
             </p>
             <p role="status">
               {cubeRuntime.message ?? `${cubeRuntime.activeWorkers} worker${cubeRuntime.activeWorkers === 1 ? "" : "s"} active`}
@@ -142,6 +157,11 @@ export default function JobPage({ jobId }: { jobId: string }) {
           >
             Copy public share link
           </button>
+          {ownerToken && status && status.state !== "CANCELLED" && (
+            <button className="secondary-button" type="button" disabled={busy} onClick={() => void rotateOwner()}>
+              Rotate owner token
+            </button>
+          )}
           {ownerToken && status && status.state !== "CANCELLED" && (
             <button className="primary-button" type="button" disabled={busy} onClick={() => void cancel()}>
               {busy ? "Cancelling…" : "Cancel and delete formula"}

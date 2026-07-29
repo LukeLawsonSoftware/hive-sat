@@ -32,7 +32,7 @@ describe("HiveSAT app", () => {
     const ownerToken = "a".repeat(43);
     window.history.replaceState(null, "", `/jobs/${"b".repeat(32)}#owner=${ownerToken}`);
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({
-      protocolVersion: 1,
+      protocolVersion: 2,
       jobId: "b".repeat(32),
       state: "QUEUED",
       formula: {

@@ -3,14 +3,12 @@
 New to SAT solving or distributed browser compute? Start with the sequential
 [How HiveSAT works guide](docs/guide/README.md).
 
-HiveSAT is an experimental web-based SAT solver designed to distribute search
-work across participating browsers. The Phase 4 runtime strictly parses,
-hashes, caches, and solves DIMACS formulas locally, and can submit an explicitly
-public formula to the feature-flagged Cloudflare job platform. Phase 6 adds the
-owner-side cube worker pool and distributed coordinator runtime. Phase 7 adds
-compact model artifacts and independent server verification. Phases 8 and 9
-add equal-service public scheduling and an opt-in, page-scoped Swarm Mode
-dashboard; production activation remains feature-flagged for launch hardening.
+HiveSAT is an experimental web-based SAT solver that distributes explicitly
+public search work across opted-in browsers. It strictly parses, hashes, caches,
+and solves DIMACS formulas locally; public jobs add cube-and-conquer leasing,
+equal-service swarm scheduling, independent SAT-model verification, and
+proof-carrying UNSAT with downloadable LRAT certificates. Public contribution
+runs only while the user has started the page-scoped Swarm Mode runtime.
 
 ## Development
 
@@ -63,12 +61,16 @@ authenticating Wrangler, deploy the `hive-sat` Worker with:
 pnpm deploy
 ```
 
-The production environment keeps `FEATURE_PUBLIC_JOBS` and
-`FEATURE_PUBLIC_SWARM` disabled until the phase smoke test. Public jobs use an
+The production environment enables `FEATURE_PUBLIC_JOBS` and
+`FEATURE_PUBLIC_SWARM`; both variables remain immediate operator kill switches.
+Public jobs use an
 R2 binding plus SQLite-backed `JobCoordinatorDO` and `SwarmDirectoryDO`
 namespaces. Turnstile, token handling, admission, streaming upload, browser
 hash verification, cancellation, and expiry are documented in
 [`docs/public-job-platform.md`](docs/public-job-platform.md).
+Launch controls, quota response, and rollback steps are in
+[`docs/operator-runbook.md`](docs/operator-runbook.md). Privacy and trust
+limitations are published in [`docs/privacy-and-trust.md`](docs/privacy-and-trust.md).
 
 GitHub Actions owns validation only: lint,
 type-checking, unit and Workers-runtime tests, browser E2E tests, the production

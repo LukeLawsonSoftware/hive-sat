@@ -13,6 +13,7 @@ Read the pages in order:
 5. [How the public swarm shares compute fairly](05-fair-swarm-scheduling.md)
 6. [Reading and controlling the Swarm Mode dashboard](06-swarm-mode.md)
 7. [How proof-carrying UNSAT becomes a certificate](07-proof-carrying-unsat.md)
+8. [How launch safety contains abuse and quota pressure](08-launch-hardening.md)
 
 The shorter reference documents in the parent `docs/` directory specify wire
 formats and APIs. This guide tells the story: what problem each component

@@ -207,6 +207,23 @@ export async function cancelPublicJob(
   }));
 }
 
+export async function rotatePublicJobOwnerToken(
+  jobId: string,
+  ownerToken: string,
+  expiresAt: number,
+  fetcher: typeof fetch = fetch,
+  ownerStore = new PublicJobOwnerStore(),
+): Promise<string> {
+  const result = await apiJson<{ ownerToken: string }>(await fetcher(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/rotate-owner`,
+    { method: "POST", headers: { authorization: `Bearer ${ownerToken}` } },
+  ));
+  await ownerStore.saveOwner({ jobId, ownerToken: result.ownerToken, expiresAt });
+  const fragment = `owner=${encodeURIComponent(result.ownerToken)}`;
+  history.replaceState(null, "", `${location.pathname}${location.search}#${fragment}`);
+  return result.ownerToken;
+}
+
 export async function verifyAndConfirmOwnerProof(
   jobId: string,
   ownerToken: string,

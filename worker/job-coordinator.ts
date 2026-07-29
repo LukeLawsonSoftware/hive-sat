@@ -542,6 +542,16 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     return { ok: true, changed, objectKey: row.object_key };
   }
 
+  rotateOwnerToken(ownerDigest: string, nextOwnerDigest: string): boolean {
+    const row = this.job();
+    if (!row || Date.now() >= row.expires_at || !fixedTimeHexEqual(ownerDigest, row.owner_digest)) return false;
+    return this.ctx.storage.sql.exec(
+      "UPDATE jobs SET owner_digest = ? WHERE owner_digest = ?",
+      nextOwnerDigest,
+      row.owner_digest,
+    ).rowsWritten === 1;
+  }
+
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
@@ -549,6 +559,14 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     const row = this.job();
     if (!row || !["QUEUED", "RUNNING"].includes(row.state) || Date.now() >= row.expires_at) {
       return new Response("Job is not available", { status: 409 });
+    }
+    const maximumConnections = Number.parseInt(this.env.MAX_JOB_CONNECTIONS, 10);
+    if (!Number.isSafeInteger(maximumConnections) || maximumConnections < 1 ||
+      this.ctx.getWebSockets().length >= maximumConnections) {
+      return new Response("Job connection capacity reached", {
+        status: 503,
+        headers: { "retry-after": "30" },
+      });
     }
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -1323,6 +1341,13 @@ export class JobCoordinatorDO extends DurableObject<Env> {
           "UPDATE proof_artifacts SET verification_status = 'OWNER_CHECK_REQUIRED' WHERE artifact_id = ?",
           manifest.artifactId,
         );
+      } else if (verification.status === "INVALID_FORMULA") {
+        this.ctx.storage.sql.exec("UPDATE jobs SET state = 'INVALID'");
+        this.ctx.storage.sql.exec(
+          "UPDATE tasks SET state = 'UNKNOWN', active_lease_id = NULL, updated_at = ? WHERE state != 'CANCELLED'",
+          finishedAt,
+        );
+        this.ctx.storage.sql.exec("UPDATE leases SET status = 'SUPERSEDED' WHERE status = 'ACTIVE'");
       } else {
         this.ctx.storage.sql.exec(
           "UPDATE proof_artifacts SET verification_status = 'INVALID' WHERE artifact_id = ?",
@@ -1334,6 +1359,23 @@ export class JobCoordinatorDO extends DurableObject<Env> {
           task.task_id,
         );
         if (task.task_id === "root") this.ctx.storage.sql.exec("UPDATE jobs SET state = 'UNKNOWN'");
+        const invalid = verification.status === "INVALID_PROOF";
+        this.ctx.storage.sql.exec(
+          `INSERT INTO session_reliability (
+            session_id, verified_results, invalid_results, verification_timeouts,
+            quarantined, updated_at
+          ) VALUES (?, 0, ?, ?, ?, ?)
+          ON CONFLICT(session_id) DO UPDATE SET
+            invalid_results = invalid_results + excluded.invalid_results,
+            verification_timeouts = verification_timeouts + excluded.verification_timeouts,
+            quarantined = MAX(quarantined, excluded.quarantined),
+            updated_at = excluded.updated_at`,
+          sessionId,
+          invalid ? 1 : 0,
+          invalid ? 0 : 1,
+          invalid ? 1 : 0,
+          finishedAt,
+        );
       }
       const response: CoordinatorServerMessage = {
         ...this.serverBase(message.jobId, finishedAt),
@@ -1346,6 +1388,11 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     });
     if (terminal) {
       this.broadcast({ ...this.serverBase(job.job_id), type: "JOB_RESULT", result: terminal, taskId: "root" });
+      await this.env.SWARM_DIRECTORY.getByName("global-v1").close(job.job_id);
+    }
+    if (verification.status === "INVALID_PROOF") {
+      await this.env.FORMULAS.delete(unsatProofObjectKey(job.job_id, manifest.artifactId));
+    } else if (verification.status === "INVALID_FORMULA") {
       await this.env.SWARM_DIRECTORY.getByName("global-v1").close(job.job_id);
     }
     return {

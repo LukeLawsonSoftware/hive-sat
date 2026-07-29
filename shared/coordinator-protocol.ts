@@ -6,6 +6,8 @@ export const COORDINATOR_LEASE_EXTENSION_MS = 5 * 60_000;
 export const COORDINATOR_MAX_MESSAGE_BYTES = 16 * 1024;
 export const COORDINATOR_MAX_TASK_ATTEMPTS = 5;
 export const COORDINATOR_ALARM_BATCH_SIZE = 64;
+export const COORDINATOR_MAX_CUBE_DEPTH = 64;
+export const COORDINATOR_MAX_TASKS = 10_000;
 
 export type TaskState =
   | "READY"
@@ -37,6 +39,28 @@ export interface Lease {
   attempt: number;
   issuedAt: number;
   expiresAt: number;
+}
+
+export interface CubeQueueSnapshot {
+  readyTasks: number;
+  activeWorkers: number;
+  lowWatermark: number;
+  targetWatermark: number;
+  highWatermark: number;
+  taskCount: number;
+  canSplit: boolean;
+}
+
+export function cubeQueueWatermarks(activeWorkers: number): Pick<
+  CubeQueueSnapshot,
+  "lowWatermark" | "targetWatermark" | "highWatermark"
+> {
+  const workers = Math.max(1, Math.floor(activeWorkers));
+  return {
+    lowWatermark: workers,
+    targetWatermark: workers * 3,
+    highWatermark: workers * 8,
+  };
 }
 
 interface MessageBase {
@@ -114,6 +138,7 @@ export interface WorkMessage extends ServerMessageBase {
   requestMessageId: string;
   task: CubeTask;
   lease: Lease;
+  queue: CubeQueueSnapshot;
 }
 
 export interface NoWorkMessage extends ServerMessageBase {
@@ -140,7 +165,8 @@ export interface CoordinatorErrorMessage extends ServerMessageBase {
     | "HELLO_REQUIRED"
     | "INVALID_STATE"
     | "STALE_LEASE"
-    | "ATTEMPTS_EXHAUSTED";
+    | "ATTEMPTS_EXHAUSTED"
+    | "TASK_LIMIT";
   retryable: boolean;
 }
 
@@ -303,6 +329,29 @@ function parseLease(value: unknown): Lease | null {
   };
 }
 
+function parseQueueSnapshot(value: unknown): CubeQueueSnapshot | null {
+  if (!isRecord(value) ||
+    !isBoundedInteger(value.readyTasks, 0, COORDINATOR_MAX_TASKS) ||
+    !isBoundedInteger(value.activeWorkers, 1, 32) ||
+    !isBoundedInteger(value.lowWatermark, 1, COORDINATOR_MAX_TASKS) ||
+    !isBoundedInteger(value.targetWatermark, 1, COORDINATOR_MAX_TASKS) ||
+    !isBoundedInteger(value.highWatermark, 1, COORDINATOR_MAX_TASKS) ||
+    !isBoundedInteger(value.taskCount, 1, COORDINATOR_MAX_TASKS) ||
+    typeof value.canSplit !== "boolean" ||
+    value.lowWatermark > value.targetWatermark ||
+    value.targetWatermark > value.highWatermark
+  ) return null;
+  return {
+    readyTasks: value.readyTasks,
+    activeWorkers: value.activeWorkers,
+    lowWatermark: value.lowWatermark,
+    targetWatermark: value.targetWatermark,
+    highWatermark: value.highWatermark,
+    taskCount: value.taskCount,
+    canSplit: value.canSplit,
+  };
+}
+
 export function parseCoordinatorServerMessage(value: unknown): CoordinatorServerMessageParseResult {
   if (!isRecord(value)) return { ok: false, code: "INVALID_MESSAGE" };
   if (value.protocolVersion !== PUBLIC_JOB_PROTOCOL_VERSION) return { ok: false, code: "UPGRADE_REQUIRED" };
@@ -333,10 +382,11 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
   if (value.type === "WORK") {
     const task = parseCubeTask(value.task);
     const lease = parseLease(value.lease);
-    if (!isId(value.requestMessageId) || !task || !lease || task.taskId !== lease.taskId) {
+    const queue = parseQueueSnapshot(value.queue);
+    if (!isId(value.requestMessageId) || !task || !lease || !queue || task.taskId !== lease.taskId) {
       return { ok: false, code: "INVALID_MESSAGE" };
     }
-    return { ok: true, message: { ...base, type: "WORK", requestMessageId: value.requestMessageId, task, lease } };
+    return { ok: true, message: { ...base, type: "WORK", requestMessageId: value.requestMessageId, task, lease, queue } };
   }
   if (value.type === "NO_WORK") {
     if (!isId(value.requestMessageId) || !isBoundedInteger(value.retryAfterMs, 0, 3_600_000)) {
@@ -365,7 +415,7 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
   if (value.type === "ERROR") {
     const codes: CoordinatorErrorMessage["code"][] = [
       "INVALID_MESSAGE", "UPGRADE_REQUIRED", "JOB_MISMATCH", "HELLO_REQUIRED",
-      "INVALID_STATE", "STALE_LEASE", "ATTEMPTS_EXHAUSTED",
+      "INVALID_STATE", "STALE_LEASE", "ATTEMPTS_EXHAUSTED", "TASK_LIMIT",
     ];
     if (!codes.includes(value.code as CoordinatorErrorMessage["code"]) ||
       typeof value.retryable !== "boolean" ||

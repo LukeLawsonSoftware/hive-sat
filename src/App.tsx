@@ -1,11 +1,14 @@
 import { useSyncExternalStore } from "react";
 import HomePage from "./pages/HomePage";
 import JobPage from "./pages/JobPage";
+import JobsPage from "./pages/JobsPage";
 import SwarmPage from "./pages/SwarmPage";
+import { AppHeader } from "./components/AppHeader";
 
 type Route =
   | { name: "home" }
   | { name: "job"; jobId: string }
+  | { name: "jobs" }
   | { name: "swarm" }
   | { name: "not-found" };
 
@@ -28,6 +31,7 @@ function decodeRouteSegment(segment: string): string {
 
 function matchRoute(pathname: string): Route {
   if (pathname === "/") return { name: "home" };
+  if (pathname === "/jobs" || pathname === "/jobs/") return { name: "jobs" };
   if (pathname === "/swarm" || pathname === "/swarm/") return { name: "swarm" };
 
   const jobMatch = pathname.match(/^\/jobs\/([^/]+)\/?$/);
@@ -49,12 +53,7 @@ function RoutePlaceholder({
 }) {
   return (
     <div className="route-shell">
-      <header className="route-header">
-        <a className="brand route-brand" href="/" aria-label="HiveSAT home">
-          <span className="route-brand-mark" aria-hidden="true">H</span>
-          <span>HiveSAT</span>
-        </a>
-      </header>
+      <AppHeader />
       <main className="route-placeholder">
         <p className="eyebrow">{eyebrow}</p>
         <h1>{title}</h1>
@@ -78,6 +77,8 @@ function App() {
   if (route.name === "swarm") {
     return <SwarmPage />;
   }
+
+  if (route.name === "jobs") return <JobsPage />;
 
   if (route.name === "job") {
     return <JobPage jobId={route.jobId} />;

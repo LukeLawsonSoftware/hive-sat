@@ -12,6 +12,7 @@ import {
   type SwarmTotals,
 } from "../lib/swarmStatsStore";
 import { conservativeWorkerCapacity, isLikelyMobile } from "../lib/distributed/workerCapacity";
+import { AppHeader } from "../components/AppHeader";
 
 const WORKER_PREFERENCE_KEY = "hivesat:swarm-worker-preference";
 const PAUSE_HIDDEN_KEY = "hivesat:swarm-pause-hidden";
@@ -258,16 +259,7 @@ export default function SwarmPage() {
 
   return (
     <div className="swarm-page">
-      <header className="swarm-header">
-        <a className="swarm-brand" href="/" aria-label="HiveSAT home">
-          <span aria-hidden="true">H</span>
-          <strong>HiveSAT</strong>
-        </a>
-        <div className="swarm-header-state" aria-live="polite">
-          <i className={isActive ? "is-live" : ""} aria-hidden="true" />
-          <span>{status}</span>
-        </div>
-      </header>
+      <AppHeader current="swarm" />
 
       <main className="swarm-main">
         <section className="swarm-hero" aria-labelledby="swarm-title">

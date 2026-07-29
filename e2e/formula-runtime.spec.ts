@@ -4,9 +4,13 @@ import path from "node:path";
 
 const fixtures = path.join(import.meta.dirname, "fixtures");
 
-async function chooseAndSolve(page: Page, file: string | { name: string; mimeType: string; buffer: Buffer }) {
+async function choose(page: Page, file: string | { name: string; mimeType: string; buffer: Buffer }) {
   await page.getByLabel("Choose DIMACS CNF file").setInputFiles(file);
-  await page.getByRole("button", { name: "Solve instance" }).click();
+}
+
+async function chooseAndSolve(page: Page, file: string | { name: string; mimeType: string; buffer: Buffer }) {
+  await choose(page, file);
+  await page.getByRole("button", { name: "Solve locally" }).click();
 }
 
 test.describe("Phase 3 formula runtime", () => {
@@ -82,7 +86,7 @@ test.describe("Phase 3 formula runtime", () => {
 
   test("surfaces strict parser locations without invoking the solver", async ({ page }) => {
     await page.goto("/");
-    await chooseAndSolve(page, {
+    await choose(page, {
       name: "malformed.cnf",
       mimeType: "text/plain",
       buffer: Buffer.from("c bad literal\np cnf 2 1\n1 nope 0\n"),
@@ -94,7 +98,7 @@ test.describe("Phase 3 formula runtime", () => {
   test("rejects a gzip decompression bomb before parsing beyond 32 MiB", async ({ page }) => {
     await page.goto("/");
     const expanded = Buffer.alloc(32 * 1024 * 1024 + 1, 0x20);
-    await chooseAndSolve(page, {
+    await choose(page, {
       name: "bomb.cnf.gz",
       mimeType: "application/gzip",
       buffer: gzipSync(expanded),
@@ -133,7 +137,7 @@ test.describe("Phase 3 formula runtime", () => {
     await expect(page.getByRole("heading", { name: "Exploring assignments" })).toBeVisible({ timeout: 20_000 });
     await page.getByRole("button", { name: "Pause solve" }).click();
     await expect(page.getByText(/resume continues the current bounded CaDiCaL search/i)).toBeVisible();
-    await page.getByRole("button", { name: "Solve instance" }).click();
+    await page.getByRole("button", { name: "Solve locally" }).click();
     await expect(page.getByRole("heading", { name: "Exploring assignments" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Pause solve" })).toBeVisible();
   });

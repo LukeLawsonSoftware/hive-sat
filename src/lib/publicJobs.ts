@@ -3,6 +3,7 @@ import {
   type CreateJobInput,
   type CreateJobResult,
   type FormulaDeclaration,
+  type PublicJobState,
   type PublicJobStatus,
 } from "../../shared/public-jobs";
 import { VerifiedFormulaCache, type CachedFormula } from "./formula/cache";
@@ -12,12 +13,25 @@ import { MAX_UNSAT_PROOF_DECOMPRESSED_BYTES } from "../../shared/result-manifest
 import { verifyWithPinnedLratChecker } from "./lratChecker";
 
 const DATABASE_NAME = "hivesat-public-jobs";
-const DATABASE_VERSION = 1;
+const DATABASE_VERSION = 2;
 const OWNER_STORE = "owners";
 const META_STORE = "metadata";
 const DEVICE_KEY = "anonymous-device-id";
 
-interface OwnerRecord {
+export interface OwnedPublicJobRecord {
+  jobId: string;
+  ownerToken: string | null;
+  filename: string;
+  formula: FormulaDeclaration | null;
+  createdAt: number;
+  expiresAt: number;
+  lastStatus: PublicJobStatus | null;
+  lastSyncedAt: number | null;
+  terminalAt: number | null;
+  unavailable: boolean;
+}
+
+interface LegacyOwnerRecord {
   jobId: string;
   ownerToken: string;
   expiresAt: number;
@@ -74,11 +88,15 @@ export class PublicJobOwnerStore {
     }
   }
 
-  async saveOwner(record: OwnerRecord): Promise<void> {
+  async saveOwner(record: LegacyOwnerRecord): Promise<void> {
     const database = await this.openRequired();
     try {
       const transaction = database.transaction(OWNER_STORE, "readwrite");
-      transaction.objectStore(OWNER_STORE).put(record);
+      const store = transaction.objectStore(OWNER_STORE);
+      const existing = await requestResult(
+        store.get(record.jobId) as IDBRequest<OwnedPublicJobRecord | LegacyOwnerRecord | undefined>,
+      );
+      store.put(normalizeOwnedRecord({ ...existing, ...record }));
       await transactionDone(transaction);
     } finally {
       database.close();
@@ -90,10 +108,132 @@ export class PublicJobOwnerStore {
     try {
       const transaction = database.transaction(OWNER_STORE, "readonly");
       const record = await requestResult(
-        transaction.objectStore(OWNER_STORE).get(jobId) as IDBRequest<OwnerRecord | undefined>,
+        transaction.objectStore(OWNER_STORE).get(jobId) as IDBRequest<OwnedPublicJobRecord | LegacyOwnerRecord | undefined>,
       );
       await transactionDone(transaction);
       return record && record.expiresAt > Date.now() ? record.ownerToken : null;
+    } finally {
+      database.close();
+    }
+  }
+
+  async saveSubmission(input: {
+    jobId: string;
+    ownerToken: string;
+    filename: string;
+    formula: FormulaDeclaration;
+    createdAt: number;
+    expiresAt: number;
+    status?: PublicJobStatus | null;
+  }): Promise<void> {
+    const record: OwnedPublicJobRecord = {
+      jobId: input.jobId,
+      ownerToken: input.ownerToken,
+      filename: input.filename,
+      formula: input.formula,
+      createdAt: input.status?.createdAt ?? input.createdAt,
+      expiresAt: input.status?.expiresAt ?? input.expiresAt,
+      lastStatus: input.status ?? null,
+      lastSyncedAt: input.status ? Date.now() : null,
+      terminalAt: input.status && isTerminalPublicJobState(input.status.state) ? Date.now() : null,
+      unavailable: false,
+    };
+    await this.put(record);
+  }
+
+  async listJobs(now = Date.now()): Promise<OwnedPublicJobRecord[]> {
+    const database = await this.openRequired();
+    try {
+      const transaction = database.transaction(OWNER_STORE, "readwrite");
+      const store = transaction.objectStore(OWNER_STORE);
+      const raw = await requestResult(
+        store.getAll() as IDBRequest<Array<OwnedPublicJobRecord | LegacyOwnerRecord>>,
+      );
+      const records = raw.map(normalizeOwnedRecord).map((record) => {
+        if (record.expiresAt <= now && record.ownerToken) {
+          const expired = { ...record, ownerToken: null };
+          store.put(expired);
+          return expired;
+        }
+        return record;
+      });
+      await transactionDone(transaction);
+      return records.sort((left, right) => right.createdAt - left.createdAt);
+    } finally {
+      database.close();
+    }
+  }
+
+  async updateStatus(status: PublicJobStatus, now = Date.now()): Promise<void> {
+    const existing = await this.get(status.jobId);
+    await this.put({
+      ...(existing ?? normalizeOwnedRecord({
+        jobId: status.jobId,
+        ownerToken: null,
+        expiresAt: status.expiresAt,
+      })),
+      formula: status.formula,
+      createdAt: status.createdAt,
+      expiresAt: status.expiresAt,
+      lastStatus: status,
+      lastSyncedAt: now,
+      terminalAt: isTerminalPublicJobState(status.state)
+        ? existing?.terminalAt ?? now
+        : null,
+      unavailable: false,
+      ownerToken: status.expiresAt > now ? existing?.ownerToken ?? null : null,
+    });
+  }
+
+  async markUnavailable(jobId: string, now = Date.now()): Promise<void> {
+    const existing = await this.get(jobId);
+    if (!existing) return;
+    await this.put({
+      ...existing,
+      ownerToken: existing.expiresAt > now ? existing.ownerToken : null,
+      unavailable: true,
+      lastSyncedAt: now,
+    });
+  }
+
+  async removeJob(jobId: string): Promise<void> {
+    const database = await this.openRequired();
+    try {
+      const transaction = database.transaction(OWNER_STORE, "readwrite");
+      transaction.objectStore(OWNER_STORE).delete(jobId);
+      await transactionDone(transaction);
+    } finally {
+      database.close();
+    }
+  }
+
+  async clearTerminalJobs(): Promise<void> {
+    const records = await this.listJobs();
+    await Promise.all(records
+      .filter((record) => ownedJobGroup(record) === "completed" || ownedJobGroup(record) === "stopped")
+      .map((record) => this.removeJob(record.jobId)));
+  }
+
+  private async get(jobId: string): Promise<OwnedPublicJobRecord | null> {
+    const database = await this.openRequired();
+    try {
+      const transaction = database.transaction(OWNER_STORE, "readonly");
+      const record = await requestResult(
+        transaction.objectStore(OWNER_STORE).get(jobId) as IDBRequest<OwnedPublicJobRecord | LegacyOwnerRecord | undefined>,
+      );
+      await transactionDone(transaction);
+      return record ? normalizeOwnedRecord(record) : null;
+    } finally {
+      database.close();
+    }
+  }
+
+  private async put(record: OwnedPublicJobRecord): Promise<void> {
+    const database = await this.openRequired();
+    try {
+      const transaction = database.transaction(OWNER_STORE, "readwrite");
+      transaction.objectStore(OWNER_STORE).put(record);
+      await transactionDone(transaction);
     } finally {
       database.close();
     }
@@ -113,6 +253,56 @@ export class PublicJobOwnerStore {
     };
     return requestResult(request);
   }
+}
+
+function normalizeOwnedRecord(record: Partial<OwnedPublicJobRecord> & {
+  jobId: string;
+  ownerToken?: string | null;
+  expiresAt: number;
+}): OwnedPublicJobRecord {
+  return {
+    jobId: record.jobId,
+    ownerToken: record.ownerToken ?? null,
+    filename: record.filename ?? "Public SAT job",
+    formula: record.formula ?? record.lastStatus?.formula ?? null,
+    createdAt: record.createdAt ?? Math.max(0, record.expiresAt - 24 * 60 * 60 * 1_000),
+    expiresAt: record.expiresAt,
+    lastStatus: record.lastStatus ?? null,
+    lastSyncedAt: record.lastSyncedAt ?? null,
+    terminalAt: record.terminalAt ?? null,
+    unavailable: record.unavailable ?? false,
+  };
+}
+
+export type OwnedJobGroup = "submitted" | "in-progress" | "completed" | "stopped";
+
+export function isTerminalPublicJobState(state: PublicJobState): boolean {
+  return ["SAT_VERIFIED", "UNSAT_CERTIFIED", "UNSAT_OWNER_VERIFIED", "INVALID", "UNKNOWN", "CANCELLED"].includes(state);
+}
+
+export function ownedJobGroup(record: OwnedPublicJobRecord): OwnedJobGroup {
+  if (record.unavailable || record.expiresAt <= Date.now() && !record.lastStatus) return "stopped";
+  const state = record.lastStatus?.state ?? "UPLOADING";
+  if (state === "UPLOADING" || state === "QUEUED") return "submitted";
+  if (state === "RUNNING") return "in-progress";
+  if (["SAT_VERIFIED", "UNSAT_CERTIFIED", "UNSAT_OWNER_VERIFIED"].includes(state)) return "completed";
+  return "stopped";
+}
+
+export function publicJobStatusLabel(record: OwnedPublicJobRecord): string {
+  if (record.unavailable) return record.expiresAt <= Date.now() ? "Expired" : "Status unavailable";
+  const labels: Record<PublicJobState, string> = {
+    UPLOADING: "Uploading",
+    QUEUED: "Submitted",
+    RUNNING: record.lastStatus?.certificate?.verification === "OWNER_CHECK_REQUIRED" ? "Proof check required" : "In progress",
+    SAT_VERIFIED: "Completed · SAT",
+    UNSAT_CERTIFIED: "Completed · UNSAT certified",
+    UNSAT_OWNER_VERIFIED: "Completed · UNSAT owner verified",
+    INVALID: "Invalid result",
+    UNKNOWN: "Stopped without a verdict",
+    CANCELLED: "Cancelled",
+  };
+  return labels[record.lastStatus?.state ?? "UPLOADING"];
 }
 
 export function ownerTokenFromFragment(fragment = window.location.hash): string | null {
@@ -139,6 +329,7 @@ export interface SubmitPublicJobOptions {
   turnstileToken: string;
   publicConsent: true;
   cachedFormula: CachedFormula;
+  filename: string;
   ownerStore?: PublicJobOwnerStore;
   fetcher?: typeof fetch;
 }
@@ -167,9 +358,13 @@ export async function submitPublicJob(options: SubmitPublicJobOptions): Promise<
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
   }));
-  await ownerStore.saveOwner({
+  const submittedAt = Date.now();
+  await ownerStore.saveSubmission({
     jobId: created.jobId,
     ownerToken: created.ownerToken,
+    filename: options.filename,
+    formula,
+    createdAt: submittedAt,
     expiresAt: created.expiresAt,
   });
   try {
@@ -187,8 +382,11 @@ export async function submitPublicJob(options: SubmitPublicJobOptions): Promise<
       method: "POST",
       headers: { authorization: `Bearer ${created.ownerToken}` },
     }).catch(() => undefined);
+    await ownerStore.markUnavailable(created.jobId).catch(() => undefined);
     throw error;
   }
+  const status = await getPublicJob(created.jobId, fetcher).catch(() => null);
+  if (status) await ownerStore.updateStatus(status);
   return created;
 }
 

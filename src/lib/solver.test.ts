@@ -53,7 +53,7 @@ describe("BrowserSolverClient", () => {
     const workers = [formulaWorker, solverWorker];
     const client = new BrowserSolverClient(() => workers.shift()!);
     client.select(new File(["p cnf 1 1\n1 0\n"], "sat.cnf"));
-    client.start();
+    client.prepare();
     const requestId = formulaWorker.posted[0].message.requestId as string;
     const { encoded, hash } = await fixture();
     const batch = Int32Array.from([1, 0]);
@@ -74,6 +74,9 @@ describe("BrowserSolverClient", () => {
       batches: [batch],
     });
 
+    await vi.waitFor(() => expect(client.getSnapshot().phase).toBe("prepared"));
+    expect(solverWorker.posted).toHaveLength(0);
+    client.solveLocally();
     await vi.waitFor(() => expect(solverWorker.posted).toHaveLength(2));
     expect(solverWorker.posted.map(({ message }) => message.type)).toEqual(["initialize", "clause-batch"]);
     expect(solverWorker.posted[1].transfer).toHaveLength(1);
@@ -103,7 +106,7 @@ describe("BrowserSolverClient", () => {
     const workers = [formulaWorker, solverWorker];
     const client = new BrowserSolverClient(() => workers.shift()!);
     client.select(new File(["p cnf 1 1\n1 0\n"], "resume.cnf"));
-    client.start();
+    client.prepare();
     const requestId = formulaWorker.posted[0].message.requestId as string;
     const { encoded, hash } = await fixture();
     const batch = Int32Array.from([1, 0]);
@@ -114,13 +117,15 @@ describe("BrowserSolverClient", () => {
       encoded: encoded.slice().buffer as ArrayBuffer,
       batches: [batch],
     });
+    await vi.waitFor(() => expect(client.getSnapshot().phase).toBe("prepared"));
+    client.solveLocally();
     await vi.waitFor(() => expect(solverWorker.posted).toHaveLength(2));
     solverWorker.emit({ type: "ready", requestId });
     client.cancel();
-    expect(client.getSnapshot()).toMatchObject({ phase: "ready", message: expect.stringMatching(/resume continues/i) });
+    expect(client.getSnapshot()).toMatchObject({ phase: "prepared", message: expect.stringMatching(/resume continues/i) });
     expect(solverWorker.posted.at(-1)?.message.type).toBe("pause");
 
-    client.start();
+    client.solveLocally();
     expect(client.getSnapshot().phase).toBe("solving");
     expect(solverWorker.posted.at(-1)?.message.type).toBe("solve");
     expect(workers).toHaveLength(0);
@@ -132,7 +137,7 @@ describe("BrowserSolverClient", () => {
     const workers = [formulaWorker, solverWorker];
     const client = new BrowserSolverClient(() => workers.shift()!);
     client.select(new File(["p cnf 1 1\n1 0\n"], "bad-model.cnf"));
-    client.start();
+    client.prepare();
     const requestId = formulaWorker.posted[0].message.requestId as string;
     const { encoded, hash } = await fixture();
     const batch = Int32Array.from([1, 0]);
@@ -143,6 +148,8 @@ describe("BrowserSolverClient", () => {
       encoded: encoded.slice().buffer as ArrayBuffer,
       batches: [batch],
     });
+    await vi.waitFor(() => expect(client.getSnapshot().phase).toBe("prepared"));
+    client.solveLocally();
     await vi.waitFor(() => expect(solverWorker.posted).toHaveLength(2));
     solverWorker.emit({ type: "ready", requestId });
     solverWorker.emit({

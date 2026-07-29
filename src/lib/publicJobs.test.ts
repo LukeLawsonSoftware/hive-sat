@@ -2,11 +2,47 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeHiveCnfV1, sha256Hex } from "./formula/hiveCnf";
 import {
   downloadVerifiedPublicFormula,
+  ownedJobGroup,
   ownerTokenFromFragment,
+  publicJobStatusLabel,
   publicJobUrl,
+  type OwnedPublicJobRecord,
 } from "./publicJobs";
 
 describe("public job browser trust boundary", () => {
+  it("groups browser-owned jobs and presents terminal verdicts clearly", () => {
+    const base: OwnedPublicJobRecord = {
+      jobId: "job",
+      ownerToken: null,
+      filename: "sample.cnf",
+      formula: null,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      lastStatus: null,
+      lastSyncedAt: null,
+      terminalAt: null,
+      unavailable: false,
+    };
+    expect(ownedJobGroup(base)).toBe("submitted");
+    const completed = {
+      ...base,
+      lastStatus: {
+        protocolVersion: 2,
+        jobId: "job",
+        state: "SAT_VERIFIED",
+        formula: { hash: "ab".repeat(32), variableCount: 1, clauseCount: 1, literalCount: 1, encodedBytes: 24, compressedBytes: 20 },
+        createdAt: base.createdAt,
+        expiresAt: base.expiresAt,
+        uploadedBytes: 20,
+        rootTaskState: "SAT_VERIFIED",
+        certificate: null,
+      },
+    } satisfies OwnedPublicJobRecord;
+    expect(ownedJobGroup(completed)).toBe("completed");
+    expect(publicJobStatusLabel(completed)).toBe("Completed · SAT");
+    expect(ownedJobGroup({ ...base, unavailable: true })).toBe("stopped");
+  });
+
   it("keeps owner credentials in the fragment and public links credential-free", () => {
     const token = "a".repeat(43);
     expect(ownerTokenFromFragment(`#owner=${token}`)).toBe(token);

@@ -1,13 +1,13 @@
 # HiveSAT operator runbook
 
 This runbook is for the Cloudflare Worker, `JobCoordinatorDO`,
-`SwarmDirectoryDO`, `ResultVerifierDO`, and the job-scoped R2 bucket. It favors
+`SwarmDirectoryDO`, `ResultVerifierDO`, and the `JOB_ARTIFACTS` KV namespace. It favors
 rejecting new work over weakening result verification or exceeding configured
 safety margins.
 
 ## Before enabling public traffic
 
-1. Confirm the production R2 bucket and all three Durable Object bindings.
+1. Confirm the production KV namespace and all three Durable Object bindings.
 2. Configure the production Turnstile site key and secret.
 3. Configure a high-entropy `NETWORK_DIGEST_KEY` as a secret.
 4. Run lint, type-check, unit, Workers-runtime, browser, Wasm reproducibility,
@@ -28,10 +28,10 @@ Cloudflare Git deployment.
 
 | Signal | Action |
 | --- | --- |
-| `quota.state = NEAR_LIMIT` | Lower `MAX_ACTIVE_JOBS`; inspect assignments, R2 operations, and DO request/duration trends |
+| `quota.state = NEAR_LIMIT` | Lower `MAX_ACTIVE_JOBS`; inspect assignments, Workers KV operations, and DO request/duration trends |
 | Job socket 503s | Confirm genuine concurrency, reconnect storms, and the 60-second heartbeat interval before raising `MAX_JOB_CONNECTIONS` |
 | Directory socket 503s | Keep client backoff; inspect one-shot sockets and handoff latency before raising `MAX_DIRECTORY_CONNECTIONS` |
-| R2 operation or byte trend unsafe | Disable `FEATURE_PUBLIC_JOBS` first; existing jobs still expire |
+| Workers KV operation or byte trend unsafe | Disable `FEATURE_PUBLIC_JOBS` first; existing jobs still expire |
 | DO request/duration trend unsafe | Disable `FEATURE_PUBLIC_SWARM`; preserve public status and cleanup |
 | Both margins unsafe | Disable both flags and reduce the active-job ceiling |
 
@@ -67,13 +67,13 @@ For a sampled expired job, verify all of the following:
 
 - no directory `active_jobs` row or active reservation;
 - no coordinator SQL storage after its deletion alarm;
-- no `jobs/{jobId}/formula.hivecnf.gz` object;
+- no `jobs/{jobId}/formula/*` key;
 - no `jobs/{jobId}/models/*` objects;
 - no `jobs/{jobId}/proofs/*` objects; and
 - public status returns not found.
 
 An orphan is a cleanup incident. Disable admission if orphan growth threatens
-the R2 safety margin, then investigate alarms and partial uploads.
+the Workers KV safety margin, then investigate alarms and partial uploads.
 
 ## Post-deployment smoke record
 

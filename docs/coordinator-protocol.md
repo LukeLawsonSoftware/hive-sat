@@ -73,7 +73,7 @@ the earliest active lease deadline. Each invocation recovers at most 64
 expired leases, then schedules an immediate continuation when more are due.
 Otherwise it recomputes the next earliest deadline.
 
-At job expiry the same alarm broadcasts cancellation, removes the R2 formula,
+At job expiry the same alarm broadcasts cancellation, removes KV artifacts in bounded batches,
 releases directory capacity, and deletes coordinator storage. Owner
 cancellation atomically cancels active leases/tasks, broadcasts
 `JOB_CANCELLED`, and leaves the existing expiry alarm to perform final durable

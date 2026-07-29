@@ -27,7 +27,7 @@ class FakeWebSocket extends EventTarget {
 function welcome(jobId: string) {
   return {
     type: "WELCOME",
-    protocolVersion: 2,
+    protocolVersion: 3,
     messageId: "welcome-one",
     jobId,
     serverTime: 1,

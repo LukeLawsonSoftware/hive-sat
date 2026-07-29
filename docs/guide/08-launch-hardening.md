@@ -47,7 +47,7 @@ layer reduces what the next one must handle:
 | Task tree | 10,000 tasks, depth 64 |
 | Formula | 5 MiB gzip, 32 MiB canonical, 2,000,000 literals |
 | SAT model | 512 KiB |
-| LRAT per job | 32 MiB gzip, 128 MiB expanded |
+| LRAT per job | 25 MiB gzip, 128 MiB expanded |
 | Job coordinator sockets | 32 by default |
 | Directory handoff sockets | 128 by default |
 
@@ -145,12 +145,12 @@ migration tag.
 
 Each job has one earliest-deadline alarm. At expiry the coordinator closes
 sockets, cancels leases, deletes the canonical formula plus model and proof
-objects from R2, tells the directory to remove the job, and deletes its SQL
+objects from Workers KV, tells the directory to remove the job, and deletes its SQL
 storage. Directory alarms also expire reservations, replay rows, and rolling
 creation history.
 
-Cleanup tests cover R2 content and Durable Object state. The operator runbook
-adds the production checks for orphaned object prefixes and alarm failures.
+Cleanup tests cover Workers KV content and Durable Object state. The operator runbook
+adds the production checks for orphaned key prefixes and alarm failures.
 
 ## What launch hardening does not promise
 

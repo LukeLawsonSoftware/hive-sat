@@ -6,6 +6,7 @@ import {
 } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CreateJobResult, PublicJobStatus } from "./contracts";
+import { putJobArtifact } from "./job-artifacts";
 
 const FORMULA = {
   hash: "ab".repeat(32),
@@ -28,7 +29,7 @@ async function createJob(overrides: Record<string, unknown> = {}): Promise<Creat
     },
     body: JSON.stringify({
       deviceId: `device_${String(sequence).padStart(24, "0")}`,
-      protocolVersion: 2,
+      protocolVersion: 3,
       turnstileToken: `test-turnstile-token-${sequence}`,
       publicConsent: true,
       formula: FORMULA,
@@ -99,7 +100,7 @@ describe("HiveSAT Worker", () => {
       headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.220" },
       body: JSON.stringify({
         deviceId: "device_replay_000000000000000002",
-        protocolVersion: 2,
+        protocolVersion: 3,
         turnstileToken: replayToken,
         publicConsent: true,
         formula: FORMULA,
@@ -134,7 +135,7 @@ describe("HiveSAT Worker", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         deviceId: "device_000000000000000000000001",
-        protocolVersion: 2,
+        protocolVersion: 3,
         turnstileToken: "token",
         publicConsent: false,
         formula: FORMULA,
@@ -175,7 +176,7 @@ describe("HiveSAT Worker", () => {
     });
   });
 
-  it("streams a job-scoped formula to R2 and exposes public status/download", async () => {
+  it("streams a job-scoped formula to KV and exposes public status/download", async () => {
     const job = await createJob();
     const uploaded = await uploadFormula(job);
     expect(uploaded.status).toBe(201);
@@ -192,8 +193,106 @@ describe("HiveSAT Worker", () => {
 
     const download = await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/formula`);
     expect(download.status).toBe(200);
+    expect(download.headers.get("content-type")).toBe("application/vnd.hivesat.cnf+gzip");
+    expect(download.headers.get("etag")).toBe(`W/"${FORMULA.hash}"`);
     expect(download.headers.get("x-hivesat-formula-sha256")).toBe(FORMULA.hash);
     expect(new Uint8Array(await download.arrayBuffer())).toEqual(new Uint8Array([0x1f, 0x8b, 0x00, 0x00]));
+
+    const artifactKey = await runInDurableObject(
+      env.JOB_COORDINATORS.getByName(job.jobId),
+      (_instance, state) => state.storage.sql.exec<{ object_key: string }>(
+        "SELECT object_key FROM jobs",
+      ).one().object_key,
+    );
+    const stored = await env.JOB_ARTIFACTS.getWithMetadata<{
+      kind: string;
+      formulaHash: string;
+      bytes: number;
+    }>(artifactKey, "arrayBuffer");
+    expect(stored.metadata).toMatchObject({
+      kind: "formula",
+      formulaHash: FORMULA.hash,
+      bytes: FORMULA.compressedBytes,
+    });
+  });
+
+  it("rejects a streamed length mismatch without consuming the upload capability", async () => {
+    const job = await createJob();
+    const mismatched = await SELF.fetch(job.uploadUrl, {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${job.uploadToken}`,
+        "content-length": String(FORMULA.compressedBytes),
+      },
+      body: new Uint8Array([0x1f, 0x8b, 0x00]),
+    });
+    expect(mismatched.status).toBe(400);
+    await expect(mismatched.json()).resolves.toMatchObject({ error: { code: "INVALID_BODY" } });
+    expect((await uploadFormula(job)).status).toBe(201);
+  });
+
+  it("commits only one immutable key when formula uploads race", async () => {
+    const job = await createJob();
+    const responses = await Promise.all([uploadFormula(job), uploadFormula(job)]);
+    expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+    const keys = await env.JOB_ARTIFACTS.list({ prefix: `jobs/${job.jobId}/formula/` });
+    expect(keys.keys).toHaveLength(1);
+  });
+
+  it("returns a retryable error when committed KV data is temporarily unavailable", async () => {
+    const job = await createJob();
+    expect((await uploadFormula(job)).status).toBe(201);
+    const artifactKey = await runInDurableObject(
+      env.JOB_COORDINATORS.getByName(job.jobId),
+      (_instance, state) => state.storage.sql.exec<{ object_key: string }>(
+        "SELECT object_key FROM jobs",
+      ).one().object_key,
+    );
+    await env.JOB_ARTIFACTS.delete(artifactKey);
+    const response = await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/formula`);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("30");
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "ARTIFACT_UNAVAILABLE" } });
+  });
+
+  it("downloads certified proofs with explicit content headers and a strong hash ETag", async () => {
+    const job = await createJob();
+    expect((await uploadFormula(job)).status).toBe(201);
+    const artifactId = "proof-download";
+    const artifactSha256 = "cd".repeat(32);
+    const objectKey = `jobs/${job.jobId}/proof/${artifactId}-unique.lrat.gz`;
+    const bytes = new Uint8Array([0x1f, 0x8b, 0x08, 0x00]);
+    await putJobArtifact(env.JOB_ARTIFACTS, objectKey, new Response(bytes).body!, {
+      kind: "unsat-proof",
+      jobId: job.jobId,
+      taskId: "root",
+      formulaHash: FORMULA.hash,
+      artifactSha256,
+      contentType: "application/vnd.hivesat.lrat+gzip",
+      bytes: bytes.byteLength,
+    }, Date.now() + 24 * 60 * 60_000);
+    await runInDurableObject(env.JOB_COORDINATORS.getByName(job.jobId), (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO proof_artifacts (
+          artifact_id, task_id, lease_id, artifact_sha256, compressed_bytes,
+          decompressed_bytes, verification_status, created_at, object_key
+        ) VALUES (?, 'root', ?, ?, ?, 8, 'SERVER_CERTIFIED', ?, ?)`,
+        artifactId,
+        artifactId,
+        artifactSha256,
+        bytes.byteLength,
+        Date.now(),
+        objectKey,
+      );
+    });
+
+    const response = await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/proofs/${artifactId}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/vnd.hivesat.lrat+gzip");
+    expect(response.headers.get("content-length")).toBe(String(bytes.byteLength));
+    expect(response.headers.get("etag")).toBe(`"${artifactSha256}"`);
+    expect(response.headers.get("x-hivesat-proof-sha256")).toBe(artifactSha256);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
   });
 
   it("routes WebSocket upgrades to the job coordinator", async () => {
@@ -223,7 +322,7 @@ describe("HiveSAT Worker", () => {
     });
     socket.send(JSON.stringify({
       type: "SWARM_HELLO",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "swarm-index-request",
       sessionId: "swarm-index-session",
       capabilities: {
@@ -255,6 +354,14 @@ describe("HiveSAT Worker", () => {
     });
     expect(badCancel.status).toBe(403);
 
+    const artifactKey = await runInDurableObject(
+      env.JOB_COORDINATORS.getByName(job.jobId),
+      (_instance, state) => state.storage.sql.exec<{ object_key: string }>(
+        "SELECT object_key FROM jobs",
+      ).one().object_key,
+    );
+    expect(await env.JOB_ARTIFACTS.get(artifactKey, "arrayBuffer")).not.toBeNull();
+
     const cancelled = await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/cancel`, {
       method: "POST",
       headers: { authorization: `Bearer ${job.ownerToken}` },
@@ -262,7 +369,7 @@ describe("HiveSAT Worker", () => {
     expect(cancelled.status).toBe(200);
     await expect(cancelled.json()).resolves.toMatchObject({ state: "CANCELLED", changed: true });
     expect((await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}/formula`)).status).toBe(404);
-    expect(await env.FORMULAS.get(`jobs/${job.jobId}/formula.hivecnf.gz`)).toBeNull();
+    expect(await env.JOB_ARTIFACTS.get(artifactKey)).toBeNull();
   });
 
   it("enforces active and rolling-day admission per device/network digest", async () => {
@@ -275,7 +382,7 @@ describe("HiveSAT Worker", () => {
         headers: { "content-type": "application/json", "cf-connecting-ip": ip },
         body: JSON.stringify({
           deviceId,
-          protocolVersion: 2,
+          protocolVersion: 3,
           turnstileToken: `token-${++attemptSequence}`,
           publicConsent: true,
           formula: FORMULA,
@@ -320,10 +427,12 @@ describe("HiveSAT Worker", () => {
     })).toEqual({ ok: false, code: "GLOBAL_JOB_LIMIT" });
   });
 
-  it("expires coordinator data and R2 content through its 24-hour alarm", async () => {
+  it("expires coordinator data and KV content through its 24-hour alarm", async () => {
     const job = await createJob();
     expect((await uploadFormula(job)).status).toBe(201);
     const stub = env.JOB_COORDINATORS.getByName(job.jobId);
+    const artifactKey = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{ object_key: string }>("SELECT object_key FROM jobs").one().object_key);
     await runInDurableObject(stub, (_instance, state) => {
       state.storage.sql.exec("UPDATE jobs SET expires_at = ?", Date.now() - 1);
       return state.storage.setAlarm(Date.now() + 10_000);
@@ -331,7 +440,7 @@ describe("HiveSAT Worker", () => {
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
     expect((await SELF.fetch(`https://hive-sat.test/api/v1/jobs/${job.jobId}`)).status).toBe(404);
-    expect(await env.FORMULAS.get(`jobs/${job.jobId}/formula.hivecnf.gz`)).toBeNull();
+    expect(await env.JOB_ARTIFACTS.get(artifactKey)).toBeNull();
     await runInDurableObject(env.SWARM_DIRECTORY.getByName("global-v1"), (_instance, state) => {
       const row = state.storage.sql.exec<{ total: number }>(
         "SELECT COUNT(*) AS total FROM active_jobs WHERE job_id = ?",

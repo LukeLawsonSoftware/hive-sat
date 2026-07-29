@@ -78,18 +78,19 @@ for the formula but not for this cube is rejected.
 sequenceDiagram
   participant C as "CaDiCaL worker"
   participant B as "Browser runtime"
-  participant R as "R2"
+  participant K as "Workers KV"
   participant J as "JobCoordinatorDO"
   participant V as "ResultVerifierDO"
 
   C->>B: "SAT + ordered model"
   B->>B: "Check every clause and cube literal"
   B->>B: "Encode bitset; hash artifact"
-  B->>R: "Lease-scoped bounded model upload"
+  B->>K: "Lease-scoped bounded model upload"
   B->>J: "RESULT + manifest"
   J->>J: "Validate lease, formula, task, cube, path"
   J->>V: "Verify immutable formula + model objects"
-  V->>R: "Read model and gzip formula"
+  J->>K: "Read model and gzip formula"
+  J->>V: "Stream immutable artifacts"
   V->>V: "Re-hash, decode, check cube and clauses"
   V-->>J: "VALID_SAT"
   J->>J: "Atomically set SAT_VERIFIED"
@@ -101,7 +102,7 @@ or transfer mistakes early. The server verifier is decisive because it does
 not trust the browser's memory, parser, claimed hash, or previous check.
 
 The coordinator stores `VERIFYING_SAT` before calling the verifier. This matters
-because Durable Objects may release their input gate while awaiting R2 or
+because Durable Objects may release their input gate while awaiting Workers KV or
 another Durable Object. A second message cannot quietly turn an in-flight
 candidate into a terminal result.
 

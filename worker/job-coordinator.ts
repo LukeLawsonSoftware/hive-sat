@@ -32,6 +32,7 @@ import {
   unsatProofObjectKey,
   type UnsatProofManifest,
 } from "../shared/result-manifest";
+import { formulaObjectKey } from "./contracts";
 import type {
   InitializeJobInput,
   ModelUploadAuthorization,
@@ -43,6 +44,7 @@ import type {
 import { fixedTimeHexEqual, randomToken } from "./crypto";
 import type { VerifySatResult, VerifyUnsatResult } from "./result-verifier";
 import { calibratedTaskProfile } from "../shared/capability-profile";
+import { deleteJobArtifacts, getJobArtifact, putJobArtifact } from "./job-artifacts";
 
 interface JobRow {
   [key: string]: SqlStorageValue;
@@ -84,7 +86,16 @@ interface ProofArtifactRow {
   artifact_sha256: string;
   compressed_bytes: number;
   decompressed_bytes: number;
+  object_key: string;
   verification_status: "UPLOADED" | "SERVER_CERTIFIED" | "OWNER_CHECK_REQUIRED" | "OWNER_VERIFIED" | "INVALID";
+  created_at: number;
+}
+
+interface ModelArtifactRow {
+  [key: string]: SqlStorageValue;
+  lease_id: string;
+  object_key: string;
+  artifact_bytes: number;
   created_at: number;
 }
 
@@ -276,6 +287,18 @@ export class JobCoordinatorDO extends DurableObject<Env> {
         INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (5, unixepoch('now') * 1000);
       `);
     }
+    if (version < 6) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE proof_artifacts ADD COLUMN object_key TEXT NOT NULL DEFAULT '';
+        CREATE TABLE model_artifacts (
+          lease_id TEXT PRIMARY KEY,
+          object_key TEXT NOT NULL UNIQUE,
+          artifact_bytes INTEGER NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (6, unixepoch('now') * 1000);
+      `);
+    }
   }
 
   async initialize(input: InitializeJobInput): Promise<void> {
@@ -303,7 +326,7 @@ export class JobCoordinatorDO extends DurableObject<Env> {
         input.formula.literalCount,
         input.formula.encodedBytes,
         input.formula.compressedBytes,
-        input.objectKey,
+        "",
         input.createdAt,
         input.expiresAt,
       );
@@ -362,16 +385,58 @@ export class JobCoordinatorDO extends DurableObject<Env> {
   authorizeUpload(uploadDigest: string): UploadAuthorization {
     const row = this.job();
     if (!row) return { ok: false, code: "NOT_FOUND" };
+    if (row.state !== "UPLOADING") return { ok: false, code: "INVALID_STATE" };
     if (!row.upload_digest || !fixedTimeHexEqual(uploadDigest, row.upload_digest)) {
       return { ok: false, code: "INVALID_TOKEN" };
     }
-    if (row.state !== "UPLOADING") return { ok: false, code: "INVALID_STATE" };
     return {
       ok: true,
       objectKey: row.object_key,
       formulaHash: row.formula_hash,
       compressedBytes: row.compressed_bytes,
     };
+  }
+
+  async storeFormula(
+    uploadDigest: string,
+    body: ReadableStream<Uint8Array>,
+    contentLength: number,
+  ): Promise<
+    | { ok: true; formulaHash: string; bytes: number }
+    | { ok: false; code: "NOT_FOUND" | "INVALID_TOKEN" | "INVALID_STATE" | "INVALID_BODY" | "STORAGE_UNAVAILABLE" }
+  > {
+    const authorization = this.authorizeUpload(uploadDigest);
+    if (!authorization.ok) return authorization;
+    if (contentLength !== authorization.compressedBytes) return { ok: false, code: "INVALID_BODY" };
+    const job = this.job();
+    if (!job) return { ok: false, code: "NOT_FOUND" };
+    const objectKey = formulaObjectKey(job.job_id, randomToken(18));
+    try {
+      await putJobArtifact(this.env.JOB_ARTIFACTS, objectKey, body, {
+        kind: "formula",
+        jobId: job.job_id,
+        formulaHash: job.formula_hash,
+        contentType: "application/vnd.hivesat.cnf+gzip",
+        bytes: contentLength,
+      }, job.expires_at);
+    } catch (error) {
+      return {
+        ok: false,
+        code: String(error).includes("declared byte length") ? "INVALID_BODY" : "STORAGE_UNAVAILABLE",
+      };
+    }
+    const committed = this.ctx.storage.sql.exec(
+      `UPDATE jobs SET state = 'QUEUED', uploaded_bytes = ?, upload_digest = NULL, object_key = ?
+       WHERE state = 'UPLOADING' AND upload_digest = ?`,
+      contentLength,
+      objectKey,
+      uploadDigest,
+    ).rowsWritten === 1;
+    if (!committed) {
+      await this.env.JOB_ARTIFACTS.delete(objectKey);
+      return { ok: false, code: "INVALID_STATE" };
+    }
+    return { ok: true, formulaHash: authorization.formulaHash, bytes: contentLength };
   }
 
   completeUpload(uploadDigest: string, uploadedBytes: number): UploadAuthorization {
@@ -412,6 +477,57 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     };
   }
 
+  async storeModel(
+    leaseId: string,
+    body: ReadableStream<Uint8Array>,
+    contentLength: number,
+  ): Promise<
+    | { ok: true; taskId: string; bytes: number }
+    | { ok: false; code: "NOT_FOUND" | "INVALID_STATE" | "INVALID_BODY" | "ALREADY_UPLOADED" | "STORAGE_UNAVAILABLE" }
+  > {
+    const authorization = this.authorizeModelUpload(leaseId);
+    if (!authorization.ok) return authorization;
+    if (contentLength < 12 || contentLength > authorization.maximumBytes) {
+      return { ok: false, code: "INVALID_BODY" };
+    }
+    if (this.modelArtifact(leaseId)) return { ok: false, code: "ALREADY_UPLOADED" };
+    const job = this.job();
+    if (!job) return { ok: false, code: "NOT_FOUND" };
+    const objectKey = satModelObjectKey(job.job_id, `${leaseId}-${randomToken(12)}`);
+    try {
+      await putJobArtifact(this.env.JOB_ARTIFACTS, objectKey, body, {
+        kind: "sat-model",
+        jobId: job.job_id,
+        taskId: authorization.task.taskId,
+        formulaHash: job.formula_hash,
+        contentType: "application/vnd.hivesat.model",
+        bytes: contentLength,
+      }, job.expires_at);
+    } catch (error) {
+      return {
+        ok: false,
+        code: String(error).includes("declared byte length") ? "INVALID_BODY" : "STORAGE_UNAVAILABLE",
+      };
+    }
+    if (!this.authorizeModelUpload(leaseId).ok) {
+      await this.env.JOB_ARTIFACTS.delete(objectKey);
+      return { ok: false, code: "INVALID_STATE" };
+    }
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO model_artifacts (lease_id, object_key, artifact_bytes, created_at) VALUES (?, ?, ?, ?)",
+      leaseId,
+      objectKey,
+      contentLength,
+      Date.now(),
+    );
+    const committed = this.modelArtifact(leaseId)?.object_key === objectKey;
+    if (!committed) {
+      await this.env.JOB_ARTIFACTS.delete(objectKey);
+      return { ok: false, code: "ALREADY_UPLOADED" };
+    }
+    return { ok: true, taskId: authorization.task.taskId, bytes: contentLength };
+  }
+
   authorizeProofUpload(leaseId: string, decompressedBytes: number): ProofUploadAuthorization {
     const job = this.job();
     const lease = this.ctx.storage.sql.exec<LeaseRow>(
@@ -441,6 +557,70 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     };
   }
 
+  async storeProof(
+    leaseId: string,
+    body: ReadableStream<Uint8Array>,
+    contentLength: number,
+    artifactSha256: string,
+    decompressedBytes: number,
+  ): Promise<
+    | { ok: true; taskId: string; bytes: number }
+    | { ok: false; code: "NOT_FOUND" | "INVALID_STATE" | "PROOF_BUDGET_EXHAUSTED" | "INVALID_BODY" | "ALREADY_UPLOADED" | "STORAGE_UNAVAILABLE" }
+  > {
+    const authorization = this.authorizeProofUpload(leaseId, decompressedBytes);
+    if (!authorization.ok) return authorization;
+    if (contentLength < 1 || contentLength > authorization.maximumCompressedBytes) {
+      return { ok: false, code: "INVALID_BODY" };
+    }
+    const job = this.job();
+    if (!job) return { ok: false, code: "NOT_FOUND" };
+    const objectKey = unsatProofObjectKey(job.job_id, `${leaseId}-${randomToken(12)}`);
+    try {
+      await putJobArtifact(this.env.JOB_ARTIFACTS, objectKey, body, {
+        kind: "unsat-proof",
+        jobId: job.job_id,
+        taskId: authorization.task.taskId,
+        formulaHash: job.formula_hash,
+        artifactSha256,
+        contentType: "application/vnd.hivesat.lrat+gzip",
+        bytes: contentLength,
+      }, job.expires_at);
+    } catch (error) {
+      return {
+        ok: false,
+        code: String(error).includes("declared byte length") ? "INVALID_BODY" : "STORAGE_UNAVAILABLE",
+      };
+    }
+    const current = this.authorizeProofUpload(leaseId, decompressedBytes);
+    if (!current.ok || contentLength > current.maximumCompressedBytes) {
+      await this.env.JOB_ARTIFACTS.delete(objectKey);
+      return { ok: false, code: current.ok ? "PROOF_BUDGET_EXHAUSTED" : current.code };
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO proof_artifacts (
+        artifact_id, task_id, lease_id, artifact_sha256, compressed_bytes,
+        decompressed_bytes, object_key, verification_status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'UPLOADED', ?)`,
+      leaseId,
+      authorization.task.taskId,
+      leaseId,
+      artifactSha256,
+      contentLength,
+      decompressedBytes,
+      objectKey,
+      Date.now(),
+    );
+    const committed = this.ctx.storage.sql.exec<ProofArtifactRow>(
+      "SELECT * FROM proof_artifacts WHERE artifact_id = ?",
+      leaseId,
+    ).toArray()[0]?.object_key === objectKey;
+    if (!committed) {
+      await this.env.JOB_ARTIFACTS.delete(objectKey);
+      return { ok: false, code: "ALREADY_UPLOADED" };
+    }
+    return { ok: true, taskId: authorization.task.taskId, bytes: contentLength };
+  }
+
   recordProofUpload(
     leaseId: string,
     artifactSha256: string,
@@ -465,15 +645,40 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     return true;
   }
 
-  proofDownload(artifactId: string): { objectKey: string; sha256: string } | null {
+  async formulaDownload(): Promise<
+    | { ok: true; body: ReadableStream; hash: string; bytes: number }
+    | { ok: false; code: "NOT_FOUND" | "ARTIFACT_UNAVAILABLE" }
+  > {
+    const job = this.job();
+    if (!job || !job.object_key ||
+      ["UPLOADING", "CANCELLED", "INVALID"].includes(job.state)) {
+      return { ok: false, code: "NOT_FOUND" };
+    }
+    const body = await getJobArtifact(this.env.JOB_ARTIFACTS, job.object_key);
+    if (!body) return { ok: false, code: "ARTIFACT_UNAVAILABLE" };
+    return { ok: true, body, hash: job.formula_hash, bytes: job.compressed_bytes };
+  }
+
+  proofDownload(artifactId: string): { objectKey: string; sha256: string; bytes: number } | null {
     const job = this.job();
     const proof = this.ctx.storage.sql.exec<ProofArtifactRow>(
       `SELECT * FROM proof_artifacts WHERE artifact_id = ?
        AND verification_status IN ('SERVER_CERTIFIED', 'OWNER_CHECK_REQUIRED', 'OWNER_VERIFIED')`,
       artifactId,
     ).toArray()[0];
-    if (!job || !proof) return null;
-    return { objectKey: unsatProofObjectKey(job.job_id, artifactId), sha256: proof.artifact_sha256 };
+    if (!job || !proof || !proof.object_key || ["CANCELLED", "INVALID"].includes(job.state)) return null;
+    return { objectKey: proof.object_key, sha256: proof.artifact_sha256, bytes: proof.compressed_bytes };
+  }
+
+  async proofArtifactDownload(artifactId: string): Promise<
+    | { ok: true; body: ReadableStream; sha256: string; bytes: number }
+    | { ok: false; code: "NOT_FOUND" | "ARTIFACT_UNAVAILABLE" }
+  > {
+    const authorization = this.proofDownload(artifactId);
+    if (!authorization) return { ok: false, code: "NOT_FOUND" };
+    const body = await getJobArtifact(this.env.JOB_ARTIFACTS, authorization.objectKey);
+    if (!body) return { ok: false, code: "ARTIFACT_UNAVAILABLE" };
+    return { ok: true, body, sha256: authorization.sha256, bytes: authorization.bytes };
   }
 
   confirmOwnerProof(
@@ -535,11 +740,10 @@ export class JobCoordinatorDO extends DurableObject<Env> {
         type: "JOB_CANCELLED",
         reason: "OWNER_CANCELLED",
       });
-      const artifactKeys = [...this.modelObjectKeys(row.job_id), ...this.proofObjectKeys(row.job_id)];
-      if (artifactKeys.length > 0) await this.env.FORMULAS.delete(artifactKeys);
-      await this.scheduleNextAlarm();
+      const remaining = await this.cleanupArtifactBatch();
+      await this.ctx.storage.setAlarm(remaining ? now + 1_000 : row.expires_at);
     }
-    return { ok: true, changed, objectKey: row.object_key };
+    return { ok: true, changed };
   }
 
   rotateOwnerToken(ownerDigest: string, nextOwnerDigest: string): boolean {
@@ -645,20 +849,33 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       return;
     }
     const now = Date.now();
+    if (row.state === "CANCELLED") {
+      const remaining = await this.cleanupArtifactBatch();
+      if (remaining) {
+        await this.ctx.storage.setAlarm(now + 1_000);
+      } else if (now >= row.expires_at) {
+        await this.env.SWARM_DIRECTORY.getByName("global-v1").close(row.job_id);
+        await this.ctx.storage.deleteAll();
+        this.deleted = true;
+      } else {
+        await this.ctx.storage.setAlarm(row.expires_at);
+      }
+      return;
+    }
     if (now >= row.expires_at) {
       this.broadcast({
         ...this.serverBase(row.job_id, now),
         type: "JOB_CANCELLED",
         reason: "EXPIRED",
       });
-      if (!this.env.FORMULAS || !this.env.SWARM_DIRECTORY) {
+      if (!this.env.JOB_ARTIFACTS || !this.env.SWARM_DIRECTORY) {
         throw new Error("Job cleanup bindings are not configured.");
       }
-      await this.env.FORMULAS.delete([
-        row.object_key,
-        ...this.modelObjectKeys(row.job_id),
-        ...this.proofObjectKeys(row.job_id),
-      ]);
+      const remaining = await this.cleanupArtifactBatch();
+      if (remaining) {
+        await this.ctx.storage.setAlarm(now + 1_000);
+        return;
+      }
       await this.env.SWARM_DIRECTORY.getByName("global-v1").close(row.job_id);
       await this.ctx.storage.deleteAll();
       this.deleted = true;
@@ -1086,15 +1303,22 @@ export class JobCoordinatorDO extends DurableObject<Env> {
 
     let verification: VerifySatResult;
     try {
-      verification = await this.env.RESULT_VERIFIERS
-        .getByName(`${job.job_id}:${task.task_id}:${message.evidenceSha256}`)
-        .verifySat({
-          formulaObjectKey: job.object_key,
-          modelObjectKey: satModelObjectKey(job.job_id, message.leaseId),
-          manifest: message.manifest,
-          expectedCube: cube,
-          expectedVariableCount: job.variable_count,
-        });
+      const model = this.modelArtifact(message.leaseId);
+      const [formulaStream, modelStream] = await Promise.all([
+        job.object_key ? getJobArtifact(this.env.JOB_ARTIFACTS, job.object_key) : null,
+        model?.object_key ? getJobArtifact(this.env.JOB_ARTIFACTS, model.object_key) : null,
+      ]);
+      verification = !formulaStream || !modelStream
+        ? { status: "VERIFICATION_TIMEOUT", reason: "A committed artifact is temporarily unavailable." }
+        : await this.env.RESULT_VERIFIERS
+          .getByName(`${job.job_id}:${task.task_id}:${message.evidenceSha256}`)
+          .verifySat({
+            formulaStream,
+            modelStream,
+            manifest: message.manifest,
+            expectedCube: cube,
+            expectedVariableCount: job.variable_count,
+          });
     } catch (error) {
       verification = { status: "VERIFICATION_TIMEOUT", reason: `Verifier unavailable: ${String(error)}` };
     }
@@ -1181,7 +1405,11 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     });
 
     if (verification.status === "INVALID_MODEL") {
-      await this.env.FORMULAS.delete(satModelObjectKey(job.job_id, message.leaseId));
+      const model = this.modelArtifact(message.leaseId);
+      if (model) {
+        await this.env.JOB_ARTIFACTS.delete(model.object_key);
+        this.ctx.storage.sql.exec("DELETE FROM model_artifacts WHERE lease_id = ?", message.leaseId);
+      }
     } else if (verification.status === "VALID_SAT") {
       this.broadcast({
         ...this.serverBase(job.job_id),
@@ -1311,14 +1539,20 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     });
     let verification: VerifyUnsatResult;
     try {
-      verification = await this.env.RESULT_VERIFIERS
-        .getByName(`${job.job_id}:${task.task_id}:${manifest.artifactSha256}`)
-        .verifyUnsat({
-          jobId: job.job_id,
-          formulaObjectKey: job.object_key,
-          manifest,
-          expectedCube: parseAssumptions(task.assumptions_json),
-        });
+      const [formulaStream, proofStream] = await Promise.all([
+        job.object_key ? getJobArtifact(this.env.JOB_ARTIFACTS, job.object_key) : null,
+        artifact.object_key ? getJobArtifact(this.env.JOB_ARTIFACTS, artifact.object_key) : null,
+      ]);
+      verification = !formulaStream || !proofStream
+        ? { status: "VERIFICATION_TIMEOUT", reason: "A committed artifact is temporarily unavailable." }
+        : await this.env.RESULT_VERIFIERS
+          .getByName(`${job.job_id}:${task.task_id}:${manifest.artifactSha256}`)
+          .verifyUnsat({
+            formulaStream,
+            proofStream,
+            manifest,
+            expectedCube: parseAssumptions(task.assumptions_json),
+          });
     } catch (error) {
       verification = { status: "VERIFICATION_TIMEOUT", reason: `Verifier unavailable: ${String(error)}` };
     }
@@ -1348,6 +1582,23 @@ export class JobCoordinatorDO extends DurableObject<Env> {
           finishedAt,
         );
         this.ctx.storage.sql.exec("UPDATE leases SET status = 'SUPERSEDED' WHERE status = 'ACTIVE'");
+      } else if (verification.status === "VERIFICATION_TIMEOUT") {
+        this.ctx.storage.sql.exec(
+          "UPDATE tasks SET state = 'READY', proof_required = 1, updated_at = ? WHERE task_id = ?",
+          finishedAt,
+          task.task_id,
+        );
+        this.ctx.storage.sql.exec(
+          `INSERT INTO session_reliability (
+            session_id, verified_results, invalid_results, verification_timeouts,
+            quarantined, updated_at
+          ) VALUES (?, 0, 0, 1, 0, ?)
+          ON CONFLICT(session_id) DO UPDATE SET
+            verification_timeouts = verification_timeouts + 1,
+            updated_at = excluded.updated_at`,
+          sessionId,
+          finishedAt,
+        );
       } else {
         this.ctx.storage.sql.exec(
           "UPDATE proof_artifacts SET verification_status = 'INVALID' WHERE artifact_id = ?",
@@ -1391,7 +1642,11 @@ export class JobCoordinatorDO extends DurableObject<Env> {
       await this.env.SWARM_DIRECTORY.getByName("global-v1").close(job.job_id);
     }
     if (verification.status === "INVALID_PROOF") {
-      await this.env.FORMULAS.delete(unsatProofObjectKey(job.job_id, manifest.artifactId));
+      if (artifact.object_key) await this.env.JOB_ARTIFACTS.delete(artifact.object_key);
+      this.ctx.storage.sql.exec(
+        "UPDATE proof_artifacts SET object_key = '' WHERE artifact_id = ?",
+        manifest.artifactId,
+      );
     } else if (verification.status === "INVALID_FORMULA") {
       await this.env.SWARM_DIRECTORY.getByName("global-v1").close(job.job_id);
     }
@@ -1496,16 +1751,38 @@ export class JobCoordinatorDO extends DurableObject<Env> {
     return this.ctx.storage.sql.exec<TaskRow>("SELECT * FROM tasks WHERE task_id = ?", taskId).toArray()[0] ?? null;
   }
 
-  private modelObjectKeys(jobId: string): string[] {
-    return this.ctx.storage.sql.exec<{ lease_id: string }>(
-      "SELECT DISTINCT lease_id FROM results WHERE result_kind = 'SAT'",
-    ).toArray().map((row) => satModelObjectKey(jobId, row.lease_id));
+  private modelArtifact(leaseId: string): ModelArtifactRow | null {
+    return this.ctx.storage.sql.exec<ModelArtifactRow>(
+      "SELECT * FROM model_artifacts WHERE lease_id = ?",
+      leaseId,
+    ).toArray()[0] ?? null;
   }
 
-  private proofObjectKeys(jobId: string): string[] {
-    return this.ctx.storage.sql.exec<{ artifact_id: string }>(
-      "SELECT artifact_id FROM proof_artifacts",
-    ).toArray().map((row) => unsatProofObjectKey(jobId, row.artifact_id));
+  private artifactObjectKeys(): string[] {
+    const job = this.job();
+    return [
+      ...(job?.object_key ? [job.object_key] : []),
+      ...this.ctx.storage.sql.exec<{ object_key: string }>(
+        "SELECT object_key FROM model_artifacts WHERE object_key != '' ORDER BY created_at",
+      ).toArray().map((row) => row.object_key),
+      ...this.ctx.storage.sql.exec<{ object_key: string }>(
+        "SELECT object_key FROM proof_artifacts WHERE object_key != '' ORDER BY created_at",
+      ).toArray().map((row) => row.object_key),
+    ];
+  }
+
+  private async cleanupArtifactBatch(): Promise<boolean> {
+    const keys = this.artifactObjectKeys();
+    if (keys.length === 0) return false;
+    const deletedKeys = await deleteJobArtifacts(this.env.JOB_ARTIFACTS, keys);
+    this.ctx.storage.transactionSync(() => {
+      for (const key of deletedKeys) {
+        this.ctx.storage.sql.exec("UPDATE jobs SET object_key = '' WHERE object_key = ?", key);
+        this.ctx.storage.sql.exec("DELETE FROM model_artifacts WHERE object_key = ?", key);
+        this.ctx.storage.sql.exec("UPDATE proof_artifacts SET object_key = '' WHERE object_key = ?", key);
+      }
+    });
+    return this.artifactObjectKeys().length > 0;
   }
 
   private toCubeTask(row: TaskRow): CubeTask {

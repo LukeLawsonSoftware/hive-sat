@@ -103,7 +103,7 @@ describe("SwarmDirectoryDO fair assignment", () => {
     });
     socket.send(JSON.stringify({
       type: "SWARM_HELLO",
-      protocolVersion: 2,
+      protocolVersion: 3,
       messageId: "directory-request",
       sessionId: "browser-session",
       capabilities: capabilities(1),

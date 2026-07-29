@@ -16,7 +16,8 @@ loads local solver workers from the verified bytes.
 3. The worker encodes a canonical `HiveCnfV1` byte sequence.
 4. SHA-256 is computed over the uncompressed canonical bytes.
 5. The bytes are gzip-compressed for transfer and cached in IndexedDB.
-6. The browser creates a public job and streams only the gzip object to R2.
+6. The browser creates a public job and streams only the gzip value through its
+   coordinator into Workers KV.
 
 ```mermaid
 flowchart TD
@@ -26,7 +27,7 @@ flowchart TD
   H --> G["gzip transfer bytes"]
   S --> I["IndexedDB verified cache"]
   G --> I
-  G --> R["R2: jobs/{id}/formula.hivecnf.gz"]
+  G --> K["KV: unique expiring job formula key"]
 ```
 
 The hash is the formula's identity. Filenames, upload timestamps, job IDs, and
@@ -65,7 +66,7 @@ For a public task, a participant:
 2. checks IndexedDB for that hash;
 3. re-decodes and re-hashes every cache hit—IndexedDB is a cache, not a trust
    anchor;
-4. otherwise streams bounded gzip bytes from R2;
+4. otherwise streams bounded gzip bytes from KV through the coordinator;
 5. expands them under the encoded-size limit;
 6. decodes `HiveCnfV1`, verifies counts and literal ranges, and computes SHA-256;
 7. caches only a matching formula;

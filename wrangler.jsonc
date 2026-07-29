@@ -1,107 +1,115 @@
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "hive-sat",
-  "compatibility_date": "2026-07-21",
-  "compatibility_flags": ["nodejs_compat"],
-  "main": "./worker/index.ts",
-  "vars": {
-    "ENVIRONMENT": "development",
-    "FEATURE_PUBLIC_JOBS": "true",
-    "FEATURE_PUBLIC_SWARM": "true",
-    "MAX_ACTIVE_JOBS": "100",
-    "MAX_JOB_CONNECTIONS": "32",
-    "MAX_DIRECTORY_CONNECTIONS": "128",
-    "SAFETY_MARGIN_PERCENT": "80",
-    "TURNSTILE_SITE_KEY": "1x00000000000000000000AA",
-    "TURNSTILE_SECRET": "1x0000000000000000000000000000000AA",
-    "NETWORK_DIGEST_KEY": "development-only-network-digest-key"
-  },
-  "r2_buckets": [
-    {
-      "binding": "FORMULAS",
-      "bucket_name": "hivesat-formulas"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "JOB_COORDINATORS",
-        "class_name": "JobCoordinatorDO"
-      },
-      {
-        "name": "SWARM_DIRECTORY",
-        "class_name": "SwarmDirectoryDO"
-      },
-      {
-        "name": "RESULT_VERIFIERS",
-        "class_name": "ResultVerifierDO"
-      }
-    ]
-  },
-  "assets": {
-    "binding": "ASSETS",
-    "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
-  },
-  "observability": {
-    "enabled": true,
-    "logs": {
-      "enabled": true,
-      "head_sampling_rate": 0.1,
-      "invocation_logs": true
-    },
-    "traces": {
-      "enabled": true,
-      "head_sampling_rate": 0.05
-    }
-  },
-  // Durable Object migrations are append-only. Add future SQLite-backed
-  // classes as new, uniquely tagged entries; never edit or reorder old tags.
-  "migrations": [
-    {
-      "tag": "v0001_job_platform",
-      "new_sqlite_classes": ["JobCoordinatorDO", "SwarmDirectoryDO"]
-    },
-    {
-      "tag": "v0002_result_verifier",
-      "new_sqlite_classes": ["ResultVerifierDO"]
-    }
-  ],
-  "env": {
-    "production": {
-      "name": "hive-sat",
-      "r2_buckets": [
-        {
-          "binding": "FORMULAS",
-          "bucket_name": "hivesat-formulas"
-        }
-      ],
-      "durable_objects": {
-        "bindings": [
-          {
-            "name": "JOB_COORDINATORS",
-            "class_name": "JobCoordinatorDO"
-          },
-          {
-            "name": "SWARM_DIRECTORY",
-            "class_name": "SwarmDirectoryDO"
-          },
-          {
-            "name": "RESULT_VERIFIERS",
-            "class_name": "ResultVerifierDO"
-          }
-        ]
-      },
-      "vars": {
-        "ENVIRONMENT": "production",
-        "FEATURE_PUBLIC_JOBS": "true",
-        "FEATURE_PUBLIC_SWARM": "true",
-        "MAX_ACTIVE_JOBS": "100",
-        "MAX_JOB_CONNECTIONS": "32",
-        "MAX_DIRECTORY_CONNECTIONS": "128",
-        "SAFETY_MARGIN_PERCENT": "80",
-        "TURNSTILE_SITE_KEY": "configure-in-cloudflare-dashboard"
-      }
-    }
-  }
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "hive-sat",
+	"compatibility_date": "2026-07-21",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"main": "./worker/index.ts",
+	"vars": {
+		"ENVIRONMENT": "development",
+		"FEATURE_PUBLIC_JOBS": "true",
+		"FEATURE_PUBLIC_SWARM": "true",
+		"MAX_ACTIVE_JOBS": "100",
+		"MAX_JOB_CONNECTIONS": "32",
+		"MAX_DIRECTORY_CONNECTIONS": "128",
+		"SAFETY_MARGIN_PERCENT": "80",
+		"TURNSTILE_SITE_KEY": "1x00000000000000000000AA",
+		"TURNSTILE_SECRET": "1x0000000000000000000000000000000AA",
+		"NETWORK_DIGEST_KEY": "development-only-network-digest-key"
+	},
+	"kv_namespaces": [
+		{
+			"binding": "JOB_ARTIFACTS",
+			"id": "0f12b0b73f5045069ffd99c88d50abfb"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "JOB_COORDINATORS",
+				"class_name": "JobCoordinatorDO"
+			},
+			{
+				"name": "SWARM_DIRECTORY",
+				"class_name": "SwarmDirectoryDO"
+			},
+			{
+				"name": "RESULT_VERIFIERS",
+				"class_name": "ResultVerifierDO"
+			}
+		]
+	},
+	"assets": {
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/api/*"
+		]
+	},
+	"observability": {
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 0.1,
+			"invocation_logs": true
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.05
+		}
+	},
+	// Durable Object migrations are append-only. Add future SQLite-backed
+	// classes as new, uniquely tagged entries; never edit or reorder old tags.
+	"migrations": [
+		{
+			"tag": "v0001_job_platform",
+			"new_sqlite_classes": [
+				"JobCoordinatorDO",
+				"SwarmDirectoryDO"
+			]
+		},
+		{
+			"tag": "v0002_result_verifier",
+			"new_sqlite_classes": [
+				"ResultVerifierDO"
+			]
+		}
+	],
+	"env": {
+		"production": {
+			"name": "hive-sat",
+			"kv_namespaces": [
+				{
+					"binding": "JOB_ARTIFACTS"
+				}
+			],
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "JOB_COORDINATORS",
+						"class_name": "JobCoordinatorDO"
+					},
+					{
+						"name": "SWARM_DIRECTORY",
+						"class_name": "SwarmDirectoryDO"
+					},
+					{
+						"name": "RESULT_VERIFIERS",
+						"class_name": "ResultVerifierDO"
+					}
+				]
+			},
+			"vars": {
+				"ENVIRONMENT": "production",
+				"FEATURE_PUBLIC_JOBS": "true",
+				"FEATURE_PUBLIC_SWARM": "true",
+				"MAX_ACTIVE_JOBS": "100",
+				"MAX_JOB_CONNECTIONS": "32",
+				"MAX_DIRECTORY_CONNECTIONS": "128",
+				"SAFETY_MARGIN_PERCENT": "80",
+				"TURNSTILE_SITE_KEY": "configure-in-cloudflare-dashboard"
+			}
+		}
+	}
 }

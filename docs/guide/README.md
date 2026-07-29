@@ -23,17 +23,17 @@ solves, what happens step by step, and why the safety checks exist.
 
 ```mermaid
 flowchart LR
-  A["Owner browser<br/>parse + hash + upload"] --> R2["R2 formula object"]
+  A["Owner browser<br/>parse + hash + upload"] --> KV["Workers KV formula value"]
   A --> JC["JobCoordinatorDO<br/>task tree + leases"]
-  R2 --> B1["Participant browser A"]
-  R2 --> B2["Participant browser B"]
+  KV --> B1["Participant browser A"]
+  KV --> B2["Participant browser B"]
   JC <--> B1
   JC <--> B2
   B1 --> W1["Dedicated Worker<br/>CaDiCaL Wasm"]
   B2 --> W2["Dedicated Worker<br/>CaDiCaL Wasm"]
 ```
 
-The large formula travels through R2 and normal HTTP streaming. Small control
+The large formula travels through Workers KV and normal HTTP streaming. Small control
 messages—request work, renew a lease, split, yield, or report a candidate—travel
 through one hibernating WebSocket per job. The Cloudflare Worker coordinates
 the search; it does not perform the SAT search itself.

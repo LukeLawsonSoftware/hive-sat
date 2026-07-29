@@ -64,7 +64,7 @@ pnpm deploy
 The production environment enables `FEATURE_PUBLIC_JOBS` and
 `FEATURE_PUBLIC_SWARM`; both variables remain immediate operator kill switches.
 Public jobs use an
-R2 binding plus SQLite-backed `JobCoordinatorDO` and `SwarmDirectoryDO`
+A Workers KV binding plus SQLite-backed `JobCoordinatorDO` and `SwarmDirectoryDO`
 namespaces. Turnstile, token handling, admission, streaming upload, browser
 hash verification, cancellation, and expiry are documented in
 [`docs/public-job-platform.md`](docs/public-job-platform.md).
@@ -78,6 +78,7 @@ build, generated-type drift detection, and a Wrangler dry-run. The existing
 Cloudflare Git integration owns production deployment after a successful merge
 to `main`; GitHub Actions does not deploy and requires no Cloudflare secrets.
 
-The browser still performs all parsing, hashing, and SAT solving. The Worker
-never buffers formula uploads and does not solve formulas. See
+The browser still performs all parsing, hashing, and SAT solving. Formula and
+evidence uploads stream through the job coordinator into KV without buffering;
+the Worker does not solve formulas. See
 `docs/durable-object-migrations.md` before changing a Durable Object class.

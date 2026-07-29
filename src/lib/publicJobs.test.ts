@@ -27,7 +27,7 @@ describe("public job browser trust boundary", () => {
     const completed = {
       ...base,
       lastStatus: {
-        protocolVersion: 2,
+        protocolVersion: 3,
         jobId: "job",
         state: "SAT_VERIFIED",
         formula: { hash: "ab".repeat(32), variableCount: 1, clauseCount: 1, literalCount: 1, encodedBytes: 24, compressedBytes: 20 },
@@ -63,7 +63,7 @@ describe("public job browser trust boundary", () => {
       (value) => value.charCodeAt(0),
     );
     const status = {
-      protocolVersion: 2,
+      protocolVersion: 3,
       jobId: "job",
       state: "QUEUED",
       formula: {
@@ -96,7 +96,7 @@ describe("public job browser trust boundary", () => {
     const fetcher = vi.fn<typeof fetch>(async (input) => String(input).endsWith("/formula")
       ? new Response(new Uint8Array([1]), { headers: { "x-hivesat-formula-sha256": "cd".repeat(32) } })
       : Response.json({
-          protocolVersion: 2,
+          protocolVersion: 3,
           jobId: "job",
           state: "QUEUED",
           formula: { hash, variableCount: 0, clauseCount: 0, literalCount: 0, encodedBytes: 20, compressedBytes: 1 },

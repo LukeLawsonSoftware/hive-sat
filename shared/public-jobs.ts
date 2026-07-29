@@ -1,6 +1,6 @@
 import type { TaskState } from "./coordinator-protocol";
 
-export const PUBLIC_JOB_PROTOCOL_VERSION = 2 as const;
+export const PUBLIC_JOB_PROTOCOL_VERSION = 3 as const;
 
 export type PublicJobState =
   | "UPLOADING"

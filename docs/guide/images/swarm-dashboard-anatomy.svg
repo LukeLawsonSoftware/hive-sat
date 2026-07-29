@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">Annotated HiveSAT Swarm Mode dashboard</title>
+  <desc id="desc">A simplified dark dashboard with numbered callouts for contribution control, current assignment, rolling aggregate graph, honest solver metrics, local limits, and IndexedDB lifetime totals.</desc>
+  <defs>
+    <linearGradient id="dashbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0c100b"/>
+      <stop offset="1" stop-color="#1b2016"/>
+    </linearGradient>
+    <style>
+      .panel{fill:#171c14;stroke:#424b39;stroke-width:2}
+      .lime{fill:#d9ff43}
+      .amber{fill:#f1b84b}
+      .h{fill:#edf2e5;font:700 23px system-ui,sans-serif}
+      .t{fill:#bcc5b0;font:16px system-ui,sans-serif}
+      .s{fill:#8e9983;font:14px system-ui,sans-serif}
+      .n{fill:#0f130d;font:700 17px system-ui,sans-serif}
+      .line{fill:none;stroke:#91a07f;stroke-width:2}
+    </style>
+  </defs>
+  <rect width="1200" height="760" rx="24" fill="url(#dashbg)"/>
+  <text x="55" y="55" class="h">HiveSAT / Swarm Mode</text>
+  <circle cx="1030" cy="48" r="5" class="lime"/>
+  <text x="1045" y="54" class="s">computing</text>
+  <text x="55" y="115" class="s">PUBLIC COMPUTE / VOLUNTARY</text>
+  <text x="55" y="160" class="h">Lend a little compute.</text>
+  <rect x="850" y="93" width="295" height="95" rx="14" class="panel"/>
+  <rect x="880" y="140" width="235" height="30" rx="15" class="lime"/>
+  <text x="997" y="161" text-anchor="middle" class="n">Pause contribution</text>
+  <rect x="55" y="220" width="620" height="190" rx="16" class="panel"/>
+  <text x="80" y="250" class="s">CURRENT ASSIGNMENT</text>
+  <text x="80" y="305" class="h">Job a8Pc2m… / cube leaf-47…</text>
+  <text x="80" y="352" class="t">2 / 2 active workers · coordinator connected</text>
+  <rect x="695" y="220" width="450" height="190" rx="16" class="panel"/>
+  <path d="M725 365 L765 340 L805 350 L845 295 L885 315 L925 270 L965 290 L1005 250 L1045 280 L1110 245" fill="none" stroke="#d9ff43" stroke-width="3"/>
+  <text x="720" y="250" class="s">ROLLING AGGREGATE ACTIVITY</text>
+  <rect x="55" y="430" width="1090" height="170" rx="16" class="panel"/>
+  <text x="80" y="460" class="s">HONEST WORK METRICS</text>
+  <text x="80" y="505" class="h">12m 08s</text><text x="80" y="535" class="s">active worker-time</text>
+  <text x="295" y="505" class="h">18,420/s</text><text x="295" y="535" class="s">conflicts</text>
+  <text x="510" y="505" class="h">384 KiB</text><text x="510" y="535" class="s">Wasm allocation</text>
+  <text x="725" y="505" class="h">3</text><text x="725" y="535" class="s">unique jobs</text>
+  <text x="940" y="505" class="h">1</text><text x="940" y="535" class="s">verified SAT</text>
+  <rect x="55" y="620" width="535" height="95" rx="16" class="panel"/>
+  <text x="80" y="655" class="h">Local limits</text>
+  <text x="80" y="685" class="s">max workers · pause when hidden</text>
+  <rect x="610" y="620" width="535" height="95" rx="16" class="panel"/>
+  <text x="635" y="655" class="h">Device lifetime</text>
+  <text x="635" y="685" class="s">aggregate IndexedDB totals · reset locally</text>
+  <circle cx="1130" cy="105" r="15" class="lime"/><text x="1130" y="111" text-anchor="middle" class="n">1</text>
+  <circle cx="650" cy="235" r="15" class="amber"/><text x="650" y="241" text-anchor="middle" class="n">2</text>
+  <circle cx="1125" cy="235" r="15" class="amber"/><text x="1125" y="241" text-anchor="middle" class="n">3</text>
+  <circle cx="1125" cy="445" r="15" class="lime"/><text x="1125" y="451" text-anchor="middle" class="n">4</text>
+  <circle cx="570" cy="635" r="15" class="amber"/><text x="570" y="641" text-anchor="middle" class="n">5</text>
+  <circle cx="1125" cy="635" r="15" class="amber"/><text x="1125" y="641" text-anchor="middle" class="n">6</text>
+</svg>

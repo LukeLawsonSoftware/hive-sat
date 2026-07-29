@@ -36,6 +36,16 @@ export interface CubeRuntimeSnapshot {
   completedTasks: number;
   splitTasks: number;
   yieldedTasks: number;
+  acceptedTasks: number;
+  activeComputeMs: number;
+  conflicts: number;
+  decisions: number;
+  propagations: number;
+  formulaBytesTransferred: number;
+  wasmMemoryBytes: number;
+  wasmMemoryHighWaterBytes: number;
+  decisiveSatResults: number;
+  currentTaskId: string | null;
   message: string | null;
 }
 
@@ -53,6 +63,10 @@ interface WorkerSlot {
   lease: Lease | null;
   lastHeartbeatAt: number;
   pendingRequestId: string | null;
+  lastActiveMs: number;
+  lastMetrics: { conflicts: number; decisions: number; propagations: number };
+  memoryBytes: number;
+  memoryHighWaterBytes: number;
 }
 
 export interface CubeRuntimeOptions {
@@ -133,6 +147,16 @@ export class DistributedCubeRuntime {
       completedTasks: 0,
       splitTasks: 0,
       yieldedTasks: 0,
+      acceptedTasks: 0,
+      activeComputeMs: 0,
+      conflicts: 0,
+      decisions: 0,
+      propagations: 0,
+      formulaBytesTransferred: 0,
+      wasmMemoryBytes: 0,
+      wasmMemoryHighWaterBytes: 0,
+      decisiveSatResults: 0,
+      currentTaskId: null,
       message: null,
     };
   }
@@ -160,6 +184,10 @@ export class DistributedCubeRuntime {
     this.update({ ...this.snapshot, phase: "loading", message: "Verifying and caching the public formula…" });
     try {
       const cached = await loadVerifiedPublicFormula(this.options.jobId, this.options.fetcher);
+      this.update({
+        ...this.snapshot,
+        formulaBytesTransferred: this.snapshot.formulaBytesTransferred + cached.transferredBytes,
+      });
       const encoded = new Uint8Array(cached.encoded);
       this.formula = decodeHiveCnfV1(encoded);
       this.formulaHash = cached.hash;
@@ -182,6 +210,10 @@ export class DistributedCubeRuntime {
           lease: null,
           lastHeartbeatAt: 0,
           pendingRequestId: null,
+          lastActiveMs: 0,
+          lastMetrics: { conflicts: 0, decisions: 0, propagations: 0 },
+          memoryBytes: 0,
+          memoryHighWaterBytes: 0,
         };
         worker.onmessage = (event) => void this.onWorkerMessage(index, event.data);
         worker.onerror = (event) => this.fail(event.message || "A cube worker failed.");
@@ -330,6 +362,7 @@ export class DistributedCubeRuntime {
         ...this.snapshot,
         phase: "complete",
         activeWorkers: 0,
+        decisiveSatResults: this.snapshot.decisiveSatResults + 1,
         message: "The SAT model passed independent server verification.",
       });
     }
@@ -340,7 +373,13 @@ export class DistributedCubeRuntime {
     slot.task = work.task;
     slot.lease = work.lease;
     slot.lastHeartbeatAt = this.now();
+    slot.lastActiveMs = 0;
     this.refreshActiveWorkers();
+    this.update({
+      ...this.snapshot,
+      acceptedTasks: this.snapshot.acceptedTasks + 1,
+      currentTaskId: work.task.taskId,
+    });
     slot.worker.postMessage({
       type: "run",
       requestId: this.requestId,
@@ -368,6 +407,7 @@ export class DistributedCubeRuntime {
     if (!slot.task || !slot.lease || message.taskId !== slot.task.taskId || message.leaseId !== slot.lease.leaseId) {
       return;
     }
+    this.recordTelemetry(slot, message.activeMs, message.metrics);
     if (message.type === "progress") {
       if (this.now() - slot.lastHeartbeatAt >= COORDINATOR_HEARTBEAT_INTERVAL_MS) {
         slot.lastHeartbeatAt = this.now();
@@ -528,6 +568,40 @@ export class DistributedCubeRuntime {
     this.update({
       ...this.snapshot,
       activeWorkers: this.slots.filter((slot) => slot.task !== null).length,
+      currentTaskId: this.slots.find((slot) => slot.task)?.task?.taskId ?? null,
+    });
+  }
+
+  private recordTelemetry(
+    slot: WorkerSlot,
+    activeMs: number,
+    metrics: { conflicts: number; decisions: number; propagations: number; memoryBytes?: number; memoryHighWaterBytes?: number },
+  ): void {
+    const activeDelta = Math.max(0, activeMs - slot.lastActiveMs);
+    const conflicts = Math.max(0, metrics.conflicts - slot.lastMetrics.conflicts);
+    const decisions = Math.max(0, metrics.decisions - slot.lastMetrics.decisions);
+    const propagations = Math.max(0, metrics.propagations - slot.lastMetrics.propagations);
+    slot.lastActiveMs = Math.max(slot.lastActiveMs, activeMs);
+    slot.lastMetrics = {
+      conflicts: Math.max(slot.lastMetrics.conflicts, metrics.conflicts),
+      decisions: Math.max(slot.lastMetrics.decisions, metrics.decisions),
+      propagations: Math.max(slot.lastMetrics.propagations, metrics.propagations),
+    };
+    slot.memoryBytes = Math.max(0, metrics.memoryBytes ?? slot.memoryBytes);
+    slot.memoryHighWaterBytes = Math.max(
+      slot.memoryHighWaterBytes,
+      metrics.memoryHighWaterBytes ?? slot.memoryHighWaterBytes,
+    );
+    const currentMemory = this.slots.reduce((total, candidate) => total + candidate.memoryBytes, 0);
+    const highWater = this.slots.reduce((total, candidate) => total + candidate.memoryHighWaterBytes, 0);
+    this.update({
+      ...this.snapshot,
+      activeComputeMs: this.snapshot.activeComputeMs + activeDelta,
+      conflicts: this.snapshot.conflicts + conflicts,
+      decisions: this.snapshot.decisions + decisions,
+      propagations: this.snapshot.propagations + propagations,
+      wasmMemoryBytes: currentMemory,
+      wasmMemoryHighWaterBytes: Math.max(this.snapshot.wasmMemoryHighWaterBytes, highWater),
     });
   }
 

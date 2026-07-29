@@ -6,6 +6,7 @@ import { SwarmDirectorySocket } from "./swarmDirectorySocket";
 export type PublicSwarmPhase =
   | "idle"
   | "directory"
+  | "reconnecting"
   | "computing"
   | "no-work"
   | "paused"
@@ -16,6 +17,19 @@ export interface PublicSwarmSnapshot {
   jobId: string | null;
   activeWorkers: number;
   activeWorkerMs: number;
+  capacity: number;
+  currentTaskId: string | null;
+  acceptedCubes: number;
+  completedCubes: number;
+  conflicts: number;
+  decisions: number;
+  propagations: number;
+  uniqueJobsHelped: number;
+  decisiveSatResults: number;
+  certifiedUnsatResults: number;
+  formulaBytesTransferred: number;
+  wasmMemoryBytes: number;
+  wasmMemoryHighWaterBytes: number;
   global: SwarmSnapshot;
   message: string | null;
 }
@@ -44,6 +58,19 @@ export class PublicSwarmRuntime {
     jobId: null,
     activeWorkers: 0,
     activeWorkerMs: 0,
+    capacity: 1,
+    currentTaskId: null,
+    acceptedCubes: 0,
+    completedCubes: 0,
+    conflicts: 0,
+    decisions: 0,
+    propagations: 0,
+    uniqueJobsHelped: 0,
+    decisiveSatResults: 0,
+    certifiedUnsatResults: 0,
+    formulaBytesTransferred: 0,
+    wasmMemoryBytes: 0,
+    wasmMemoryHighWaterBytes: 0,
     global: { activeJobs: 0, activeWorkers: 0 },
     message: null,
   };
@@ -56,6 +83,17 @@ export class PublicSwarmRuntime {
   private lastIntegratedAt = 0;
   private lastActiveWorkers = 0;
   private assignmentWorkerMs = 0;
+  private currentAssignmentId: string | null = null;
+  private readonly helpedJobs = new Set<string>();
+  private observedCube = {
+    acceptedTasks: 0,
+    completedTasks: 0,
+    conflicts: 0,
+    decisions: 0,
+    propagations: 0,
+    decisiveSatResults: 0,
+    formulaBytesTransferred: 0,
+  };
 
   constructor(private readonly options: PublicSwarmRuntimeOptions = {}) {
     this.sessionId = options.sessionId ?? crypto.randomUUID();
@@ -77,6 +115,13 @@ export class PublicSwarmRuntime {
 
   pause(): void {
     this.integrateWorkerTime();
+    if (this.currentAssignmentId) {
+      this.previousAssignment = {
+        assignmentId: this.currentAssignmentId,
+        activeWorkerMs: Math.round(this.assignmentWorkerMs),
+      };
+      this.currentAssignmentId = null;
+    }
     this.directory?.stop();
     this.directory = null;
     this.finishCube(false);
@@ -85,6 +130,8 @@ export class PublicSwarmRuntime {
       ...this.snapshot,
       phase: "paused",
       activeWorkers: 0,
+      currentTaskId: null,
+      wasmMemoryBytes: 0,
       jobId: null,
       message: "Public contribution is paused.",
     });
@@ -94,6 +141,7 @@ export class PublicSwarmRuntime {
     this.pause();
     this.previousAssignment = undefined;
     this.assignmentWorkerMs = 0;
+    this.currentAssignmentId = null;
     this.update({ ...this.snapshot, phase: "idle", activeWorkerMs: 0, message: null });
   }
 
@@ -110,7 +158,7 @@ export class PublicSwarmRuntime {
       sessionId: this.sessionId,
       capabilities: {
         hardwareConcurrency: this.options.hardwareConcurrency ?? navigator.hardwareConcurrency ?? 1,
-        maxWorkers: Math.max(1, Math.floor(this.options.workerPreference ?? 1)),
+        maxWorkers: Math.min(32, Math.max(1, Math.floor(this.options.workerPreference ?? 1))),
         mobile: this.options.mobile ?? false,
         solverVersion: "cadical-3.0.1",
         ...(this.options.calibratedConflictsPerSecond
@@ -141,7 +189,15 @@ export class PublicSwarmRuntime {
       },
       onProtocolError: (code) => {
         this.directory = null;
-        this.update({ ...this.snapshot, phase: "error", message: `Directory protocol error: ${code}.` });
+        if (code === "UPGRADE_REQUIRED" || code === "INVALID_ASSIGNMENT") {
+          this.update({ ...this.snapshot, phase: "error", message: `Directory protocol error: ${code}.` });
+          return;
+        }
+        this.update({ ...this.snapshot, phase: "reconnecting", message: "Reconnecting to the swarm directory…" });
+        this.retryTimer = setTimeout(() => {
+          this.retryTimer = null;
+          if (this.snapshot.phase === "reconnecting") this.connectDirectory();
+        }, 3_000);
       },
     });
     this.directory.start();
@@ -155,6 +211,17 @@ export class PublicSwarmRuntime {
     conflictBudget: number;
   }): void {
     this.assignmentWorkerMs = 0;
+    this.currentAssignmentId = assignment.assignmentId;
+    this.observedCube = {
+      acceptedTasks: 0,
+      completedTasks: 0,
+      conflicts: 0,
+      decisions: 0,
+      propagations: 0,
+      decisiveSatResults: 0,
+      formulaBytesTransferred: 0,
+    };
+    this.helpedJobs.add(assignment.jobId);
     this.lastIntegratedAt = this.now();
     this.lastActiveWorkers = 0;
     const cube = new DistributedCubeRuntime({
@@ -176,11 +243,49 @@ export class PublicSwarmRuntime {
       this.integrateWorkerTime();
       const value = cube.getSnapshot();
       this.lastActiveWorkers = value.activeWorkers;
+      const acceptedCubes = this.snapshot.acceptedCubes +
+        Math.max(0, value.acceptedTasks - this.observedCube.acceptedTasks);
+      const completedCubes = this.snapshot.completedCubes +
+        Math.max(0, value.completedTasks - this.observedCube.completedTasks);
+      const conflicts = this.snapshot.conflicts +
+        Math.max(0, value.conflicts - this.observedCube.conflicts);
+      const decisions = this.snapshot.decisions +
+        Math.max(0, value.decisions - this.observedCube.decisions);
+      const propagations = this.snapshot.propagations +
+        Math.max(0, value.propagations - this.observedCube.propagations);
+      const decisiveSatResults = this.snapshot.decisiveSatResults +
+        Math.max(0, value.decisiveSatResults - this.observedCube.decisiveSatResults);
+      const formulaBytesTransferred = this.snapshot.formulaBytesTransferred +
+        Math.max(0, value.formulaBytesTransferred - this.observedCube.formulaBytesTransferred);
+      this.observedCube = {
+        acceptedTasks: value.acceptedTasks,
+        completedTasks: value.completedTasks,
+        conflicts: value.conflicts,
+        decisions: value.decisions,
+        propagations: value.propagations,
+        decisiveSatResults: value.decisiveSatResults,
+        formulaBytesTransferred: value.formulaBytesTransferred,
+      };
       this.update({
         ...this.snapshot,
         phase: "computing",
         jobId: assignment.jobId,
         activeWorkers: value.activeWorkers,
+        capacity: value.capacity,
+        currentTaskId: value.currentTaskId,
+        acceptedCubes,
+        completedCubes,
+        conflicts,
+        decisions,
+        propagations,
+        uniqueJobsHelped: this.helpedJobs.size,
+        decisiveSatResults,
+        formulaBytesTransferred,
+        wasmMemoryBytes: value.wasmMemoryBytes,
+        wasmMemoryHighWaterBytes: Math.max(
+          this.snapshot.wasmMemoryHighWaterBytes,
+          value.wasmMemoryHighWaterBytes,
+        ),
         message: value.message,
       });
       if (value.phase === "complete" || value.phase === "error") {
@@ -191,6 +296,8 @@ export class PublicSwarmRuntime {
       ...this.snapshot,
       phase: "computing",
       jobId: assignment.jobId,
+      capacity: assignment.workers,
+      uniqueJobsHelped: this.helpedJobs.size,
       message: "Loading the assigned public formula…",
     });
     this.assignmentTimer = setTimeout(
@@ -207,6 +314,7 @@ export class PublicSwarmRuntime {
       assignmentId,
       activeWorkerMs: Math.round(this.assignmentWorkerMs),
     };
+    this.currentAssignmentId = null;
     this.finishCube(true);
     if (this.snapshot.phase !== "paused") this.connectDirectory();
   }
@@ -236,6 +344,9 @@ export class PublicSwarmRuntime {
     this.cube = null;
     this.lastActiveWorkers = 0;
     this.lastIntegratedAt = 0;
+    if (this.snapshot.wasmMemoryBytes !== 0 || this.snapshot.currentTaskId !== null) {
+      this.snapshot = { ...this.snapshot, wasmMemoryBytes: 0, currentTaskId: null };
+    }
   }
 
   private clearRetry(): void {

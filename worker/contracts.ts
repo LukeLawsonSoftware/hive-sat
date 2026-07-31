@@ -30,6 +30,7 @@ export interface AdmissionInput {
   createdAt: number;
   expiresAt: number;
   globalCeiling: number;
+  bypassCreationRateLimit?: boolean;
 }
 
 export type AdmissionResult =

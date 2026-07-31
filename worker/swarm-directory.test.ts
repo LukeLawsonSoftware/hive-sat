@@ -86,6 +86,21 @@ describe("SwarmDirectoryDO fair assignment", () => {
     }, now + 3)).resolves.toEqual({ ok: false, code: "INVALID_ASSIGNMENT" });
   });
 
+  it("accepts idempotent reconciliation after a job cancellation released the assignment", async () => {
+    const { stub, now } = await readyDirectory(1);
+    const first = await stub.assign("cancelled-session", capabilities(2), undefined, now + 1);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    await stub.close(first.jobId);
+    const next = await stub.assign("cancelled-session", capabilities(1), {
+      assignmentId: first.assignmentId,
+      activeWorkerMs: 10_000,
+    }, now + 2);
+
+    expect(next).toEqual({ ok: false, code: "NO_WORK" });
+  });
+
   it("hands an opted-in socket one assignment and closes before coordinator handoff", async () => {
     const { stub } = await readyDirectory(1);
     const response = await stub.fetch("https://hive-sat.test/swarm", {

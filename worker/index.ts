@@ -232,7 +232,14 @@ async function createJob(request: Request, env: Env): Promise<Response> {
     hmacSha256Hex(requiredString(env.NETWORK_DIGEST_KEY, "NETWORK_DIGEST_KEY"), remoteIp),
     sha256Hex(input.turnstileToken),
   ]);
-  if (!await directoryStub(env).consumeTurnstile(
+  // Cloudflare's documented development test widget returns a reusable dummy
+  // token. Keep replay protection unchanged everywhere except a localhost-like
+  // development request that has no Cloudflare client IP, otherwise one manual
+  // submission makes every later local browser test fail for 24 hours.
+  const localTestChallenge = env.ENVIRONMENT === "development" &&
+    ["unknown", "127.0.0.1", "::1"].includes(remoteIp) &&
+    env.TURNSTILE_SITE_KEY === "1x00000000000000000000AA";
+  if (!localTestChallenge && !await directoryStub(env).consumeTurnstile(
     turnstileDigest,
     Date.now() + TURNSTILE_REPLAY_RETENTION_MS,
   )) {
@@ -260,6 +267,7 @@ async function createJob(request: Request, env: Env): Promise<Response> {
     createdAt,
     expiresAt,
     globalCeiling,
+    bypassCreationRateLimit: localTestChallenge,
   });
   if (!admission.ok) {
     const status = admission.code === "GLOBAL_JOB_LIMIT" ? 503 : 429;

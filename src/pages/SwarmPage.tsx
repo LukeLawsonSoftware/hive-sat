@@ -100,7 +100,7 @@ function ActivityGraph({ values }: { values: number[] }) {
         <polyline points={points} className="swarm-graph-line" />
       </svg>
       <figcaption id="swarm-activity-caption">
-        <span>Rolling swarm activity</span>
+        <span>Rolling local worker activity</span>
         <strong>{values.at(-1) ?? 0} active workers</strong>
       </figcaption>
     </figure>
@@ -148,7 +148,6 @@ export default function SwarmPage() {
   const snapshot = useSyncExternalStore(runtime.subscribe, runtime.getSnapshot, runtime.getSnapshot);
   const store = useMemo(() => new SwarmStatsStore(), []);
   const [lifetime, setLifetime] = useState<SwarmTotals>(EMPTY_SWARM_TOTALS);
-  const [sessionBase, setSessionBase] = useState<SwarmTotals>(EMPTY_SWARM_TOTALS);
   const lastSession = useRef<SwarmTotals>(EMPTY_SWARM_TOTALS);
   const resumeWhenVisible = useRef(false);
   const [visibilityPaused, setVisibilityPaused] = useState(false);
@@ -160,11 +159,10 @@ export default function SwarmPage() {
 
   useEffect(() => {
     let active = true;
-    void Promise.all([store.load(), store.loadSession()]).then(([totals, session]) => {
+    void store.load().then((totals) => {
       if (active) {
         // Preserve any work completed while IndexedDB was still opening.
         setLifetime((current) => addTotals(totals, current));
-        setSessionBase(session);
       }
     });
     return () => { active = false; };
@@ -183,20 +181,17 @@ export default function SwarmPage() {
 
   useEffect(() => {
     const timer = setTimeout(() => {
-      void Promise.all([
-        store.save(lifetime),
-        store.saveSession(addTotals(sessionBase, sessionTotals(snapshot))),
-      ]);
+      void store.save(lifetime);
     }, 500);
     return () => clearTimeout(timer);
-  }, [lifetime, sessionBase, snapshot, store]);
+  }, [lifetime, store]);
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setActivity((values) => [...values.slice(-23), snapshot.global.activeWorkers]);
+      setActivity((values) => [...values.slice(-23), snapshot.activeWorkers]);
     }, 5_000);
     return () => clearInterval(timer);
-  }, [snapshot.global.activeWorkers]);
+  }, [snapshot.activeWorkers]);
 
   useEffect(() => {
     const onVisibility = () => {
@@ -231,28 +226,21 @@ export default function SwarmPage() {
             : snapshot.phase === "error"
               ? "Reconnecting needed"
               : "Paused";
-  const displayedSession = addTotals(sessionBase, sessionTotals(snapshot));
+  const displayedSession = sessionTotals(snapshot);
   const conflictRate = displayedSession.activeWorkerMs > 0
     ? displayedSession.conflicts / (displayedSession.activeWorkerMs / 1_000)
     : 0;
 
   const changeWorkers = (workers: number) => {
-    const completedRuntime = sessionTotals(runtime.getSnapshot());
-    const nextSessionBase = addTotals(sessionBase, completedRuntime);
-    setSessionBase(nextSessionBase);
-    void store.saveSession(nextSessionBase);
-    runtime.stop();
     localStorage.setItem(WORKER_PREFERENCE_KEY, String(workers));
     setWorkerPreference(workers);
-    lastSession.current = { ...EMPTY_SWARM_TOTALS };
-    setRuntime(createRuntime(workers));
+    runtime.reconfigureWorkers(workers);
   };
 
   const resetTotals = async () => {
     runtime.stop();
     await store.reset();
     setLifetime({ ...EMPTY_SWARM_TOTALS });
-    setSessionBase({ ...EMPTY_SWARM_TOTALS });
     lastSession.current = { ...EMPTY_SWARM_TOTALS };
     setRuntime(createRuntime(workerPreference));
   };
@@ -275,7 +263,9 @@ export default function SwarmPage() {
             <div>
               <span className="swarm-control-label">Contribution</span>
               <strong>{status}</strong>
-              <small>{snapshot.message ?? "No public work runs until you start."}</small>
+              <small>{snapshot.message ?? (isActive
+                ? "Workers are requesting and solving public cubes."
+                : "No public work runs until you start.")}</small>
             </div>
             <button
               type="button"
@@ -319,7 +309,7 @@ export default function SwarmPage() {
               <Metric label="Capacity" value={mobile ? "Mobile fallback" : `${availableCapacity} local`} />
             </dl>
           </article>
-          <ActivityGraph values={activity} />
+          <ActivityGraph values={[...activity.slice(-23), snapshot.activeWorkers]} />
         </section>
 
         <section className="swarm-metrics-section" aria-labelledby="session-metrics-title">
@@ -342,7 +332,7 @@ export default function SwarmPage() {
             <Metric label="Formula bytes transferred" value={formatBytes(displayedSession.formulaBytesTransferred)} />
             <Metric label="Wasm allocation now" value={formatBytes(snapshot.wasmMemoryBytes)} detail="linear memory, not process RAM" />
             <Metric label="Wasm high-water" value={formatBytes(snapshot.wasmMemoryHighWaterBytes)} />
-            <Metric label="Global swarm" value={`${snapshot.global.activeJobs} jobs`} detail={`${snapshot.global.activeWorkers} active workers`} />
+            <Metric label="Global swarm" value={`${snapshot.global.activeJobs} jobs`} detail={`${snapshot.global.activeWorkers} reserved worker slots`} />
           </dl>
         </section>
 
@@ -359,7 +349,6 @@ export default function SwarmPage() {
             <select
               id="swarm-workers"
               value={workerPreference}
-              disabled={isActive}
               onChange={(event) => changeWorkers(Number(event.target.value))}
             >
               {Array.from({ length: availableCapacity }, (_, index) => index + 1).map((workers) => (

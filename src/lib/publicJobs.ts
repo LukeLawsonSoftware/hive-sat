@@ -317,10 +317,14 @@ export function publicJobUrl(jobId: string, origin = window.location.origin): st
 async function apiJson<T>(response: Response): Promise<T> {
   const body = await response.json() as unknown;
   if (!response.ok) {
-    const message = typeof body === "object" && body !== null && "error" in body
-      ? JSON.stringify((body as { error: unknown }).error)
-      : `HTTP ${response.status}`;
-    throw new Error(`HiveSAT public-job request failed: ${message}`);
+    const error = typeof body === "object" && body !== null && "error" in body
+      ? (body as { error: unknown }).error
+      : null;
+    const message = typeof error === "object" && error !== null && "message" in error &&
+      typeof (error as { message: unknown }).message === "string"
+      ? (error as { message: string }).message
+      : `The server returned HTTP ${response.status}.`;
+    throw new Error(message);
   }
   return body as T;
 }

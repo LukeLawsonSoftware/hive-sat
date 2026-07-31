@@ -113,6 +113,16 @@ export class PublicSwarmRuntime {
     this.connectDirectory();
   }
 
+  reconfigureWorkers(workerPreference: number): void {
+    const workers = Math.min(32, Math.max(1, Math.floor(workerPreference)));
+    if (workers === this.options.workerPreference) return;
+    const wasActive = ["directory", "reconnecting", "computing", "no-work"].includes(this.snapshot.phase);
+    if (wasActive) this.pause();
+    this.options.workerPreference = workers;
+    this.update({ ...this.snapshot, capacity: workers });
+    if (wasActive) this.start();
+  }
+
   pause(): void {
     this.integrateWorkerTime();
     if (this.currentAssignmentId) {
@@ -124,7 +134,7 @@ export class PublicSwarmRuntime {
     }
     this.directory?.stop();
     this.directory = null;
-    this.finishCube(false);
+    this.finishCube();
     this.clearRetry();
     this.update({
       ...this.snapshot,
@@ -146,7 +156,7 @@ export class PublicSwarmRuntime {
   }
 
   private connectDirectory(): void {
-    this.finishCube(false);
+    this.finishCube();
     this.update({
       ...this.snapshot,
       phase: "directory",
@@ -315,7 +325,7 @@ export class PublicSwarmRuntime {
       activeWorkerMs: Math.round(this.assignmentWorkerMs),
     };
     this.currentAssignmentId = null;
-    this.finishCube(true);
+    this.finishCube();
     if (this.snapshot.phase !== "paused") this.connectDirectory();
   }
 
@@ -334,13 +344,16 @@ export class PublicSwarmRuntime {
     }
   }
 
-  private finishCube(stop: boolean): void {
+  private finishCube(): void {
     if (this.assignmentTimer !== null) clearTimeout(this.assignmentTimer);
     this.assignmentTimer = null;
     this.unsubscribeCube?.();
     this.unsubscribeCube = null;
-    if (stop) this.cube?.stop();
-    else this.cube?.pause();
+    // PublicSwarmRuntime never reuses a completed assignment runtime. Yield
+    // leased tasks first, then terminate its workers so pausing/reconfiguring
+    // cannot leak Web Workers or Wasm memories in the background.
+    this.cube?.pause();
+    this.cube?.stop();
     this.cube = null;
     this.lastActiveWorkers = 0;
     this.lastIntegratedAt = 0;

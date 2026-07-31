@@ -4,12 +4,17 @@ import { JobCoordinatorSocket, coordinatorReconnectDelayMs } from "./jobCoordina
 class FakeWebSocket extends EventTarget {
   readyState: WebSocket["readyState"] = WebSocket.CONNECTING;
   readonly sent: string[] = [];
+  closeCode: number | undefined;
 
   send(data: Parameters<WebSocket["send"]>[0]): void {
     this.sent.push(String(data));
   }
 
-  close(): void {
+  close(code = 1000): void {
+    if (code !== 1000 && (code < 3000 || code > 4999)) {
+      throw new DOMException("Invalid browser WebSocket close code", "InvalidAccessError");
+    }
+    this.closeCode = code;
     this.readyState = WebSocket.CLOSED;
     this.dispatchEvent(new CloseEvent("close"));
   }
@@ -111,6 +116,7 @@ describe("JobCoordinatorSocket", () => {
     sockets[0].receive(welcome("another-job"));
     expect(errors).toEqual(["JOB_MISMATCH"]);
     expect(sockets[0].readyState).toBe(WebSocket.CLOSED);
+    expect(sockets[0].closeCode).toBe(4002);
     client.stop();
   });
 });

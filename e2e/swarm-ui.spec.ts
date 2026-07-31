@@ -52,4 +52,17 @@ test.describe("Phase 9 Swarm Mode", () => {
       : Number.parseFloat(duration);
     expect(seconds).toBeLessThanOrEqual(0.00001);
   });
+
+  test("keeps the worker selector usable while contribution is active", async ({ page }) => {
+    await page.goto("/swarm");
+    const workers = page.getByRole("combobox", { name: /Maximum workers/i });
+    await workers.selectOption("1");
+    await page.getByRole("button", { name: "Start contributing" }).click();
+
+    await expect(workers).toBeEnabled();
+    await workers.selectOption("2");
+    await expect(workers).toHaveValue("2");
+    await expect(page.getByRole("button", { name: "Pause contribution" })).toBeVisible();
+    await expect(page.getByText("Rolling local worker activity")).toBeVisible();
+  });
 });

@@ -10,6 +10,12 @@ import type { CoordinatorWebSocket } from "./jobCoordinatorSocket";
 
 export type SwarmDirectorySocketState = "idle" | "connecting" | "waiting" | "handoff" | "stopped";
 
+// Browser clients may only initiate RFC 6455 close code 1000 or application
+// codes in the 3000-4999 range. Protocol/server codes such as 1008 and 1011
+// throw InvalidAccessError when passed to the browser WebSocket API.
+const CLIENT_CONNECTION_ERROR_CLOSE_CODE = 4001;
+const CLIENT_PROTOCOL_ERROR_CLOSE_CODE = 4002;
+
 export interface SwarmDirectorySocketOptions {
   sessionId: string;
   capabilities: WorkerCapabilities;
@@ -96,7 +102,7 @@ export class SwarmDirectorySocket {
     });
     socket.addEventListener("error", () => {
       if (this.socket === socket && socket.readyState < WebSocket.CLOSING) {
-        socket.close(1011, "Directory connection failed");
+        socket.close(CLIENT_CONNECTION_ERROR_CLOSE_CODE, "Directory connection failed");
       }
     });
   }
@@ -117,7 +123,7 @@ export class SwarmDirectorySocket {
     this.options.onProtocolError?.(code);
     this.pending = null;
     this.stopped = true;
-    if (socket.readyState < WebSocket.CLOSING) socket.close(1008, code);
+    if (socket.readyState < WebSocket.CLOSING) socket.close(CLIENT_PROTOCOL_ERROR_CLOSE_CODE, code);
     this.setState("stopped");
   }
 

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeHiveCnfV1, sha256Hex } from "./formula/hiveCnf";
 import {
   downloadVerifiedPublicFormula,
+  getPublicJob,
   ownedJobGroup,
   ownerTokenFromFragment,
   publicJobStatusLabel,
@@ -107,5 +108,15 @@ describe("public job browser trust boundary", () => {
         }));
 
     await expect(downloadVerifiedPublicFormula("job", fetcher)).rejects.toThrow(/metadata does not match/u);
+  });
+
+  it("surfaces the server's human-readable failure reason", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({
+      error: { code: "ACTIVE_JOB_LIMIT", message: "This device already has an active public job." },
+    }, { status: 429 }));
+
+    await expect(getPublicJob("job", fetcher)).rejects.toThrow(
+      "This device already has an active public job.",
+    );
   });
 });

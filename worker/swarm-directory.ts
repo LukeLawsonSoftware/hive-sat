@@ -167,20 +167,22 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
     ).one().total;
     if (existing > 0) return { ok: false, code: "ACTIVE_JOB_LIMIT" };
 
-    const recent = this.ctx.storage.sql.exec<CreationRow>(
-      `SELECT created_at FROM creation_events
-       WHERE (device_digest = ? OR network_digest = ?) AND created_at >= ?
-       ORDER BY created_at ASC`,
-      input.deviceDigest,
-      input.networkDigest,
-      windowStart,
-    ).toArray();
-    if (recent.length >= MAX_CREATIONS_PER_WINDOW) {
-      return {
-        ok: false,
-        code: "CREATION_RATE_LIMIT",
-        retryAt: recent[0].created_at + CREATION_WINDOW_MS,
-      };
+    if (!input.bypassCreationRateLimit) {
+      const recent = this.ctx.storage.sql.exec<CreationRow>(
+        `SELECT created_at FROM creation_events
+         WHERE (device_digest = ? OR network_digest = ?) AND created_at >= ?
+         ORDER BY created_at ASC`,
+        input.deviceDigest,
+        input.networkDigest,
+        windowStart,
+      ).toArray();
+      if (recent.length >= MAX_CREATIONS_PER_WINDOW) {
+        return {
+          ok: false,
+          code: "CREATION_RATE_LIMIT",
+          retryAt: recent[0].created_at + CREATION_WINDOW_MS,
+        };
+      }
     }
 
     const fairJobs = this.activeFairJobs();
@@ -482,11 +484,16 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
   private reconcile(sessionId: string, assignmentId: string, actualWorkerMs: number): boolean {
     const assignment = this.ctx.storage.sql.exec<AssignmentRow>(
       `SELECT * FROM assignments
-       WHERE assignment_id = ? AND session_id = ? AND status = 'ACTIVE'`,
+       WHERE assignment_id = ? AND session_id = ?`,
       assignmentId,
       sessionId,
     ).toArray()[0];
     if (!assignment || actualWorkerMs > assignment.reserved_worker_ms) return false;
+    // Reconciliation is idempotent. A job can finish, be cancelled, or expire
+    // between the worker closing its coordinator socket and reporting actual
+    // time to the directory. Those terminal rows have already released their
+    // reservation and must not strand a healthy browser in INVALID_ASSIGNMENT.
+    if (assignment.status !== "ACTIVE") return true;
     const job = this.ctx.storage.sql.exec<ActiveJobRow>(
       "SELECT * FROM active_jobs WHERE job_id = ?",
       assignment.job_id,

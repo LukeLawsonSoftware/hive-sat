@@ -11,6 +11,7 @@ interface TurnstileApi {
     "error-callback"(): void;
   }): string;
   remove(widgetId: string): void;
+  reset(widgetId: string): void;
 }
 
 declare global {
@@ -38,6 +39,7 @@ export function PublicJobSubmission({
   const [message, setMessage] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const widgetRef = useRef<HTMLDivElement>(null);
+  const widgetIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -65,6 +67,7 @@ export function PublicJobSubmission({
         "expired-callback": () => setTurnstileToken(null),
         "error-callback": () => setMessage("The anti-abuse challenge could not be completed."),
       });
+      widgetIdRef.current = widgetId;
     };
     const existing = document.querySelector<HTMLScriptElement>('script[data-hivesat-turnstile="true"]');
     if (existing) {
@@ -83,6 +86,7 @@ export function PublicJobSubmission({
       cancelled = true;
       existing?.removeEventListener("load", render);
       if (widgetId) window.turnstile?.remove(widgetId);
+      if (widgetIdRef.current === widgetId) widgetIdRef.current = null;
     };
   }, [enabled, siteKey]);
 
@@ -102,6 +106,8 @@ export function PublicJobSubmission({
       window.location.assign(job.ownerUrl);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "The public job could not be submitted.");
+      setTurnstileToken(null);
+      if (widgetIdRef.current) window.turnstile?.reset(widgetIdRef.current);
       setSubmitting(false);
     }
   }

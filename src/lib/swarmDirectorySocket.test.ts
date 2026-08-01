@@ -4,12 +4,17 @@ import { SwarmDirectorySocket } from "./swarmDirectorySocket";
 class FakeWebSocket extends EventTarget {
   readyState: WebSocket["readyState"] = WebSocket.CONNECTING;
   readonly sent: string[] = [];
+  closeCode: number | undefined;
 
   send(data: Parameters<WebSocket["send"]>[0]): void {
     this.sent.push(String(data));
   }
 
-  close(): void {
+  close(code = 1000): void {
+    if (code !== 1000 && (code < 3000 || code > 4999)) {
+      throw new DOMException("Invalid browser WebSocket close code", "InvalidAccessError");
+    }
+    this.closeCode = code;
     this.readyState = WebSocket.CLOSED;
     this.dispatchEvent(new CloseEvent("close"));
   }
@@ -27,7 +32,7 @@ class FakeWebSocket extends EventTarget {
 function serverBase(type: string) {
   return {
     type,
-    protocolVersion: 3,
+    protocolVersion: 4,
     messageId: "server-one",
     requestMessageId: "request-one",
     serverTime: 1,
@@ -67,7 +72,7 @@ describe("SwarmDirectorySocket", () => {
       quantumMs: 3_600_000,
       reservedWorkerMs: 7_200_000,
       conflictBudget: 100,
-      leaseTargetMs: 900_000,
+      leaseTargetMs: 300_000,
     });
     expect(events).toEqual([]);
     socket.close();
@@ -95,5 +100,6 @@ describe("SwarmDirectorySocket", () => {
     socket.receive({ type: "SWARM_ASSIGNMENT" });
     expect(errors).toEqual(["UPGRADE_REQUIRED"]);
     expect(socket.readyState).toBe(WebSocket.CLOSED);
+    expect(socket.closeCode).toBe(4002);
   });
 });

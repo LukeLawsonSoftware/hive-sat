@@ -31,16 +31,17 @@ UNSAT is a universal claim:
 ```
 
 Two browsers agreeing does not prove that claim. They could share the same
-solver bug or both stop too early. Phase 7 uses a second, independent browser
-solve only to raise confidence before proof production. A public job still does
-not become UNSAT. A later phase must attach and independently check a proof.
+solver bug or both stop too early. Repeating anonymous work therefore adds
+latency without crossing a trust boundary. HiveSAT sends the first
+structurally valid UNSAT candidate directly to a fresh proof finisher; only an
+independently checked LRAT proof can certify the public result.
 
-| Browser report | Phase 7 meaning | Can it end the public job? |
+| Browser report | Coordinator meaning | Can it end the public job? |
 | --- | --- | --- |
 | SAT plus a model | A checkable candidate | Yes, after server verification |
-| One UNSAT report | A request for an independent repeat | No |
-| Two independent UNSAT reports | A proof-production candidate | No |
-| Checked UNSAT proof | A certificate | Not until the proof phase |
+| First valid UNSAT report | Reinitialize a proof-capable worker for this cube | No |
+| More browsers reporting UNSAT | Redundant candidates, not stronger evidence | No |
+| Checked UNSAT proof | A certificate for exactly this cube | Yes, after complete tree coverage |
 
 ## The compact SAT model artifact
 
@@ -108,24 +109,26 @@ candidate into a terminal result.
 
 ## Step by step: an UNSAT candidate
 
-The first UNSAT report closes that lease and returns the same exact cube to
-`READY`. Another session must solve it from scratch. Results are grouped by
-session, so reconnecting and resending the same result does not count twice.
+The first structurally valid UNSAT report closes its search lease and changes
+the same exact cube to proof-required work. The next eligible lease goes only
+to a proof-capable slot. That slot discards its search solver, creates a fresh
+CaDiCaL instance, enables LRAT before loading clauses, then solves the canonical
+formula plus the cube assumptions as unit clauses.
 
-After two distinct sessions report UNSAT, the leaf becomes
-`UNSAT_CANDIDATE`. Completion may move up the task tree only when both children
-are present and exactly complementary:
+The candidate itself never moves completion up the tree. A checked proof may
+certify the leaf, and completion may then move up only when both children are
+present, exactly complementary, and certified:
 
 ```mermaid
 flowchart TD
   P["parent cube C"]
-  L["C ∧ x₇<br/>two independent candidates"]
-  R["C ∧ ¬x₇<br/>two independent candidates"]
+  L["C ∧ x₇<br/>checked LRAT"]
+  R["C ∧ ¬x₇<br/>checked LRAT"]
   P --> L
   P --> R
   L --> CHECK["coverage check"]
   R --> CHECK
-  CHECK --> CAND["parent UNSAT_CANDIDATE<br/>never final UNSAT"]
+  CHECK --> CAND["parent certified"]
 ```
 
 The coordinator reconstructs and stores split children itself. During upward
@@ -142,17 +145,18 @@ never a convenient verdict.
 | --- | --- | --- |
 | Invalid formula object, hash, or encoding | Mark job `INVALID`; stop leases | Input cannot be trusted |
 | Missing, corrupt, swapped, or false model | Delete model, quarantine session, requeue cube | No verdict |
-| Verifier unavailable or budget exhausted | Record timeout, requeue until attempt ceiling | No verdict |
-| Task attempt budget exhausted | Mark task `UNKNOWN`; root exhaustion marks job `UNKNOWN` | Explicit non-answer |
-| SAT conflicts with UNSAT candidates | Independently verified SAT wins because it has a witness | `SAT_VERIFIED` |
-| UNSAT consensus without proof | Keep `UNSAT_CANDIDATE` | Never display final UNSAT |
+| Verifier unavailable or transient budget exhausted | Record timeout and requeue without spending a lease-attempt budget | No verdict |
+| Repeated lease expiry or browser churn | Return the exact cube to `READY`; retain `leaseCount` only as telemetry | No verdict |
+| SAT conflicts with an unproved UNSAT candidate | Independently verified SAT wins because it has a witness | `SAT_VERIFIED` |
+| Any number of UNSAT reports without proof | Keep proof work pending | Never display final UNSAT |
 | Stale but correctly bound SAT artifact | It may be verified; lease age cannot invalidate mathematics | Terminal only if valid |
 | Malformed or wrongly bound manifest | Reject before verification | No state promotion |
 
 An invalid model increments session reliability data and quarantines that
 session from reconnecting. Timeouts are counted separately because a timeout
 does not prove dishonesty. These signals are for abuse containment and bounded
-lease sizing only; they never buy or remove scheduling priority.
+operator diagnosis only; they never change lease tenure or buy/remove
+scheduling priority.
 
 ## The terminal invariant
 
@@ -169,8 +173,9 @@ well-formed manifest
   = SAT_VERIFIED
 ```
 
-Everything else remains a candidate, is requeued, becomes `UNKNOWN`, or marks
-the input invalid. That invariant is what lets later swarm scheduling improve
-throughput without weakening the meaning of an answer.
+Everything else remains a candidate, is requeued, hits an explicit platform or
+artifact safety limit, or marks the input invalid. Ordinary lease churn never
+creates `UNKNOWN`. That invariant lets scheduling improve throughput without
+weakening the meaning of an answer.
 
 Next: [How the public swarm shares compute fairly →](05-fair-swarm-scheduling.md)

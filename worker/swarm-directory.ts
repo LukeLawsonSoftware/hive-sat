@@ -6,6 +6,7 @@ import {
   type AdmissionResult,
 } from "./contracts";
 import {
+  SWARM_ASSIGNMENT_ACTIVATION_MS,
   SWARM_ASSIGNMENT_QUANTUM_MS,
   SWARM_MAX_JOB_WORKERS,
   SWARM_MAX_MESSAGE_BYTES,
@@ -48,7 +49,7 @@ interface AssignmentRow {
   workers: number;
   reserved_worker_ms: number;
   actual_worker_ms: number | null;
-  status: "ACTIVE" | "COMPLETE" | "EXPIRED" | "CANCELLED";
+  status: "PENDING" | "ACTIVE" | "COMPLETE" | "EXPIRED" | "CANCELLED";
   assigned_at: number;
   expires_at: number;
 }
@@ -167,20 +168,22 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
     ).one().total;
     if (existing > 0) return { ok: false, code: "ACTIVE_JOB_LIMIT" };
 
-    const recent = this.ctx.storage.sql.exec<CreationRow>(
-      `SELECT created_at FROM creation_events
-       WHERE (device_digest = ? OR network_digest = ?) AND created_at >= ?
-       ORDER BY created_at ASC`,
-      input.deviceDigest,
-      input.networkDigest,
-      windowStart,
-    ).toArray();
-    if (recent.length >= MAX_CREATIONS_PER_WINDOW) {
-      return {
-        ok: false,
-        code: "CREATION_RATE_LIMIT",
-        retryAt: recent[0].created_at + CREATION_WINDOW_MS,
-      };
+    if (!input.bypassCreationRateLimit) {
+      const recent = this.ctx.storage.sql.exec<CreationRow>(
+        `SELECT created_at FROM creation_events
+         WHERE (device_digest = ? OR network_digest = ?) AND created_at >= ?
+         ORDER BY created_at ASC`,
+        input.deviceDigest,
+        input.networkDigest,
+        windowStart,
+      ).toArray();
+      if (recent.length >= MAX_CREATIONS_PER_WINDOW) {
+        return {
+          ok: false,
+          code: "CREATION_RATE_LIMIT",
+          retryAt: recent[0].created_at + CREATION_WINDOW_MS,
+        };
+      }
     }
 
     const fairJobs = this.activeFairJobs();
@@ -215,7 +218,7 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
   async close(jobId: string): Promise<void> {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
-        "UPDATE assignments SET status = 'CANCELLED' WHERE job_id = ? AND status = 'ACTIVE'",
+        "UPDATE assignments SET status = 'CANCELLED' WHERE job_id = ? AND status IN ('PENDING', 'ACTIVE')",
         jobId,
       );
       this.ctx.storage.sql.exec("DELETE FROM active_jobs WHERE job_id = ?", jobId);
@@ -229,6 +232,18 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
        WHERE job_id = ? AND eligible = 0`,
       now,
       jobId,
+    );
+    return cursor.rowsWritten > 0;
+  }
+
+  setEligible(jobId: string, eligible: boolean, now = Date.now()): boolean {
+    const cursor = this.ctx.storage.sql.exec(
+      `UPDATE active_jobs SET eligible = ?, last_service_at = ?
+       WHERE job_id = ? AND eligible != ?`,
+      eligible ? 1 : 0,
+      now,
+      jobId,
+      eligible ? 1 : 0,
     );
     return cursor.rowsWritten > 0;
   }
@@ -272,7 +287,7 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
     }>(
       `SELECT COUNT(*) AS activeAssignments,
               COALESCE(SUM(reserved_worker_ms), 0) AS reservedWorkerMs
-       FROM assignments WHERE status = 'ACTIVE'`,
+       FROM assignments WHERE status IN ('PENDING', 'ACTIVE')`,
     ).one();
     const creationsInWindow = this.ctx.storage.sql.exec<{ total: number }>(
       "SELECT COUNT(*) AS total FROM creation_events WHERE created_at >= ?",
@@ -307,12 +322,12 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
       const workers = selected.workers;
       const profile = calibratedTaskProfile(capabilities);
       const reservedWorkerMs = SWARM_ASSIGNMENT_QUANTUM_MS * workers;
-      const expiresAt = now + SWARM_ASSIGNMENT_QUANTUM_MS;
+      const expiresAt = now + SWARM_ASSIGNMENT_ACTIVATION_MS;
       this.ctx.storage.sql.exec(
         `INSERT INTO assignments (
           assignment_id, job_id, session_id, workers, reserved_worker_ms,
           actual_worker_ms, status, assigned_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, NULL, 'ACTIVE', ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, NULL, 'PENDING', ?, ?)`,
         assignmentId,
         selected.job.jobId,
         sessionId,
@@ -347,6 +362,32 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
     });
     await this.scheduleNextAlarm();
     return result;
+  }
+
+  async activate(assignmentId: string, sessionId: string, jobId: string, now = Date.now()): Promise<boolean> {
+    const activated = this.ctx.storage.transactionSync(() => {
+      this.expireAssignments(now);
+      const assignment = this.ctx.storage.sql.exec<AssignmentRow>(
+        `SELECT * FROM assignments
+         WHERE assignment_id = ? AND session_id = ? AND job_id = ?`,
+        assignmentId,
+        sessionId,
+        jobId,
+      ).toArray()[0];
+      if (!assignment) return false;
+      if (assignment.status === "ACTIVE") return true;
+      if (assignment.status !== "PENDING" || assignment.expires_at <= now) return false;
+      this.ctx.storage.sql.exec(
+        `UPDATE assignments SET status = 'ACTIVE', assigned_at = ?, expires_at = ?
+         WHERE assignment_id = ? AND status = 'PENDING'`,
+        now,
+        now + SWARM_ASSIGNMENT_QUANTUM_MS,
+        assignmentId,
+      );
+      return true;
+    });
+    await this.scheduleNextAlarm();
+    return activated;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -455,7 +496,7 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
       `SELECT MIN(expires_at) AS expires_at FROM (
         SELECT expires_at FROM active_jobs
         UNION ALL
-        SELECT expires_at FROM assignments WHERE status = 'ACTIVE'
+        SELECT expires_at FROM assignments WHERE status IN ('PENDING', 'ACTIVE')
         UNION ALL
         SELECT expires_at FROM turnstile_replays
         UNION ALL
@@ -482,11 +523,16 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
   private reconcile(sessionId: string, assignmentId: string, actualWorkerMs: number): boolean {
     const assignment = this.ctx.storage.sql.exec<AssignmentRow>(
       `SELECT * FROM assignments
-       WHERE assignment_id = ? AND session_id = ? AND status = 'ACTIVE'`,
+       WHERE assignment_id = ? AND session_id = ?`,
       assignmentId,
       sessionId,
     ).toArray()[0];
     if (!assignment || actualWorkerMs > assignment.reserved_worker_ms) return false;
+    // Reconciliation is idempotent. A job can finish, be cancelled, or expire
+    // between the worker closing its coordinator socket and reporting actual
+    // time to the directory. Those terminal rows have already released their
+    // reservation and must not strand a healthy browser in INVALID_ASSIGNMENT.
+    if (assignment.status !== "PENDING" && assignment.status !== "ACTIVE") return true;
     const job = this.ctx.storage.sql.exec<ActiveJobRow>(
       "SELECT * FROM active_jobs WHERE job_id = ?",
       assignment.job_id,
@@ -519,19 +565,33 @@ export class SwarmDirectoryDO extends DurableObject<Env> {
 
   private expireAssignments(now: number): void {
     const expired = this.ctx.storage.sql.exec<AssignmentRow>(
-      "SELECT * FROM assignments WHERE status = 'ACTIVE' AND expires_at <= ?",
+      "SELECT * FROM assignments WHERE status IN ('PENDING', 'ACTIVE') AND expires_at <= ?",
       now,
     ).toArray();
     for (const assignment of expired) {
-      this.ctx.storage.sql.exec(
-        `UPDATE active_jobs SET
-          reserved_worker_ms = MAX(0, reserved_worker_ms - ?),
-          assigned_workers = MAX(0, assigned_workers - ?)
-         WHERE job_id = ?`,
-        assignment.reserved_worker_ms,
-        assignment.workers,
-        assignment.job_id,
-      );
+      if (assignment.status === "PENDING") {
+        this.ctx.storage.sql.exec(
+          `UPDATE active_jobs SET
+            virtual_worker_ms = MAX(0, virtual_worker_ms - ?),
+            reserved_worker_ms = MAX(0, reserved_worker_ms - ?),
+            assigned_workers = MAX(0, assigned_workers - ?)
+           WHERE job_id = ?`,
+          assignment.reserved_worker_ms,
+          assignment.reserved_worker_ms,
+          assignment.workers,
+          assignment.job_id,
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          `UPDATE active_jobs SET
+            reserved_worker_ms = MAX(0, reserved_worker_ms - ?),
+            assigned_workers = MAX(0, assigned_workers - ?)
+           WHERE job_id = ?`,
+          assignment.reserved_worker_ms,
+          assignment.workers,
+          assignment.job_id,
+        );
+      }
       this.ctx.storage.sql.exec(
         "UPDATE assignments SET status = 'EXPIRED' WHERE assignment_id = ?",
         assignment.assignment_id,

@@ -1,6 +1,7 @@
 # 3. How cube-and-conquer distributes one search
 
-[← Formula pipeline](02-formula-pipeline.md) · [Guide index](README.md)
+[← Formula pipeline](02-formula-pipeline.md) · [Guide index](README.md) ·
+[Next: result correctness →](04-result-correctness.md)
 
 Cube-and-conquer turns one search space into complementary subspaces. Browsers
 can solve those subspaces independently without sharing mutable solver state.
@@ -21,86 +22,126 @@ They cannot overlap because `l` and `¬l` cannot both be true. Together they
 cover every assignment in `C` because every Boolean variable is either true or
 false.
 
-The browser sends only `splitLiteral: l`. It does **not** send arbitrary child
-cubes. Inside one SQLite transaction, `JobCoordinatorDO`:
+The browser sends only `splitLiteral: l` and a coordinator-issued permit ID.
+It does **not** send arbitrary child cubes. Inside one SQLite transaction,
+`JobCoordinatorDO`:
 
-1. proves the lease is active and owns the parent task;
-2. checks `l` is non-zero, within the formula's variable range, and not already
-   fixed by the parent;
-3. checks depth is below 64 and two new rows fit under 10,000 total tasks;
-4. constructs `[...C, l]` and `[...C, -l]` itself;
-5. inserts both READY children;
-6. marks the parent SPLIT and closes the lease.
+1. proves the permit, slot, task, and active lease all match;
+2. rechecks that connected idle capacity still needs another cube;
+3. checks `l` is non-zero, in range, and not already fixed by the parent;
+4. checks depth is below 64 and two rows fit below 10,000 total tasks;
+5. constructs `[...C, l]` and `[...C, -l]` itself;
+6. inserts both `READY` children; and
+7. marks the parent `SPLIT` and closes the lease.
 
 No `await` occurs inside this transaction. A crash cannot expose one child
-without the other or mark the parent split before both exist.
+without the other. If capacity changed after the permit was issued, the
+coordinator returns `SPLIT_NOT_NEEDED` and the worker keeps solving the parent.
 
-## Leases make churn recoverable
+## Stable slots make churn recoverable
 
-A READY cube becomes LEASED before the coordinator sends it. The lease lasts
-15 minutes, with at most one exceptional five-minute extension. Ordinary
-progress heartbeats are batched about once per minute and do not rewrite task
-progress.
+Protocol v4 gives each browser worker slot a stable ID. The initial `HELLO`
+declares all slots. The coordinator persists initial idle-slot leases before
+replying and returns them with resumed work in `WELCOME.activeLeases`. It
+persists later leases before pushing `WORK` to the matching slot. There is no
+five-second per-slot `REQUEST_WORK` loop.
+
+A lease starts with a five-minute deadline. Once per minute, one session
+heartbeat carries the cumulative counters for all slots. A slot whose active
+compute advanced receives another rolling five minutes, capped at 60 minutes
+from the original issue time and by job expiry.
 
 ```mermaid
 stateDiagram-v2
   [*] --> READY
-  READY --> LEASED: persist lease, then send work
-  LEASED --> SPLIT: exact complementary split
-  LEASED --> READY: safe yield or expired lease
-  LEASED --> VERIFYING_SAT: candidate model + artifact
+  READY --> LEASED: persist, then WELCOME or WORK
+  LEASED --> LEASED: active session heartbeat renews
+  LEASED --> SPLIT: permitted complementary split
+  LEASED --> READY: safe yield, omitted slot, or expiry
+  LEASED --> VERIFYING_SAT: model candidate
   VERIFYING_SAT --> SAT_VERIFIED: independent verification
   VERIFYING_SAT --> READY: invalid or timed-out verification
-  LEASED --> READY: first UNSAT candidate
-  LEASED --> UNSAT_CANDIDATE: independent repeat
-  READY --> UNKNOWN: retry ceiling exhausted
+  LEASED --> PROOF_PENDING: first valid UNSAT candidate
+  PROOF_PENDING --> LEASED: proof-capable slot
 ```
 
-If a tab closes, the lease remains authoritative in SQLite. A reconnecting
-session resumes it from the WebSocket attachment. If it never returns, the
-single coordinator alarm requeues the cube. CDCL state is not migrated:
-another worker loads the same cached formula and restarts the cube assumptions.
+The browser keeps a mutation under a stable message ID until its ACK arrives.
+Only then is that slot displayed and reused as idle. This avoids brief double
+ownership and removes the premature-release cause of much of the visible
+one/two-worker flicker. A legitimate acknowledged ownership change may still
+change the displayed count.
 
-## Queue pressure controls splitting
+If a tab closes, the lease remains authoritative in SQLite. A reconnect with
+the same session and slot IDs resumes it. If the browser does not return, the
+single coordinator alarm requeues the exact cube. `leaseCount` is telemetry;
+there is no retry ceiling and an intermittent client cannot make a task
+`UNKNOWN` by repeatedly disappearing.
 
-Splitting every cube immediately would grow a huge task tree; never splitting
-would leave workers idle. Each WORK message includes a coordinator-computed
-queue snapshot based on active sessions:
+## The coordinator controls frontier growth
 
-| Watermark | Meaning |
-| --- | --- |
-| about `1 × workers` | the ready queue is running low |
-| about `3 × workers` | the desired working reserve |
-| about `8 × workers` | enough queued work; prefer conquering |
+Splitting every cube eagerly grows an exponential task tree. Polling browsers
+for queue pressure also creates latency and request load. Protocol v4 instead
+lets the coordinator observe both sides of the decision: durable tasks and
+connected slots.
 
-After a bounded solve attempt, a worker asks `lookahead()` for a split only
-when the queue is below the target and the coordinator says splitting remains
-legal. If there is no safe literal, the worker yields with reason `BUDGET`.
+```text
+target frontier = min(2 × connected slots, 16)
+```
+
+The frontier counts ready tasks, active search leases, and outstanding split
+permits. When idle capacity exists below that target, the coordinator grants
+only enough short-lived permits to eligible search slots. A slot must first
+record at least one second of active computation; this gives unit propagation
+and easy CDCL solving a chance to finish before paying for a split. Proof work
+never receives a split permit.
+
+No permit means “keep conquering,” not “yield.” With a permit, the worker asks
+`lookahead()` once and reports the literal if safe. Depth 64 and 10,000 tasks
+remain emergency caps rather than goals. For `N` connected slots, the ordinary
+frontier is therefore at most `min(2N, 16)` instead of growing according to a
+fixed number of slices in every worker.
 
 ## The browser worker pool
 
-Defaults are intentionally conservative:
+Defaults remain conservative:
 
 - desktop: at most two Dedicated Workers;
-- mobile: one Dedicated Worker;
-- always bounded by detected hardware concurrency and the user's preference.
+- mobile: one Dedicated Worker; and
+- always bounded by hardware concurrency and the user's preference.
 
-Every free worker first checks the user's own active job. Public swarm work is
-requested only for capacity left over after owner tasks. This is a local
-allocation rule; contributing does not buy server-side priority.
+Local solving and public solving are separate experiences. `/` owns only the
+local solver. `/swarm` explicitly creates the public runtime and stops it when
+the user pauses or leaves. `/jobs` reads status and owner controls without
+creating solver workers. A local solve therefore cannot compete with, pause,
+or strand a public assignment.
 
-Each worker:
+Each public worker:
 
-1. receives verified clause batches once;
-2. accepts a cube and lease;
-3. reapplies cube assumptions before every 100-conflict slice;
-4. yields to the event loop between slices;
-5. reports sparse aggregate progress;
-6. returns SAT, UNSAT-candidate, a safe split literal, or a budget yield.
+1. loads independently verified clause batches once;
+2. accepts initial/resumed work from `WELCOME.activeLeases` and later pushed
+   `WORK` for its stable slot;
+3. reapplies cube assumptions before each bounded CaDiCaL call;
+4. retains the solver and learned clauses while yielding to the event loop;
+5. contributes counters to the one-minute session heartbeat; and
+6. reports SAT, a permitted split, safe shutdown/yield, or an UNSAT candidate.
 
-A SAT model is checked against both the original formula and cube assumptions
-in ordinary TypeScript before the browser reports it. A verified candidate lets
-that browser stop its other cube workers early. Server-side terminal correctness
-is the next layer.
+A proof-finisher deliberately reinitializes the worker: it creates a fresh
+proof-capable CaDiCaL instance, enables LRAT before loading clauses, and then
+solves the exact formula and cube.
+
+## Why overlapping clause partitions are not combined
+
+Solving groups of clauses separately and intersecting their satisfying
+assignments is sound only when the groups are variable-disconnected. If two
+groups share boundary variables, each can be satisfiable under an incompatible
+boundary assignment. Enumerating all compatible boundary assignments restores
+correctness but costs up to `2^b` for `b` boundary variables—another SAT search,
+not a shortcut.
+
+HiveSAT may measure genuinely disconnected components and boundary width as
+preprocessing telemetry or split-variable guidance. It never treats separate
+answers for overlapping clause partitions as a model or UNSAT certificate.
+Exact complementary cubes and independently checked evidence remain the simple
+correct partition.
 
 Next: [Why results are not trusted on arrival →](04-result-correctness.md)

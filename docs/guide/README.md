@@ -33,9 +33,12 @@ flowchart LR
   B2 --> W2["Dedicated Worker<br/>CaDiCaL Wasm"]
 ```
 
-The large formula travels through Workers KV and normal HTTP streaming. Small control
-messages—request work, renew a lease, split, yield, or report a candidate—travel
-through one hibernating WebSocket per job. The Cloudflare Worker coordinates
-the search; it does not perform the SAT search itself.
+The large formula travels through Workers KV and normal HTTP streaming. Small
+control messages—one session heartbeat, coordinator-granted splits, yields,
+and candidate results—travel through one hibernating WebSocket per job. The
+coordinator returns persisted initial assignments in `WELCOME`, then pushes
+later work to stable browser slots; idle slots do not poll every few seconds.
+The Cloudflare Worker coordinates the search; it does not perform the SAT
+search itself.
 
 Next: [SAT solving from the beginning →](01-sat-solving.md)

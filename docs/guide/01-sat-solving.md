@@ -94,7 +94,7 @@ sequenceDiagram
   participant C as CaDiCaL Wasm
   UI->>DW: run cube with assumptions
   loop bounded slices
-    DW->>C: assume(cube), solve(100 conflicts)
+    DW->>C: assume(cube), solve(bounded conflicts)
     C-->>DW: UNKNOWN / SAT / UNSAT
     DW-->>DW: yield to event loop
   end
@@ -103,7 +103,9 @@ sequenceDiagram
 ```
 
 `UNKNOWN` here does not mean the formula is fundamentally unknowable. It means
-this bounded attempt did not finish. The worker can split the cube or yield it
-so another lease can restart it later.
+this bounded call did not finish. The same long-lived worker continues with its
+learned clauses after yielding to JavaScript. In distributed mode it splits
+only when the coordinator grants a permit; ordinary slice exhaustion is not a
+reason to discard the cube or consume a task-attempt budget.
 
 Next: [From a DIMACS file to verified browser memory →](02-formula-pipeline.md)

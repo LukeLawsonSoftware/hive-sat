@@ -14,6 +14,7 @@ safety margins.
    generated-type drift, production build, and Wrangler dry-run checks.
 5. Review `GET /api/v1/health`: `configuration.publicJobsReady` is true,
    features are enabled, quota state is `NORMAL`, and active counts are expected.
+   Confirm deployed browser assets and Durable Objects both speak protocol v4.
 6. Submit a small SAT fixture and confirm `SAT_VERIFIED` plus model cleanup.
 7. Submit a small UNSAT fixture and confirm checked leaf coverage, a
    downloadable LRAT certificate, and the correct certified state.
@@ -29,7 +30,7 @@ Cloudflare Git deployment.
 | Signal | Action |
 | --- | --- |
 | `quota.state = NEAR_LIMIT` | Lower `MAX_ACTIVE_JOBS`; inspect assignments, Workers KV operations, and DO request/duration trends |
-| Job socket 503s | Confirm genuine concurrency, reconnect storms, and the 60-second heartbeat interval before raising `MAX_JOB_CONNECTIONS` |
+| Job socket 503s | Confirm genuine concurrency, reconnect storms, and one 60-second session heartbeat—not one per slot—before raising `MAX_JOB_CONNECTIONS` |
 | Directory socket 503s | Keep client backoff; inspect one-shot sockets and handoff latency before raising `MAX_DIRECTORY_CONNECTIONS` |
 | Workers KV operation or byte trend unsafe | Disable `FEATURE_PUBLIC_JOBS` first; existing jobs still expire |
 | DO request/duration trend unsafe | Disable `FEATURE_PUBLIC_SWARM`; preserve public status and cleanup |
@@ -37,6 +38,46 @@ Cloudflare Git deployment.
 
 Never shorten evidence verification, skip hashes, accept consensus as UNSAT,
 or raise limits without a revised load projection.
+
+Workers KV is required; R2 is unsupported and must not be configured. Reject
+formulas above 5 MiB compressed, 2,000,000 variables/literal occurrences, or
+1,000,000 clauses. Those count caps limit canonical `HiveCnfV1` to 12,000,020
+bytes (about 11.45 MiB); 32 MiB is the defensive decoder ceiling. Preserve
+immutable job-scoped keys, and investigate cache-hit rate and orphan cleanup
+when KV byte trends are unsafe.
+Cloudflare Queues are likewise not a fallback lease dispatcher; the job Durable
+Object must remain the only authority for slots, leases, splits, and
+cancellation.
+
+## Large-instance stability checks
+
+Use durable state and message rates, not rapidly changing UI counters, to
+diagnose a job:
+
+1. Confirm `HELLO` declared stable slot IDs and that
+   `WELCOME.activeLeases` contained both resumed leases and newly persisted
+   initial idle-slot assignments. Subsequent assignments should arrive as
+   pushed `WORK` messages.
+2. Confirm one `SESSION_HEARTBEAT` arrives per connected session per minute and
+   includes each active slot. A two-slot session should not produce two
+   independent heartbeat timers.
+3. Confirm advancing active-compute counters roll deadlines five minutes ahead,
+   never beyond 60 minutes from lease issue or job expiry.
+4. Confirm an expired lease returns its task to `READY` regardless of
+   `leaseCount`; there is no retry-ceiling transition to `UNKNOWN`.
+5. When capacity is idle, confirm the durable frontier tends toward
+   `min(2 × connected slots, 16)` and that split permits appear only after at
+   least one second of active search. Depth 64 and 10,000 tasks are hard caps.
+6. When a split is no longer useful, confirm `SPLIT_NOT_NEEDED` leaves the
+   original lease active. A missing permit must not cause the browser to yield.
+7. On the first valid UNSAT candidate, confirm the same cube enters proof
+   finishing and is pushed only to a proof-capable worker. LRAT verification,
+   not a second browser report, is the certification boundary.
+
+If `/jobs` counters flicker, verify the browser rejects older observations and
+state regressions and polls single-flight every 30 seconds. A transient 5xx or
+network error must retain the last known state; only `JOB_NOT_FOUND`/404 marks
+a local history record unavailable.
 
 ## Suspected abuse
 

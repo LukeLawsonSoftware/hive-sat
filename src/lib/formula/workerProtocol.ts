@@ -26,7 +26,6 @@ export type FormulaWorkerResponse =
       requestId: string;
       metadata: FormulaMetadata;
       encoded: ArrayBuffer;
-      batches: Int32Array[];
     }
   | { type: "cancelled"; requestId: string }
   | {

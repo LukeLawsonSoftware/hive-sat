@@ -51,7 +51,11 @@ describe("strict DIMACS parsing", () => {
     expect(updates).toEqual([10]);
   });
 
-  it("rejects declarations that cannot fit in the encoded limit", async () => {
-    await expect(parseDimacsText("p cnf 0 8388604\n")).rejects.toThrow(/encoded limit/i);
+  it("rejects declarations above the public clause ceiling", async () => {
+    await expect(parseDimacsText("p cnf 0 1000001\n")).rejects.toThrow(/1,000,000 clause limit/i);
+  });
+
+  it("rejects a variable declaration before it can drive oversized allocations", async () => {
+    await expect(parseDimacsText("p cnf 2000001 0\n")).rejects.toThrow(/2,000,000 variable limit/i);
   });
 });

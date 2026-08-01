@@ -5,7 +5,12 @@ import {
   type CreateJobInput,
   type FormulaDeclaration,
 } from "./contracts";
-import { PUBLIC_JOB_PROTOCOL_VERSION } from "../shared/public-jobs";
+import {
+  MAX_PUBLIC_JOB_CLAUSES,
+  MAX_PUBLIC_JOB_LITERAL_OCCURRENCES,
+  MAX_PUBLIC_JOB_VARIABLES,
+  PUBLIC_JOB_PROTOCOL_VERSION,
+} from "../shared/public-jobs";
 import { hmacSha256Hex, randomToken, sha256Hex } from "./crypto";
 import { JobCoordinatorDO } from "./job-coordinator";
 import { SwarmDirectoryDO } from "./swarm-directory";
@@ -124,9 +129,9 @@ function parseFormula(value: unknown): FormulaDeclaration {
   if (
     typeof declaration.hash !== "string" ||
     !SHA256_PATTERN.test(declaration.hash) ||
-    !positiveInteger(declaration.variableCount, 0xffff_ffff) ||
-    !positiveInteger(declaration.clauseCount, 0xffff_ffff) ||
-    !positiveInteger(declaration.literalCount, 2_000_000) ||
+    !positiveInteger(declaration.variableCount, MAX_PUBLIC_JOB_VARIABLES) ||
+    !positiveInteger(declaration.clauseCount, MAX_PUBLIC_JOB_CLAUSES) ||
+    !positiveInteger(declaration.literalCount, MAX_PUBLIC_JOB_LITERAL_OCCURRENCES) ||
     !positiveInteger(declaration.encodedBytes, MAX_ENCODED_FORMULA_BYTES) ||
     !positiveInteger(declaration.compressedBytes, MAX_COMPRESSED_FORMULA_BYTES) ||
     declaration.encodedBytes < 20 ||
@@ -232,7 +237,14 @@ async function createJob(request: Request, env: Env): Promise<Response> {
     hmacSha256Hex(requiredString(env.NETWORK_DIGEST_KEY, "NETWORK_DIGEST_KEY"), remoteIp),
     sha256Hex(input.turnstileToken),
   ]);
-  if (!await directoryStub(env).consumeTurnstile(
+  // Cloudflare's documented development test widget returns a reusable dummy
+  // token. Keep replay protection unchanged everywhere except a localhost-like
+  // development request that has no Cloudflare client IP, otherwise one manual
+  // submission makes every later local browser test fail for 24 hours.
+  const localTestChallenge = env.ENVIRONMENT === "development" &&
+    ["unknown", "127.0.0.1", "::1"].includes(remoteIp) &&
+    env.TURNSTILE_SITE_KEY === "1x00000000000000000000AA";
+  if (!localTestChallenge && !await directoryStub(env).consumeTurnstile(
     turnstileDigest,
     Date.now() + TURNSTILE_REPLAY_RETENTION_MS,
   )) {
@@ -260,6 +272,7 @@ async function createJob(request: Request, env: Env): Promise<Response> {
     createdAt,
     expiresAt,
     globalCeiling,
+    bypassCreationRateLimit: localTestChallenge,
   });
   if (!admission.ok) {
     const status = admission.code === "GLOBAL_JOB_LIMIT" ? 503 : 429;

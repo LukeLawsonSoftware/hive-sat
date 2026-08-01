@@ -1,85 +1,127 @@
-# Coordinator leasing protocol
+# Coordinator leasing protocol v4
 
-Phase 5 adds the versioned, hibernating WebSocket protocol at
-`GET /api/v1/jobs/{jobId}/socket`. The stateless Worker validates the job and
-the WebSocket upgrade before forwarding the connection to that job's
-`JobCoordinatorDO`.
+The hibernating WebSocket protocol is served at
+`GET /api/v1/jobs/{jobId}/socket`. The stateless Worker validates the upgrade
+and forwards it to that job's `JobCoordinatorDO`, which is the single authority
+for slots, tasks, leases, split coverage, and terminal state.
 
-## Connection lifecycle
+## Connection and slot lifecycle
 
-Every JSON control message contains `protocolVersion`, `messageId`, and
-`jobId`. Task-scoped messages also contain `taskId` and `leaseId`. Both browser
-and coordinator validate the discriminated unions at runtime and reject an
-unsupported protocol with `UPGRADE_REQUIRED`.
+Every JSON control message contains `protocolVersion: 4`, `messageId`, and
+`jobId`. Task mutations also contain `slotId`, `taskId`, and `leaseId`. Both
+directions use bounded runtime validation; a different protocol version fails
+with `UPGRADE_REQUIRED`.
 
-The first client message must be `HELLO`, containing a stable reconnect
-`sessionId` and bounded `WorkerCapabilities`. The coordinator replies with
-`WELCOME`, including any unexpired leases already owned by that session. A
-browser may then send `REQUEST_WORK`, `HEARTBEAT`, `SPLIT`, `YIELD`, or
-`RESULT`. Server responses are `WORK`, `NO_WORK`, `ACK`, `ERROR`, and
-`JOB_CANCELLED`.
+The first client message is `HELLO`:
 
-Connections use the Durable Objects WebSocket Hibernation API. The coordinator
-stores the job and session identity in a serialized socket attachment, so it
-does not depend on in-memory connection state after hibernation. Application
-`PING`/`PONG` is configured as a platform auto-response and does not wake a
-hibernated object. Disconnecting a socket does not immediately revoke its
-leases: a browser can reconnect with the same session, while the alarm remains
-the authoritative recovery mechanism.
+- `sessionId` is stable across reconnects;
+- `assignmentId`, when present, binds a public directory assignment;
+- `slotIds` declares the session's stable, bounded worker slots; and
+- `capabilities` includes solver identity, capacity, and proof-generation
+  support.
 
-`JobCoordinatorSocket` is the browser transport. It resends `HELLO` with the
-same session after a disconnect and uses jittered exponential backoff from
-roughly one second to a 30-second cap. An `UPGRADE_REQUIRED` response
-stops reconnection.
+The coordinator replaces an older socket for the same session and reconciles
+its active leases against the declared slots. Before replying, it persists
+initial assignments for any idle declared slots. `WELCOME.activeLeases` then
+carries both resumed and newly assigned leases with their slot IDs. This saves
+an extra frame and lets the browser create every worker handle from the
+authoritative handshake state. Work owned by a slot omitted from the reconnect
+is safely requeued.
 
-## Lease and task rules
+After `HELLO`, normal browser messages are `SESSION_HEARTBEAT`, `SPLIT`,
+`YIELD`, and `RESULT`. The coordinator sends `WORK`, `SPLIT_PERMIT`, `ACK`,
+`ERROR`, `JOB_CANCELLED`, `JOB_SUSPENDED`, or `JOB_RESULT`. After the handshake,
+subsequent assignments are pushed as `WORK` to known idle slots; protocol v4
+has no normal per-slot work-poll loop.
 
-- A `READY` task is atomically changed to `LEASED` and its unpredictable
-  192-bit lease ID is inserted in SQLite before `WORK` is sent.
-- `WORK` includes a bounded queue snapshot: READY tasks, active sessions,
-  1×/3×/8× watermarks, total task count, and `canSplit`. Browsers use it only
-  to decide whether lookahead is useful. The coordinator accepts a split
-  literal—not browser-authored children—and constructs both children itself
-  after enforcing depth 64 and 10,000-task caps.
-- `WORK.task.purpose` distinguishes ordinary search from a fresh
-  `PROOF_FINISHER`. Proof-finisher work cannot split and must enable LRAT before
-  loading clauses.
-- The default lease is 15 minutes, capped by job expiry. Attempts are capped at
-  five. A task whose fifth lease expires becomes `UNKNOWN` instead of being
-  retried indefinitely.
-- Solver work should target about ten minutes. The browser batches its solver
-  counters into one `HEARTBEAT` payload per lease every 60 seconds. Ordinary
-  heartbeats are validated and acknowledged without a SQLite write.
-- One exceptional five-minute extension may be requested in the final two
-  minutes of a lease. That authoritative deadline change is persisted and is
-  still capped by job expiry.
-- `SPLIT` is accepted only from the active lease and creates the exact
-  complementary children `C ∧ l` and `C ∧ ¬l` atomically. `YIELD` closes the
-  lease and returns the task to `READY`.
-- A structurally valid SAT or UNSAT candidate is retained even when its lease
-  has expired or been superseded. Stale `HEARTBEAT`, `SPLIT`, and `YIELD`
-  messages are rejected. Candidate evidence is not a terminal verdict;
-  independent verification remains Phase 7.
+The Durable Objects WebSocket Hibernation API retains a serialized attachment
+containing the job, session, assignment, and slot identities. Application
+`PING`/`PONG` uses a platform auto-response and does not wake a hibernated
+object. An unexpected disconnect retains leases for session resumption and
+leaves the alarm as the recovery authority. An explicit clean client stop is
+authoritative and immediately yields that socket's leases.
 
-Mutating messages and their serialized responses are recorded under
-`(sessionId, messageId)`. Re-delivery returns the original response and cannot
-create a second lease, split, yield, or result row. The table is pruned to a
-bounded recent window by alarms.
+The browser reconnects with capped jittered backoff and the same session and
+slots. `UPGRADE_REQUIRED` is terminal. Mutating client messages retain a stable
+message ID until acknowledged, and the slot remains locally occupied while its
+mutation is in flight. Re-delivery receives the recorded response and cannot
+create a second split, yield, result, or lease transition.
 
-## One earliest-deadline alarm
+## Lease rules
 
-The coordinator keeps one alarm at the earlier of the 24-hour job expiry and
-the earliest active lease deadline. Each invocation recovers at most 64
-expired leases, then schedules an immediate continuation when more are due.
-Otherwise it recomputes the next earliest deadline.
+- The coordinator changes a `READY` task to `LEASED` and inserts an
+  unpredictable 192-bit lease before sending `WORK`.
+- Each lease is bound to exactly one `(sessionId, slotId)`. `WORK.task.purpose`
+  is either ordinary `SEARCH` or a fresh `PROOF_FINISHER`.
+- A lease starts with a five-minute deadline. Once per minute, one
+  `SESSION_HEARTBEAT` reports bounded cumulative counters for all slots. A
+  lease whose `activeMs` advanced receives a rolling five-minute renewal.
+- Renewals are capped at 60 minutes from `issuedAt`, at the split permit's
+  lease deadline where applicable, and at job expiry. A paused or dead client
+  therefore cannot retain a cube indefinitely.
+- Lease expiry, shutdown, or safe yield closes the lease and returns a
+  non-terminal cube to `READY`. `leaseCount` is operational telemetry only;
+  there is no attempt ceiling and churn cannot turn a cube into `UNKNOWN`.
+- A stale progress or tree mutation is rejected. Mathematically decisive,
+  correctly bound evidence may still be checked after a lease race; lease age
+  alone does not make a model or proof false.
 
-At job expiry the same alarm broadcasts cancellation, removes KV artifacts in bounded batches,
-releases directory capacity, and deletes coordinator storage. Owner
-cancellation atomically cancels active leases/tasks, broadcasts
-`JOB_CANCELLED`, and leaves the existing expiry alarm to perform final durable
-cleanup.
+The per-session heartbeat replaces one timer and message exchange per slot.
+It is persisted only when it advances an authoritative lease deadline; metric
+counters themselves are not a stream of task-row updates.
 
-The existing Wrangler namespace migration remains
-`v0001_job_platform` because no Durable Object class was added. Coordinator
-internal migrations remain append-only. The current ledger includes leasing,
-result verification, calibrated profiles, and proof-required artifact state.
+## Coordinator-granted splits
+
+Browsers do not infer queue pressure from a frequently refreshed snapshot.
+The coordinator observes connected slots and the durable frontier and grants a
+short-lived `SPLIT_PERMIT` only when more work is useful:
+
+```text
+target frontier = min(2 × connected slots, 16)
+```
+
+The frontier includes ready tasks, active search leases, and outstanding
+permits. A search lease must have recorded at least one second of active
+compute before it is eligible. A permit is bound to its slot, task, and lease;
+proof-finisher tasks cannot split.
+
+With a permit, the browser calls CaDiCaL `lookahead()` and sends only
+`splitLiteral` plus `permitId`. The coordinator rechecks idle capacity and
+frontier pressure, validates the active lease and literal, and atomically
+constructs the exact children `C ∧ l` and `C ∧ ¬l`. It enforces a depth-64
+cap and 10,000-task cap. If demand disappeared, `SPLIT_NOT_NEEDED` leaves the
+lease running; a transient scheduling decision does not throw useful solver
+state away.
+
+## Result transitions
+
+A SAT result carries a bounded model manifest. The candidate cannot become
+`SAT_VERIFIED` until `ResultVerifierDO` reads the exact KV artifacts, rechecks
+their hashes and encodings, and verifies every cube literal and formula clause.
+
+The first structurally valid UNSAT result changes the same task directly to
+proof-required work. A proof-capable slot receives a new
+`PROOF_FINISHER` lease and reinitializes CaDiCaL with LRAT enabled before the
+formula is loaded. Independent browser agreement is not required and is never
+treated as proof. Only a checked LRAT artifact can certify a leaf; the
+coordinator then propagates completion only through exact complementary
+children.
+
+## Earliest-deadline alarm
+
+One alarm tracks the earliest of job expiry, active lease deadlines, and other
+durable cleanup deadlines. Each invocation recovers at most 64 expired leases,
+cancels their split permits, returns non-terminal tasks to `READY`, dispatches
+new work to connected idle slots, and schedules an immediate continuation when
+more rows are due.
+
+At the 24-hour job expiry, the alarm broadcasts cancellation, deletes bounded
+Workers KV artifact batches, releases directory capacity, and deletes
+coordinator storage. Owner cancellation stops active work immediately and
+leaves the expiry path as the cleanup backstop.
+
+The Wrangler namespace migration remains append-only because protocol v4 does
+not add a Durable Object class. Internal SQLite migrations are likewise
+append-only; see [durable-object-migrations.md](durable-object-migrations.md).
+The design rationale and request estimate are in
+[stability-and-efficiency.md](stability-and-efficiency.md).

@@ -41,13 +41,15 @@ normal cache lifecycle or the user's reset action.
   leaf coverage.
 - `UNSAT_OWNER_VERIFIED` means at least one required proof was checked in the
   submitting owner's browser with the pinned independent checker.
-- `UNKNOWN` means limits, missing evidence, invalid evidence, timeout, or
-  exhausted attempts prevented a certificate. It is never silently displayed
-  as UNSAT.
+- `UNKNOWN` means a hard formula, artifact, verification, or platform safety
+  limit prevented a certificate. Lease churn and ordinary expiry do not spend
+  an attempt budget and cannot create this result. It is never silently
+  displayed as UNSAT.
 
 Anonymous participants are untrusted. Reliability signals contain abuse and
-size leases; they never affect job priority. Equal-service scheduling provides
-no credits, payments, contributor advantage, or account history.
+support operator diagnosis; they never replace model/proof verification or
+affect job priority. Equal-service scheduling provides no credits, payments,
+contributor advantage, or account history.
 
 ## Browser contribution
 
@@ -55,6 +57,11 @@ Public work is opt-in, starts paused, and runs only while the user remains on
 `/swarm`. “Pause when hidden” defaults on. HiveSAT reports configured workers,
 active compute time, solver counters, network bytes, and Wasm allocation. It
 does not claim access to OS-level CPU percentage or process memory.
+
+Local solving on `/` never starts public contribution. `/jobs` and individual
+job pages read status and expose owner controls without starting any solver
+worker. Their visible, non-terminal status polling is single-flight and no more
+frequent than every 30 seconds.
 
 ## No guarantee of service
 

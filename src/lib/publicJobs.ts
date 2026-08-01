@@ -72,16 +72,18 @@ export class PublicJobOwnerStore {
     const database = await this.openRequired();
     try {
       const read = database.transaction(META_STORE, "readonly");
+      const readDone = transactionDone(read);
       const record = await requestResult(
         read.objectStore(META_STORE).get(DEVICE_KEY) as IDBRequest<MetaRecord | undefined>,
       );
-      await transactionDone(read);
+      await readDone;
       if (record) return record.value;
 
       const value = randomDeviceId();
       const write = database.transaction(META_STORE, "readwrite");
+      const writeDone = transactionDone(write);
       write.objectStore(META_STORE).put({ key: DEVICE_KEY, value } satisfies MetaRecord);
-      await transactionDone(write);
+      await writeDone;
       return value;
     } finally {
       database.close();
@@ -92,12 +94,13 @@ export class PublicJobOwnerStore {
     const database = await this.openRequired();
     try {
       const transaction = database.transaction(OWNER_STORE, "readwrite");
+      const done = transactionDone(transaction);
       const store = transaction.objectStore(OWNER_STORE);
       const existing = await requestResult(
         store.get(record.jobId) as IDBRequest<OwnedPublicJobRecord | LegacyOwnerRecord | undefined>,
       );
       store.put(normalizeOwnedRecord({ ...existing, ...record }));
-      await transactionDone(transaction);
+      await done;
     } finally {
       database.close();
     }
@@ -107,10 +110,11 @@ export class PublicJobOwnerStore {
     const database = await this.openRequired();
     try {
       const transaction = database.transaction(OWNER_STORE, "readonly");
+      const done = transactionDone(transaction);
       const record = await requestResult(
         transaction.objectStore(OWNER_STORE).get(jobId) as IDBRequest<OwnedPublicJobRecord | LegacyOwnerRecord | undefined>,
       );
-      await transactionDone(transaction);
+      await done;
       return record && record.expiresAt > Date.now() ? record.ownerToken : null;
     } finally {
       database.close();
@@ -145,6 +149,7 @@ export class PublicJobOwnerStore {
     const database = await this.openRequired();
     try {
       const transaction = database.transaction(OWNER_STORE, "readwrite");
+      const done = transactionDone(transaction);
       const store = transaction.objectStore(OWNER_STORE);
       const raw = await requestResult(
         store.getAll() as IDBRequest<Array<OwnedPublicJobRecord | LegacyOwnerRecord>>,
@@ -157,51 +162,93 @@ export class PublicJobOwnerStore {
         }
         return record;
       });
-      await transactionDone(transaction);
+      await done;
       return records.sort((left, right) => right.createdAt - left.createdAt);
     } finally {
       database.close();
     }
   }
 
-  async updateStatus(status: PublicJobStatus, now = Date.now()): Promise<void> {
-    const existing = await this.get(status.jobId);
-    await this.put({
-      ...(existing ?? normalizeOwnedRecord({
-        jobId: status.jobId,
-        ownerToken: null,
+  async updateStatus(status: PublicJobStatus, observedAt = Date.now()): Promise<boolean> {
+    const database = await this.openRequired();
+    try {
+      const transaction = database.transaction(OWNER_STORE, "readwrite");
+      const done = transactionDone(transaction);
+      const store = transaction.objectStore(OWNER_STORE);
+      const raw = await requestResult(
+        store.get(status.jobId) as IDBRequest<OwnedPublicJobRecord | LegacyOwnerRecord | undefined>,
+      );
+      const existing = raw ? normalizeOwnedRecord(raw) : null;
+      const staleObservation = existing?.lastSyncedAt !== null &&
+        existing?.lastSyncedAt !== undefined && observedAt < existing.lastSyncedAt;
+      const stateRegression = existing?.lastStatus &&
+        !isMonotonicPublicJobStatus(existing.lastStatus, status);
+      if (staleObservation || stateRegression) {
+        await done;
+        return false;
+      }
+      store.put({
+        ...(existing ?? normalizeOwnedRecord({
+          jobId: status.jobId,
+          ownerToken: null,
+          expiresAt: status.expiresAt,
+        })),
+        formula: status.formula,
+        createdAt: status.createdAt,
         expiresAt: status.expiresAt,
-      })),
-      formula: status.formula,
-      createdAt: status.createdAt,
-      expiresAt: status.expiresAt,
-      lastStatus: status,
-      lastSyncedAt: now,
-      terminalAt: isTerminalPublicJobState(status.state)
-        ? existing?.terminalAt ?? now
-        : null,
-      unavailable: false,
-      ownerToken: status.expiresAt > now ? existing?.ownerToken ?? null : null,
-    });
+        lastStatus: status,
+        lastSyncedAt: observedAt,
+        terminalAt: isTerminalPublicJobState(status.state)
+          ? existing?.terminalAt ?? observedAt
+          : null,
+        unavailable: false,
+        ownerToken: status.expiresAt > observedAt ? existing?.ownerToken ?? null : null,
+      });
+      await done;
+      return true;
+    } finally {
+      database.close();
+    }
   }
 
-  async markUnavailable(jobId: string, now = Date.now()): Promise<void> {
-    const existing = await this.get(jobId);
-    if (!existing) return;
-    await this.put({
-      ...existing,
-      ownerToken: existing.expiresAt > now ? existing.ownerToken : null,
-      unavailable: true,
-      lastSyncedAt: now,
-    });
+  async markUnavailable(jobId: string, observedAt = Date.now()): Promise<boolean> {
+    const database = await this.openRequired();
+    try {
+      const transaction = database.transaction(OWNER_STORE, "readwrite");
+      const done = transactionDone(transaction);
+      const store = transaction.objectStore(OWNER_STORE);
+      const raw = await requestResult(
+        store.get(jobId) as IDBRequest<OwnedPublicJobRecord | LegacyOwnerRecord | undefined>,
+      );
+      if (!raw) {
+        await done;
+        return false;
+      }
+      const existing = normalizeOwnedRecord(raw);
+      if (existing.lastSyncedAt !== null && observedAt < existing.lastSyncedAt) {
+        await done;
+        return false;
+      }
+      store.put({
+        ...existing,
+        ownerToken: existing.expiresAt > observedAt ? existing.ownerToken : null,
+        unavailable: true,
+        lastSyncedAt: observedAt,
+      });
+      await done;
+      return true;
+    } finally {
+      database.close();
+    }
   }
 
   async removeJob(jobId: string): Promise<void> {
     const database = await this.openRequired();
     try {
       const transaction = database.transaction(OWNER_STORE, "readwrite");
+      const done = transactionDone(transaction);
       transaction.objectStore(OWNER_STORE).delete(jobId);
-      await transactionDone(transaction);
+      await done;
     } finally {
       database.close();
     }
@@ -218,10 +265,11 @@ export class PublicJobOwnerStore {
     const database = await this.openRequired();
     try {
       const transaction = database.transaction(OWNER_STORE, "readonly");
+      const done = transactionDone(transaction);
       const record = await requestResult(
         transaction.objectStore(OWNER_STORE).get(jobId) as IDBRequest<OwnedPublicJobRecord | LegacyOwnerRecord | undefined>,
       );
-      await transactionDone(transaction);
+      await done;
       return record ? normalizeOwnedRecord(record) : null;
     } finally {
       database.close();
@@ -232,8 +280,9 @@ export class PublicJobOwnerStore {
     const database = await this.openRequired();
     try {
       const transaction = database.transaction(OWNER_STORE, "readwrite");
+      const done = transactionDone(transaction);
       transaction.objectStore(OWNER_STORE).put(record);
-      await transactionDone(transaction);
+      await done;
     } finally {
       database.close();
     }
@@ -242,16 +291,38 @@ export class PublicJobOwnerStore {
   private async openRequired(): Promise<IDBDatabase> {
     if (!this.factory) throw new Error("IndexedDB is required to retain anonymous job ownership.");
     const request = this.factory.open(DATABASE_NAME, DATABASE_VERSION);
-    request.onupgradeneeded = () => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(OWNER_STORE)) {
-        database.createObjectStore(OWNER_STORE, { keyPath: "jobId" });
-      }
-      if (!database.objectStoreNames.contains(META_STORE)) {
-        database.createObjectStore(META_STORE, { keyPath: "key" });
-      }
-    };
-    return requestResult(request);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(OWNER_STORE)) {
+          database.createObjectStore(OWNER_STORE, { keyPath: "jobId" });
+        }
+        if (!database.objectStoreNames.contains(META_STORE)) {
+          database.createObjectStore(META_STORE, { keyPath: "key" });
+        }
+      };
+      request.onsuccess = () => {
+        const database = request.result;
+        if (settled) {
+          database.close();
+          return;
+        }
+        settled = true;
+        database.onversionchange = () => database.close();
+        resolve(database);
+      };
+      request.onerror = () => {
+        if (settled) return;
+        settled = true;
+        reject(request.error ?? new Error("IndexedDB could not open job history."));
+      };
+      request.onblocked = () => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("Job history is blocked by another open HiveSAT tab. Close or reload the other tab and try again."));
+      };
+    });
   }
 }
 
@@ -275,13 +346,48 @@ function normalizeOwnedRecord(record: Partial<OwnedPublicJobRecord> & {
 }
 
 export type OwnedJobGroup = "submitted" | "in-progress" | "completed" | "stopped";
+export type OwnedJobListGroup = "active" | "finished";
 
 export function isTerminalPublicJobState(state: PublicJobState): boolean {
   return ["SAT_VERIFIED", "UNSAT_CERTIFIED", "UNSAT_OWNER_VERIFIED", "INVALID", "UNKNOWN", "CANCELLED"].includes(state);
 }
 
-export function ownedJobGroup(record: OwnedPublicJobRecord): OwnedJobGroup {
-  if (record.unavailable || record.expiresAt <= Date.now() && !record.lastStatus) return "stopped";
+const ACTIVE_STATE_ORDER: Partial<Record<PublicJobState, number>> = {
+  UPLOADING: 0,
+  QUEUED: 1,
+  RUNNING: 2,
+};
+
+export function isMonotonicPublicJobStatus(
+  current: PublicJobStatus,
+  incoming: PublicJobStatus,
+): boolean {
+  if (current.jobId !== incoming.jobId) return false;
+  if (current.state === incoming.state) {
+    if (current.uploadedBytes !== null && incoming.uploadedBytes !== null &&
+      incoming.uploadedBytes < current.uploadedBytes) return false;
+    const certificateOrder = {
+      OWNER_CHECK_REQUIRED: 0,
+      SERVER_CERTIFIED: 1,
+      OWNER_VERIFIED: 2,
+    } as const;
+    if (current.certificate && !incoming.certificate) return false;
+    if (current.certificate && incoming.certificate &&
+      certificateOrder[incoming.certificate.verification] < certificateOrder[current.certificate.verification]) {
+      return false;
+    }
+    return true;
+  }
+  if (current.state === "UNSAT_CERTIFIED" && incoming.state === "UNSAT_OWNER_VERIFIED") return true;
+  if (isTerminalPublicJobState(current.state)) return false;
+  if (isTerminalPublicJobState(incoming.state)) return true;
+  return (ACTIVE_STATE_ORDER[incoming.state] ?? -1) >= (ACTIVE_STATE_ORDER[current.state] ?? -1);
+}
+
+export function ownedJobGroup(record: OwnedPublicJobRecord, now = Date.now()): OwnedJobGroup {
+  const expiredWithoutTerminalResult = record.expiresAt <= now &&
+    (!record.lastStatus || !isTerminalPublicJobState(record.lastStatus.state));
+  if (record.unavailable || expiredWithoutTerminalResult) return "stopped";
   const state = record.lastStatus?.state ?? "UPLOADING";
   if (state === "UPLOADING" || state === "QUEUED") return "submitted";
   if (state === "RUNNING") return "in-progress";
@@ -289,8 +395,16 @@ export function ownedJobGroup(record: OwnedPublicJobRecord): OwnedJobGroup {
   return "stopped";
 }
 
-export function publicJobStatusLabel(record: OwnedPublicJobRecord): string {
-  if (record.unavailable) return record.expiresAt <= Date.now() ? "Expired" : "Status unavailable";
+export function ownedJobListGroup(record: OwnedPublicJobRecord, now = Date.now()): OwnedJobListGroup {
+  const badgeGroup = ownedJobGroup(record, now);
+  return badgeGroup === "submitted" || badgeGroup === "in-progress" ? "active" : "finished";
+}
+
+export function publicJobStatusLabel(record: OwnedPublicJobRecord, now = Date.now()): string {
+  if (record.expiresAt <= now && (!record.lastStatus || !isTerminalPublicJobState(record.lastStatus.state))) {
+    return "Expired";
+  }
+  if (record.unavailable) return record.expiresAt <= now ? "Expired" : "Status unavailable";
   const labels: Record<PublicJobState, string> = {
     UPLOADING: "Uploading",
     QUEUED: "Submitted",
@@ -314,13 +428,43 @@ export function publicJobUrl(jobId: string, origin = window.location.origin): st
   return `${origin}/jobs/${encodeURIComponent(jobId)}`;
 }
 
+export class PublicJobApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string | null,
+  ) {
+    super(message);
+    this.name = "PublicJobApiError";
+  }
+}
+
+export function isPublicJobNotFoundError(error: unknown): boolean {
+  return error instanceof PublicJobApiError &&
+    (error.status === 404 || error.code === "JOB_NOT_FOUND");
+}
+
 async function apiJson<T>(response: Response): Promise<T> {
-  const body = await response.json() as unknown;
+  let body: unknown;
+  try {
+    body = await response.json() as unknown;
+  } catch (error) {
+    if (response.ok && response.status !== 204) throw error;
+    body = null;
+  }
   if (!response.ok) {
-    const message = typeof body === "object" && body !== null && "error" in body
-      ? JSON.stringify((body as { error: unknown }).error)
-      : `HTTP ${response.status}`;
-    throw new Error(`HiveSAT public-job request failed: ${message}`);
+    const error = typeof body === "object" && body !== null && "error" in body
+      ? (body as { error: unknown }).error
+      : null;
+    const code = typeof error === "object" && error !== null && "code" in error &&
+      typeof (error as { code: unknown }).code === "string"
+      ? (error as { code: string }).code
+      : null;
+    const message = typeof error === "object" && error !== null && "message" in error &&
+      typeof (error as { message: unknown }).message === "string"
+      ? (error as { message: string }).message
+      : `The server returned HTTP ${response.status}.`;
+    throw new PublicJobApiError(message, response.status, code);
   }
   return body as T;
 }
@@ -378,11 +522,23 @@ export async function submitPublicJob(options: SubmitPublicJobOptions): Promise<
       body: options.cachedFormula.gzip.slice(0),
     }));
   } catch (error) {
-    await fetcher(`/api/v1/jobs/${created.jobId}/cancel`, {
+    const cancelled = await fetcher(`/api/v1/jobs/${created.jobId}/cancel`, {
       method: "POST",
       headers: { authorization: `Bearer ${created.ownerToken}` },
-    }).catch(() => undefined);
-    await ownerStore.markUnavailable(created.jobId).catch(() => undefined);
+    }).then((response) => response.ok).catch(() => false);
+    if (cancelled) {
+      await ownerStore.updateStatus({
+        protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+        jobId: created.jobId,
+        state: "CANCELLED",
+        formula,
+        createdAt: submittedAt,
+        expiresAt: created.expiresAt,
+        uploadedBytes: null,
+        rootTaskState: "CANCELLED",
+        certificate: null,
+      }).catch(() => undefined);
+    }
     throw error;
   }
   const status = await getPublicJob(created.jobId, fetcher).catch(() => null);
@@ -390,8 +546,15 @@ export async function submitPublicJob(options: SubmitPublicJobOptions): Promise<
   return created;
 }
 
-export async function getPublicJob(jobId: string, fetcher: typeof fetch = fetch): Promise<PublicJobStatus> {
-  return apiJson<PublicJobStatus>(await fetcher(`/api/v1/jobs/${encodeURIComponent(jobId)}`));
+export async function getPublicJob(
+  jobId: string,
+  fetcher: typeof fetch = fetch,
+  signal?: AbortSignal,
+): Promise<PublicJobStatus> {
+  return apiJson<PublicJobStatus>(await fetcher(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}`,
+    signal ? { signal } : undefined,
+  ));
 }
 
 export async function cancelPublicJob(
@@ -502,7 +665,8 @@ export async function loadVerifiedPublicFormula(
   const cached = await cache.get(status.formula.hash);
   if (cached) return { ...cached, cacheHit: true, transferredBytes: 0 };
   const response = await fetcher(`/api/v1/jobs/${encodeURIComponent(jobId)}/formula`);
-  if (!response.ok || !response.body) throw new Error("The public formula could not be downloaded.");
+  if (!response.ok) await apiJson<never>(response);
+  if (!response.body) throw new Error("The public formula could not be downloaded.");
   const declaredHeader = response.headers.get("x-hivesat-formula-sha256");
   if (declaredHeader !== status.formula.hash) throw new Error("Formula download metadata does not match job status.");
   if (typeof DecompressionStream === "undefined") throw new Error("This browser cannot decompress public formulas.");

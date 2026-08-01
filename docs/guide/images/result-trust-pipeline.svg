@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="650" viewBox="0 0 1200 650" role="img" aria-labelledby="title desc">
   <title id="title">HiveSAT result trust pipeline</title>
-  <desc id="desc">An anonymous browser proposes SAT or UNSAT. SAT flows through a model upload and independent verifier to SAT verified. UNSAT requires independent repetition and remains a candidate.</desc>
+  <desc id="desc">An anonymous browser proposes SAT or UNSAT. SAT flows through model verification. The first UNSAT candidate goes to a fresh proof finisher and only checked LRAT coverage can certify it.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#11170f"/>
@@ -34,9 +34,9 @@
   <text x="542" y="220" text-anchor="middle" class="small">lease-scoped Workers KV upload</text>
   <rect class="unsat" x="405" y="430" width="275" height="155" rx="16"/>
   <text x="542" y="470" text-anchor="middle" class="title">UNSAT report</text>
-  <text x="542" y="505" text-anchor="middle" class="text">requeue exact same cube</text>
-  <text x="542" y="535" text-anchor="middle" class="small">fresh independent session</text>
-  <text x="542" y="560" text-anchor="middle" class="small">agreement is not a proof</text>
+  <text x="542" y="505" text-anchor="middle" class="text">mark exact cube proof-required</text>
+  <text x="542" y="535" text-anchor="middle" class="small">fresh proof-capable solver</text>
+  <text x="542" y="560" text-anchor="middle" class="small">candidate itself is not a proof</text>
   <path class="line" d="M680 165 L770 165"/>
   <path class="line" d="M680 505 L770 505"/>
   <rect class="sat" x="770" y="90" width="365" height="155" rx="16"/>
@@ -45,9 +45,9 @@
   <text x="952" y="195" text-anchor="middle" class="text">check cube and every clause</text>
   <text x="952" y="222" text-anchor="middle" class="small">only VALID_SAT → SAT_VERIFIED</text>
   <rect class="unsat" x="770" y="430" width="365" height="155" rx="16"/>
-  <text x="952" y="470" text-anchor="middle" class="title">UNSAT_CANDIDATE</text>
-  <text x="952" y="505" text-anchor="middle" class="text">two sessions + exact coverage</text>
-  <text x="952" y="535" text-anchor="middle" class="text">still not a terminal verdict</text>
-  <text x="952" y="562" text-anchor="middle" class="small">a checked proof is required later</text>
+  <text x="952" y="470" text-anchor="middle" class="title">LRAT verifier</text>
+  <text x="952" y="505" text-anchor="middle" class="text">check proof + exact cube binding</text>
+  <text x="952" y="535" text-anchor="middle" class="text">certify leaf only after VALID</text>
+  <text x="952" y="562" text-anchor="middle" class="small">root requires complete split coverage</text>
   <text x="600" y="628" text-anchor="middle" class="small">Malformed, missing, invalid, timed-out, or incomplete evidence always fails closed.</text>
 </svg>

@@ -56,8 +56,6 @@ describe("BrowserSolverClient", () => {
     client.prepare();
     const requestId = formulaWorker.posted[0].message.requestId as string;
     const { encoded, hash } = await fixture();
-    const batch = Int32Array.from([1, 0]);
-
     formulaWorker.emit({
       type: "completed",
       requestId,
@@ -71,7 +69,6 @@ describe("BrowserSolverClient", () => {
         cacheHit: false,
       },
       encoded: encoded.slice().buffer as ArrayBuffer,
-      batches: [batch],
     });
 
     await vi.waitFor(() => expect(client.getSnapshot().phase).toBe("prepared"));
@@ -109,13 +106,11 @@ describe("BrowserSolverClient", () => {
     client.prepare();
     const requestId = formulaWorker.posted[0].message.requestId as string;
     const { encoded, hash } = await fixture();
-    const batch = Int32Array.from([1, 0]);
     formulaWorker.emit({
       type: "completed",
       requestId,
       metadata: { hash, variableCount: 1, clauseCount: 1, literalCount: 1, encodedBytes: encoded.byteLength, compressedBytes: 30, cacheHit: false },
       encoded: encoded.slice().buffer as ArrayBuffer,
-      batches: [batch],
     });
     await vi.waitFor(() => expect(client.getSnapshot().phase).toBe("prepared"));
     client.solveLocally();
@@ -140,13 +135,11 @@ describe("BrowserSolverClient", () => {
     client.prepare();
     const requestId = formulaWorker.posted[0].message.requestId as string;
     const { encoded, hash } = await fixture();
-    const batch = Int32Array.from([1, 0]);
     formulaWorker.emit({
       type: "completed",
       requestId,
       metadata: { hash, variableCount: 1, clauseCount: 1, literalCount: 1, encodedBytes: encoded.byteLength, compressedBytes: 30, cacheHit: false },
       encoded: encoded.slice().buffer as ArrayBuffer,
-      batches: [batch],
     });
     await vi.waitFor(() => expect(client.getSnapshot().phase).toBe("prepared"));
     client.solveLocally();

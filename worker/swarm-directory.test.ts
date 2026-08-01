@@ -1,5 +1,6 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { SWARM_ASSIGNMENT_ACTIVATION_MS } from "../shared/swarm-protocol";
 
 let sequence = 0;
 
@@ -61,6 +62,63 @@ describe("SwarmDirectoryDO fair assignment", () => {
     });
   });
 
+  it("expires an unactivated reservation and rolls back all reserved service", async () => {
+    const { stub, now } = await readyDirectory(1);
+    const before = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{
+        virtual_worker_ms: number;
+        reserved_worker_ms: number;
+        assigned_workers: number;
+      }>(
+        "SELECT virtual_worker_ms, reserved_worker_ms, assigned_workers FROM active_jobs WHERE job_id = 'job-0'",
+      ).one());
+    const assignedAt = now - SWARM_ASSIGNMENT_ACTIVATION_MS - 1;
+    const assignment = await stub.assign("unactivated-session", capabilities(2), undefined, assignedAt);
+    expect(assignment).toMatchObject({ ok: true, jobId: "job-0", workers: 2 });
+    if (!assignment.ok) throw new Error("Expected a pending assignment.");
+
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{
+        status: string;
+        expires_at: number;
+        reserved_worker_ms: number;
+      }>(
+        "SELECT status, expires_at, reserved_worker_ms FROM assignments WHERE assignment_id = ?",
+        assignment.assignmentId,
+      ).one()).toEqual({
+        status: "PENDING",
+        expires_at: assignedAt + SWARM_ASSIGNMENT_ACTIVATION_MS,
+        reserved_worker_ms: assignment.reservedWorkerMs,
+      });
+      expect(state.storage.sql.exec<{
+        virtual_worker_ms: number;
+        reserved_worker_ms: number;
+        assigned_workers: number;
+      }>(
+        "SELECT virtual_worker_ms, reserved_worker_ms, assigned_workers FROM active_jobs WHERE job_id = 'job-0'",
+      ).one()).toEqual({
+        virtual_worker_ms: before.virtual_worker_ms + assignment.reservedWorkerMs,
+        reserved_worker_ms: assignment.reservedWorkerMs,
+        assigned_workers: assignment.workers,
+      });
+    });
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ status: string }>(
+        "SELECT status FROM assignments WHERE assignment_id = ?",
+        assignment.assignmentId,
+      ).one().status).toBe("EXPIRED");
+      expect(state.storage.sql.exec<{
+        virtual_worker_ms: number;
+        reserved_worker_ms: number;
+        assigned_workers: number;
+      }>(
+        "SELECT virtual_worker_ms, reserved_worker_ms, assigned_workers FROM active_jobs WHERE job_id = 'job-0'",
+      ).one()).toEqual(before);
+    });
+  });
+
   it("admits new jobs at the current minimum and rejects forged reconciliation", async () => {
     const { stub, now } = await readyDirectory(1);
     const first = await stub.assign("owner-session", capabilities(1), undefined, now + 1);
@@ -86,6 +144,21 @@ describe("SwarmDirectoryDO fair assignment", () => {
     }, now + 3)).resolves.toEqual({ ok: false, code: "INVALID_ASSIGNMENT" });
   });
 
+  it("accepts idempotent reconciliation after a job cancellation released the assignment", async () => {
+    const { stub, now } = await readyDirectory(1);
+    const first = await stub.assign("cancelled-session", capabilities(2), undefined, now + 1);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    await stub.close(first.jobId);
+    const next = await stub.assign("cancelled-session", capabilities(1), {
+      assignmentId: first.assignmentId,
+      activeWorkerMs: 10_000,
+    }, now + 2);
+
+    expect(next).toEqual({ ok: false, code: "NO_WORK" });
+  });
+
   it("hands an opted-in socket one assignment and closes before coordinator handoff", async () => {
     const { stub } = await readyDirectory(1);
     const response = await stub.fetch("https://hive-sat.test/swarm", {
@@ -103,7 +176,7 @@ describe("SwarmDirectoryDO fair assignment", () => {
     });
     socket.send(JSON.stringify({
       type: "SWARM_HELLO",
-      protocolVersion: 3,
+      protocolVersion: 4,
       messageId: "directory-request",
       sessionId: "browser-session",
       capabilities: capabilities(1),

@@ -17,5 +17,18 @@ describe("independent TypeScript model verification", () => {
     expect(verifySatModel(formula, [1, 2, 4])).toMatchObject({ valid: false, reason: expect.stringMatching(/invalid/i) });
     expect(verifySatModel(formula, [-1, -2, -3])).toMatchObject({ valid: false, clauseIndex: 1 });
   });
-});
 
+  it("rejects unsupported formula metadata before allocating an assignment table", () => {
+    expect(verifySatModel({ variableCount: 2_000_001, clauses: [] }, [])).toMatchObject({
+      valid: false,
+      reason: expect.stringMatching(/variable limit/i),
+    });
+  });
+
+  it("rejects invalid formula literals independently of the parser", () => {
+    expect(verifySatModel({ variableCount: 3, clauses: [[4]] }, [1, 2, 3])).toMatchObject({
+      valid: false,
+      reason: expect.stringMatching(/invalid literal/i),
+    });
+  });
+});

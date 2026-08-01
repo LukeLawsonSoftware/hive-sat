@@ -94,11 +94,11 @@ describe("equal-service virtual worker-time scheduler", () => {
       ...base,
       mobile: true,
       calibratedConflictsPerSecond: 5_000,
-    })).toEqual({ conflictBudget: 50, leaseDurationMs: 600_000 });
+    })).toEqual({ conflictBudget: 50, leaseDurationMs: 300_000 });
     expect(calibratedTaskProfile({
       ...base,
       mobile: false,
       calibratedConflictsPerSecond: 300_000,
-    })).toEqual({ conflictBudget: 200, leaseDurationMs: 1_200_000 });
+    })).toEqual({ conflictBudget: 200, leaseDurationMs: 300_000 });
   });
 });

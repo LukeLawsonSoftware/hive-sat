@@ -22,11 +22,20 @@ materialized:
 | --- | ---: |
 | Compressed input or canonical transfer | 5 MiB |
 | Decompressed DIMACS input | 32 MiB |
-| Uncompressed HiveCnfV1 encoding | 32 MiB |
+| HiveCnfV1 decoder ceiling | 32 MiB |
 | Literal occurrences | 2,000,000 |
+| Declared variables | 2,000,000 |
+| Declared clauses | 1,000,000 |
 
-The decompressed-input limit is separate from the canonical-size limit so large
-comments or whitespace cannot turn a small gzip input into a decompression bomb.
+The decompressed-input limit is separate from the canonical decoder ceiling so
+large comments or whitespace cannot turn a small gzip input into a
+decompression bomb. Count caps make the effective maximum canonical encoding
+much smaller: the 20-byte header plus four bytes for each of 2,000,000 literal
+occurrences and 1,000,000 clause terminators is 12,000,020 bytes (about
+11.45 MiB). The 32 MiB check remains a defensive decoder bound for malformed,
+cached, or network input. Public jobs keep the 5 MiB compressed limit because
+Workers KV is HiveSAT's required artifact store; R2 is not part of the
+architecture.
 
 ## HiveCnfV1 byte layout
 
@@ -58,6 +67,10 @@ worker through the app runtime to the solver worker. Each batch ends at a clause
 terminator as required by the HiveSAT CaDiCaL ABI. CaDiCaL solves in bounded
 conflict slices and yields to the worker event loop between slices, which makes
 pause/cancel messages prompt while retaining solver state for resume.
+Distributed cube workers load a verified formula once and keep the same search
+solver alive across slices. Proof-finisher work is the intentional exception:
+it discards the search instance and creates a fresh proof-capable instance with
+LRAT enabled before any clause is loaded.
 
 For SAT, the app does not trust the solver result alone. It independently checks
 that the returned signed model assigns every declared variable and satisfies

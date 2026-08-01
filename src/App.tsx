@@ -81,7 +81,7 @@ function App() {
   if (route.name === "jobs") return <JobsPage />;
 
   if (route.name === "job") {
-    return <JobPage jobId={route.jobId} />;
+    return <JobPage key={route.jobId} jobId={route.jobId} />;
   }
 
   return (

@@ -92,6 +92,7 @@ export class PublicSwarmRuntime {
     decisions: 0,
     propagations: 0,
     decisiveSatResults: 0,
+    certifiedUnsatResults: 0,
     formulaBytesTransferred: 0,
   };
 
@@ -113,6 +114,16 @@ export class PublicSwarmRuntime {
     this.connectDirectory();
   }
 
+  reconfigureWorkers(workerPreference: number): void {
+    const workers = Math.min(32, Math.max(1, Math.floor(workerPreference)));
+    if (workers === this.options.workerPreference) return;
+    const wasActive = ["directory", "reconnecting", "computing", "no-work"].includes(this.snapshot.phase);
+    if (wasActive) this.pause();
+    this.options.workerPreference = workers;
+    this.update({ ...this.snapshot, capacity: workers });
+    if (wasActive) this.start();
+  }
+
   pause(): void {
     this.integrateWorkerTime();
     if (this.currentAssignmentId) {
@@ -124,7 +135,7 @@ export class PublicSwarmRuntime {
     }
     this.directory?.stop();
     this.directory = null;
-    this.finishCube(false);
+    this.finishCube();
     this.clearRetry();
     this.update({
       ...this.snapshot,
@@ -146,7 +157,7 @@ export class PublicSwarmRuntime {
   }
 
   private connectDirectory(): void {
-    this.finishCube(false);
+    this.finishCube();
     this.update({
       ...this.snapshot,
       phase: "directory",
@@ -219,6 +230,7 @@ export class PublicSwarmRuntime {
       decisions: 0,
       propagations: 0,
       decisiveSatResults: 0,
+      certifiedUnsatResults: 0,
       formulaBytesTransferred: 0,
     };
     this.helpedJobs.add(assignment.jobId);
@@ -227,6 +239,7 @@ export class PublicSwarmRuntime {
     const cube = new DistributedCubeRuntime({
       jobId: assignment.jobId,
       sessionId: this.sessionId,
+      assignmentId: assignment.assignmentId,
       workerPreference: assignment.workers,
       hardwareConcurrency: this.options.hardwareConcurrency,
       mobile: this.options.mobile,
@@ -255,6 +268,8 @@ export class PublicSwarmRuntime {
         Math.max(0, value.propagations - this.observedCube.propagations);
       const decisiveSatResults = this.snapshot.decisiveSatResults +
         Math.max(0, value.decisiveSatResults - this.observedCube.decisiveSatResults);
+      const certifiedUnsatResults = this.snapshot.certifiedUnsatResults +
+        Math.max(0, value.certifiedUnsatResults - this.observedCube.certifiedUnsatResults);
       const formulaBytesTransferred = this.snapshot.formulaBytesTransferred +
         Math.max(0, value.formulaBytesTransferred - this.observedCube.formulaBytesTransferred);
       this.observedCube = {
@@ -264,6 +279,7 @@ export class PublicSwarmRuntime {
         decisions: value.decisions,
         propagations: value.propagations,
         decisiveSatResults: value.decisiveSatResults,
+        certifiedUnsatResults: value.certifiedUnsatResults,
         formulaBytesTransferred: value.formulaBytesTransferred,
       };
       this.update({
@@ -280,6 +296,7 @@ export class PublicSwarmRuntime {
         propagations,
         uniqueJobsHelped: this.helpedJobs.size,
         decisiveSatResults,
+        certifiedUnsatResults,
         formulaBytesTransferred,
         wasmMemoryBytes: value.wasmMemoryBytes,
         wasmMemoryHighWaterBytes: Math.max(
@@ -289,7 +306,10 @@ export class PublicSwarmRuntime {
         message: value.message,
       });
       if (value.phase === "complete" || value.phase === "error") {
-        this.completeAssignment(assignment.assignmentId);
+        this.completeAssignment(
+          assignment.assignmentId,
+          value.phase === "error" ? value.message ?? "The assigned solver failed." : null,
+        );
       }
     });
     this.update({
@@ -307,7 +327,7 @@ export class PublicSwarmRuntime {
     void cube.start();
   }
 
-  private completeAssignment(assignmentId: string): void {
+  private completeAssignment(assignmentId: string, failureMessage: string | null = null): void {
     if (!this.cube) return;
     this.integrateWorkerTime();
     this.previousAssignment = {
@@ -315,8 +335,24 @@ export class PublicSwarmRuntime {
       activeWorkerMs: Math.round(this.assignmentWorkerMs),
     };
     this.currentAssignmentId = null;
-    this.finishCube(true);
-    if (this.snapshot.phase !== "paused") this.connectDirectory();
+    this.finishCube();
+    if (this.snapshot.phase === "paused") return;
+    if (!failureMessage) {
+      this.connectDirectory();
+      return;
+    }
+    this.update({
+      ...this.snapshot,
+      phase: "reconnecting",
+      jobId: null,
+      activeWorkers: 0,
+      currentTaskId: null,
+      message: `${failureMessage} Retrying in 30 seconds…`,
+    });
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (this.snapshot.phase === "reconnecting") this.connectDirectory();
+    }, 30_000);
   }
 
   private integrateWorkerTime(): void {
@@ -334,13 +370,16 @@ export class PublicSwarmRuntime {
     }
   }
 
-  private finishCube(stop: boolean): void {
+  private finishCube(): void {
     if (this.assignmentTimer !== null) clearTimeout(this.assignmentTimer);
     this.assignmentTimer = null;
     this.unsubscribeCube?.();
     this.unsubscribeCube = null;
-    if (stop) this.cube?.stop();
-    else this.cube?.pause();
+    // PublicSwarmRuntime never reuses a completed assignment runtime. Yield
+    // leased tasks first, then terminate its workers so pausing/reconfiguring
+    // cannot leak Web Workers or Wasm memories in the background.
+    this.cube?.pause();
+    this.cube?.stop();
     this.cube = null;
     this.lastActiveWorkers = 0;
     this.lastIntegratedAt = 0;

@@ -1,6 +1,11 @@
 import type { TaskState } from "./coordinator-protocol";
 
-export const PUBLIC_JOB_PROTOCOL_VERSION = 3 as const;
+export const PUBLIC_JOB_PROTOCOL_VERSION = 4 as const;
+export const MAX_PUBLIC_JOB_COMPRESSED_FORMULA_BYTES = 5 * 1024 * 1024;
+export const MAX_PUBLIC_JOB_ENCODED_FORMULA_BYTES = 32 * 1024 * 1024;
+export const MAX_PUBLIC_JOB_VARIABLES = 2_000_000;
+export const MAX_PUBLIC_JOB_CLAUSES = 1_000_000;
+export const MAX_PUBLIC_JOB_LITERAL_OCCURRENCES = 2_000_000;
 
 export type PublicJobState =
   | "UPLOADING"

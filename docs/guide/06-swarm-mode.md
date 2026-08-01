@@ -59,7 +59,7 @@ a web page cannot accurately inspect the operating system process.
 | Metric | Source | Exact meaning |
 | --- | --- | --- |
 | Configured capacity | local preference and conservative device detection | maximum Dedicated Workers HiveSAT may create |
-| Active workers | cube-runtime slots with a current task | workers currently holding a cube |
+| Active workers | stable slots with a lease or unacknowledged transition | work the browser or coordinator still owns |
 | Active compute time | active worker count integrated over elapsed time | worker-weighted wall time, not elapsed page time |
 | Conflicts, decisions, propagations | CaDiCaL ABI counters | cumulative solver operations reported by worker messages |
 | Conflict throughput | conflicts divided by active worker-seconds | work rate during actual compute |
@@ -67,7 +67,7 @@ a web page cannot accurately inspect the operating system process.
 | Results returned | SAT/UNSAT result messages | cubes that produced a candidate result |
 | Unique jobs helped | local set of assigned public job IDs | jobs touched during this page session |
 | Verified SAT contribution | coordinator `JOB_RESULT: SAT_VERIFIED` | this session's candidate became a checked public answer |
-| Certified UNSAT contribution | proof-backed terminal message | zero until proof-carrying UNSAT exists |
+| Certified UNSAT contribution | reserved proof-attribution counter | currently remains zero because the runtime does not attribute certified proof completion to a session |
 | Formula bytes transferred | network cache misses only | compressed formula bytes downloaded from Workers KV |
 | Wasm allocation now | `HIVESAT_MEMORY_BYTES` | current Wasm linear-memory allocation across solver workers |
 | Wasm high-water | `HIVESAT_MEMORY_HIGH_WATER_BYTES` | highest observed Wasm allocation, not browser-process RAM |
@@ -79,10 +79,10 @@ progress messages from double-counting work.
 
 ## Session and device-lifetime totals
 
-Live session totals originate in the in-memory external store and are
-checkpointed to a `current-session` IndexedDB record so a route change or
-reload does not erase them. Device-lifetime totals use a second record in the
-same small database, named `hivesat-swarm-stats`.
+Live session totals originate in the in-memory external store and cover the
+current page runtime; leaving the route or reloading starts a new displayed
+session. Device-lifetime totals are accumulated separately in the
+`hivesat-swarm-stats` IndexedDB database.
 
 The database contains aggregate numbers, not formulas, models, task trees, or
 contributor identities. **Reset local totals** overwrites those aggregates with
@@ -98,14 +98,30 @@ resource ceiling and the size of a directory reservation.
 
 ## The rolling activity graph
 
-Every five seconds, the page appends the directory's aggregate active-worker
+Every five seconds, the page appends this browser's local active leased-slot
 count to a bounded 24-point series. Old points fall off. The chart answers “is
-the swarm quiet or active?” without exposing a search tree, cube topology, job
-formula, session identity, or unbounded history.
+this browser quiet or active?” without exposing a search tree, cube topology,
+job formula, session identity, or unbounded history.
 
 This is intentionally the only graph. A live search-tree visualization would
 be expensive, easy to misinterpret, and would encourage high-frequency
 coordinator messages that conflict with the sparse protocol.
+
+## Stable display and separate status polling
+
+The runtime does not clear a slot when it first sends `SPLIT`, `YIELD`, or
+`RESULT`. It keeps the stable slot/task pair visible until the coordinator ACKs
+the mutation, then accepts coordinator-pushed `WORK` for that slot. That
+ownership rule removes the premature-release race that caused much of the
+brief one/two-worker flicker. The counter can still change after an
+acknowledged assignment transition.
+
+The `/jobs` list and individual `/jobs/:jobId` pages are separate status and
+owner experiences and never start this contribution runtime. They issue at
+most one status request every 30 seconds while visible and non-terminal, abort
+stale requests, and reject older observations or state regressions. Network
+latency can delay a label, but an older response cannot move a completed job
+back to running.
 
 ## Mobile and accessibility behavior
 
@@ -128,13 +144,16 @@ Imagine a desktop configured for two workers:
 
 1. The user opens `/swarm`; status is **Paused**, workers are `0 / 2`.
 2. They press **Start contributing**.
-3. The directory assigns job `abc…` for an hour and closes its socket.
-4. The job coordinator leases two cubes. The page shows `2 / 2`, their current
+3. The directory creates a five-minute pending handoff for job `abc…` and
+   closes its socket.
+4. The coordinator activates that handoff from `HELLO`, starting the one-hour
+   quantum, and leases two cubes. The page shows `2 / 2`, their current
    task, and increasing CaDiCaL counters.
-5. One cube yields after its budget. `Cubes accepted` stays cumulative while a
-   new cube is leased.
-6. The user switches tabs. Both cubes yield safely and status becomes
-   **Throttled while hidden**.
+5. One cube receives a split permit after useful compute and creates two exact
+   children. `Cubes accepted` stays cumulative while the coordinator pushes
+   replacement work to the now-idle slot.
+6. The user switches tabs. Both cubes yield safely; their slots remain visible
+   until ACK, then status becomes **Throttled while hidden**.
 7. They return. The browser reports actual worker-time to the directory and
    receives the next fair assignment.
 8. A SAT model from this browser passes `ResultVerifierDO`. Only then does

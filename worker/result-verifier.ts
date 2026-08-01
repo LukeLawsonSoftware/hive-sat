@@ -9,8 +9,13 @@ import {
   type UnsatProofManifest,
 } from "../shared/result-manifest";
 import { verifyTextLrat } from "../shared/lrat-check";
+import {
+  MAX_PUBLIC_JOB_CLAUSES,
+  MAX_PUBLIC_JOB_LITERAL_OCCURRENCES,
+  MAX_PUBLIC_JOB_VARIABLES,
+} from "../shared/public-jobs";
+import { MAX_ENCODED_FORMULA_BYTES } from "./contracts";
 
-const MAX_ENCODED_FORMULA_BYTES = 32 * 1024 * 1024;
 const MAX_LITERAL_CHECKS = 2_000_064;
 const HIVECNF_MAGIC = Uint8Array.from([0x48, 0x49, 0x56, 0x45, 0x43, 0x4e, 0x46, 0x31]);
 
@@ -99,7 +104,9 @@ function decodeHiveCnfV1(bytes: Uint8Array): DecodedFormula {
   const variableCount = view.getUint32(8, true);
   const clauseCount = view.getUint32(12, true);
   const literalCount = view.getUint32(16, true);
-  if (literalCount > 2_000_000 || bytes.byteLength !== 20 + (literalCount + clauseCount) * 4) {
+  if (variableCount > MAX_PUBLIC_JOB_VARIABLES || clauseCount > MAX_PUBLIC_JOB_CLAUSES ||
+    literalCount > MAX_PUBLIC_JOB_LITERAL_OCCURRENCES ||
+    bytes.byteLength !== 20 + (literalCount + clauseCount) * 4) {
     throw new Error("HiveCnfV1 length metadata is invalid.");
   }
   const clauses: number[][] = [];
@@ -125,7 +132,34 @@ function decodeHiveCnfV1(bytes: Uint8Array): DecodedFormula {
 }
 
 export class ResultVerifierDO extends DurableObject<Env> {
+  private readonly satInFlight = new Map<string, Promise<VerifySatResult>>();
+  private readonly unsatInFlight = new Map<string, Promise<VerifyUnsatResult>>();
+
   async verifySat(input: VerifySatInput): Promise<VerifySatResult> {
+    const key = `sat:${JSON.stringify({
+      artifactSha256: input.manifest.artifactSha256,
+      formulaHash: input.manifest.formulaHash,
+      taskId: input.manifest.taskId,
+      pathHash: input.manifest.pathHash,
+      expectedCube: input.expectedCube,
+      expectedVariableCount: input.expectedVariableCount,
+      maxLiteralChecks: input.maxLiteralChecks,
+    })}`;
+    let pending = this.satInFlight.get(key);
+    if (!pending) {
+      pending = (async () => {
+        const cached = await this.ctx.storage.get<VerifySatResult>(key);
+        if (cached) return cached;
+        const result = await this.verifySatOnce(input);
+        await this.ctx.storage.put(key, result);
+        return result;
+      })();
+      this.satInFlight.set(key, pending);
+    }
+    return pending;
+  }
+
+  private async verifySatOnce(input: VerifySatInput): Promise<VerifySatResult> {
     let artifact: Uint8Array;
     try {
       artifact = await collectBounded(input.modelStream, MAX_SAT_MODEL_ARTIFACT_BYTES, "SAT model");
@@ -211,6 +245,32 @@ export class ResultVerifierDO extends DurableObject<Env> {
   }
 
   async verifyUnsat(input: VerifyUnsatInput): Promise<VerifyUnsatResult> {
+    const key = `unsat:${JSON.stringify({
+      artifactSha256: input.manifest.artifactSha256,
+      formulaHash: input.manifest.formulaHash,
+      taskId: input.manifest.taskId,
+      pathHash: input.manifest.pathHash,
+      expectedCube: input.expectedCube,
+      maxCompressedBytes: input.maxCompressedBytes,
+      maxDecompressedBytes: input.maxDecompressedBytes,
+      maxDerivedClauses: input.maxDerivedClauses,
+      maxHints: input.maxHints,
+    })}`;
+    let pending = this.unsatInFlight.get(key);
+    if (!pending) {
+      pending = (async () => {
+        const cached = await this.ctx.storage.get<VerifyUnsatResult>(key);
+        if (cached) return cached;
+        const result = await this.verifyUnsatOnce(input);
+        await this.ctx.storage.put(key, result);
+        return result;
+      })();
+      this.unsatInFlight.set(key, pending);
+    }
+    return pending;
+  }
+
+  private async verifyUnsatOnce(input: VerifyUnsatInput): Promise<VerifyUnsatResult> {
     if (!equalCube(input.manifest.cube, input.expectedCube)) {
       return { status: "INVALID_PROOF", reason: "The proof is not bound to the expected cube." };
     }

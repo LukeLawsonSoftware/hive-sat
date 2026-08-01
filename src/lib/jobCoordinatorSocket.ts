@@ -13,6 +13,8 @@ export type CoordinatorWebSocket = Pick<WebSocket, "readyState" | "send" | "clos
 export interface CoordinatorSocketOptions {
   jobId: string;
   sessionId: string;
+  assignmentId?: string;
+  slotIds: string[];
   capabilities: WorkerCapabilities;
   url?: string;
   webSocketFactory?: (url: string) => CoordinatorWebSocket;
@@ -24,6 +26,8 @@ export interface CoordinatorSocketOptions {
 
 const MIN_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
+const CLIENT_CONNECTION_ERROR_CLOSE_CODE = 4001;
+const CLIENT_PROTOCOL_ERROR_CLOSE_CODE = 4002;
 
 export function coordinatorReconnectDelayMs(attempt: number, random = Math.random): number {
   const exponent = Math.min(Math.max(0, attempt), 10);
@@ -88,6 +92,8 @@ export class JobCoordinatorSocket {
         messageId: crypto.randomUUID(),
         jobId: this.options.jobId,
         sessionId: this.options.sessionId,
+        ...(this.options.assignmentId ? { assignmentId: this.options.assignmentId } : {}),
+        slotIds: [...this.options.slotIds],
         capabilities: this.options.capabilities,
       };
       socket.send(JSON.stringify(hello));
@@ -127,7 +133,7 @@ export class JobCoordinatorSocket {
     });
     socket.addEventListener("error", () => {
       if (this.socket === socket && socket.readyState < WebSocket.CLOSING) {
-        socket.close(1011, "Connection error");
+        socket.close(CLIENT_CONNECTION_ERROR_CLOSE_CODE, "Connection error");
       }
     });
   }
@@ -135,7 +141,7 @@ export class JobCoordinatorSocket {
   private protocolError(socket: CoordinatorWebSocket, code: "INVALID_MESSAGE" | "UPGRADE_REQUIRED" | "JOB_MISMATCH"): void {
     this.options.onProtocolError?.(code);
     if (code === "UPGRADE_REQUIRED") this.stopped = true;
-    if (socket.readyState < WebSocket.CLOSING) socket.close(1008, code);
+    if (socket.readyState < WebSocket.CLOSING) socket.close(CLIENT_PROTOCOL_ERROR_CLOSE_CODE, code);
   }
 
   private scheduleReconnect(): void {

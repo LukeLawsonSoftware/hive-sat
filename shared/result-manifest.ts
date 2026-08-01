@@ -1,3 +1,8 @@
+import {
+  MAX_PUBLIC_JOB_CLAUSES,
+  MAX_PUBLIC_JOB_VARIABLES,
+} from "./public-jobs";
+
 export const SAT_MODEL_ARTIFACT_VERSION = 1 as const;
 export const MAX_SAT_MODEL_ARTIFACT_BYTES = 512 * 1024;
 export const UNSAT_PROOF_ARTIFACT_VERSION = 1 as const;
@@ -93,6 +98,7 @@ export function parseResultManifest(value: unknown): ResultManifest | null {
       !Number.isSafeInteger(value.decompressedBytes) || Number(value.decompressedBytes) < 1 ||
       Number(value.decompressedBytes) > MAX_UNSAT_PROOF_DECOMPRESSED_BYTES ||
       !Number.isSafeInteger(value.originalClauseCount) || Number(value.originalClauseCount) < 0 ||
+      Number(value.originalClauseCount) > MAX_PUBLIC_JOB_CLAUSES ||
       !Array.isArray(value.cubeClauseIds) || value.cubeClauseIds.length !== common.cube.length ||
       !value.cubeClauseIds.every((id, index) =>
         Number.isSafeInteger(id) && id === Number(value.originalClauseCount) + index + 1) ||
@@ -121,7 +127,7 @@ export function parseResultManifest(value: unknown): ResultManifest | null {
     Number(value.artifactBytes) > MAX_SAT_MODEL_ARTIFACT_BYTES ||
     !Number.isSafeInteger(value.variableCount) ||
     Number(value.variableCount) < 0 ||
-    Number(value.variableCount) > 2_000_000
+    Number(value.variableCount) > MAX_PUBLIC_JOB_VARIABLES
   ) return null;
   return {
     kind: value.kind,

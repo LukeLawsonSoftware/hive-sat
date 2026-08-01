@@ -60,17 +60,28 @@ sequenceDiagram
   B->>D: "SWARM_HELLO + capacity + prior actual time"
   D->>D: "Reconcile previous reservation"
   D->>D: "Choose smallest virtual runtime"
-  D-->>B: "One-hour assignment reservation"
+  D-->>B: "Five-minute PENDING handoff"
   D--xB: "Close directory socket"
-  B->>J: "Open selected job socket"
-  B->>J: "Request and solve cubes"
+  B->>J: "Open selected job socket; HELLO with stable slots"
+  J->>D: "Activate assignment"
+  D-->>J: "One-hour ACTIVE quantum"
+  J-->>B: "WELCOME with persisted initial/resumed leases"
+  J-->>B: "Later WORK pushes for newly idle slots"
   B--xJ: "Quantum ends, pause, or job finishes"
   B->>D: "Reconnect with measured active worker-ms"
 ```
 
-The directory reserves the full hour-scale quantum immediately. This prevents
-many simultaneous browsers from all observing the same job as unserved. When a
-browser returns, the reservation is replaced by actual active worker time:
+The directory initially creates a five-minute `PENDING` handoff. It
+tentatively reserves the offered capacity and hour-scale worker-time charge so
+many simultaneous browsers cannot all observe the same job as unserved. The
+browser must reach the selected coordinator and include the assignment ID in
+`HELLO` during those five minutes. The coordinator activates it through the
+directory, which starts the one-hour `ACTIVE` quantum.
+
+If a pending handoff expires before activation, the directory releases its
+worker capacity and fully refunds the tentative virtual-runtime charge. Once
+active, the reservation is replaced by measured active worker time when the
+browser returns:
 
 ```text
 new virtual runtime
@@ -79,10 +90,11 @@ new virtual runtime
   + bounded actual worker time
 ```
 
-If the browser never returns, the reservation remains charged when it expires.
-That conservative choice prevents churn from repeatedly taking free turns.
-If it returns after doing no work, its job's recent-service timestamp breaks
-the tie so another equal job gets the next assignment.
+If an activated browser never returns to reconcile, the hour reservation
+remains charged when it expires. That conservative choice prevents churn from
+repeatedly taking free turns. If it returns after doing no work, its job's
+recent-service timestamp breaks the tie so another equal job gets the next
+assignment.
 
 ## New jobs, aging, and concurrency
 
@@ -103,22 +115,24 @@ together:
 2. bounded aging ensures progress;
 3. the concurrency ceiling spreads simultaneous capacity.
 
-## Capability changes size, never importance
+## Capability changes local slices, never importance
 
-A browser may report a local calibration such as conflicts per second. HiveSAT
-turns that into a bounded work profile:
+A browser may report local calibration such as conflicts per second. HiveSAT
+may use that to choose a conservative per-call conflict slice, but it does not
+change scheduling weight or lease ownership:
 
-| Device profile | Conflict slice | Target lease |
-| --- | ---: | ---: |
-| mobile or below 10k conflicts/s | 50 conflicts | 10 minutes |
-| ordinary/unknown | 100 conflicts | 15 minutes |
-| at least 200k conflicts/s | 200 conflicts | 20 minutes |
+| Device profile | Conflict slice |
+| --- | ---: |
+| mobile or below 10k conflicts/s | 50 conflicts |
+| ordinary/unknown | 100 conflicts |
+| at least 200k conflicts/s | 200 conflicts |
 
-Faster devices receive larger slices and a longer lease so they do not spend
-extra time on handshakes. Slower or mobile devices get smaller slices and
-earlier recovery. The fair-job selection function never receives the
-calibration value, contributor history, device identity, or owner identity.
-It sees only virtual worker time, wait age, and current job concurrency.
+All slots receive the same five-minute rolling lease, renewed by the one-minute
+session heartbeat and capped at 60 minutes from issue. Faster devices can do
+more work inside that tenure, but they do not receive priority. The fair-job
+selection function never receives calibration, contributor history, device
+identity, or owner identity. It sees only virtual worker time, wait age, and
+current job concurrency.
 
 ## What happens when no job is ready?
 

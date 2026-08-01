@@ -2,13 +2,17 @@ import { PUBLIC_JOB_PROTOCOL_VERSION } from "./public-jobs";
 import { parseResultManifest, type ResultManifest } from "./result-manifest";
 
 export const COORDINATOR_HEARTBEAT_INTERVAL_MS = 60_000;
-export const COORDINATOR_LEASE_DURATION_MS = 15 * 60_000;
-export const COORDINATOR_LEASE_EXTENSION_MS = 5 * 60_000;
+export const COORDINATOR_LEASE_DURATION_MS = 5 * 60_000;
+export const COORDINATOR_LEASE_RENEW_THRESHOLD_MS = 3 * 60_000;
+export const COORDINATOR_MAX_LEASE_TENURE_MS = 60 * 60_000;
 export const COORDINATOR_MAX_MESSAGE_BYTES = 16 * 1024;
-export const COORDINATOR_MAX_TASK_ATTEMPTS = 5;
 export const COORDINATOR_ALARM_BATCH_SIZE = 64;
 export const COORDINATOR_MAX_CUBE_DEPTH = 64;
 export const COORDINATOR_MAX_TASKS = 10_000;
+export const COORDINATOR_MAX_SLOTS = 32;
+export const COORDINATOR_MAX_FRONTIER = 16;
+export const COORDINATOR_SPLIT_SEED_MS = 1_000;
+export const COORDINATOR_SPLIT_PERMIT_MS = 2 * 60_000;
 
 export type TaskState =
   | "READY"
@@ -31,6 +35,7 @@ export interface WorkerCapabilities {
   maxWorkers: number;
   mobile: boolean;
   solverVersion: string;
+  proofGeneration?: boolean;
   calibratedConflictsPerSecond?: number;
 }
 
@@ -45,31 +50,11 @@ export interface CubeTask {
 export interface Lease {
   leaseId: string;
   taskId: string;
-  attempt: number;
+  slotId: string;
+  leaseCount: number;
   issuedAt: number;
   expiresAt: number;
-}
-
-export interface CubeQueueSnapshot {
-  readyTasks: number;
-  activeWorkers: number;
-  lowWatermark: number;
-  targetWatermark: number;
-  highWatermark: number;
-  taskCount: number;
-  canSplit: boolean;
-}
-
-export function cubeQueueWatermarks(activeWorkers: number): Pick<
-  CubeQueueSnapshot,
-  "lowWatermark" | "targetWatermark" | "highWatermark"
-> {
-  const workers = Math.max(1, Math.floor(activeWorkers));
-  return {
-    lowWatermark: workers,
-    targetWatermark: workers * 3,
-    highWatermark: workers * 8,
-  };
+  maximumExpiresAt: number;
 }
 
 interface MessageBase {
@@ -81,42 +66,45 @@ interface MessageBase {
 export interface HelloMessage extends MessageBase {
   type: "HELLO";
   sessionId: string;
+  assignmentId?: string;
+  slotIds: string[];
   capabilities: WorkerCapabilities;
 }
 
-export interface RequestWorkMessage extends MessageBase {
-  type: "REQUEST_WORK";
+export interface SessionHeartbeatSlot {
+  slotId: string;
+  leaseId: string | null;
+  activeMs: number;
+  conflicts: number;
+  decisions: number;
+  propagations: number;
 }
 
-export interface HeartbeatMessage extends MessageBase {
-  type: "HEARTBEAT";
-  taskId: string;
-  leaseId: string;
-  progress: {
-    activeMs: number;
-    conflicts: number;
-    decisions: number;
-    propagations: number;
-  };
-  requestExtension?: true;
+export interface SessionHeartbeatMessage extends MessageBase {
+  type: "SESSION_HEARTBEAT";
+  slots: SessionHeartbeatSlot[];
 }
 
 export interface SplitMessage extends MessageBase {
   type: "SPLIT";
+  slotId: string;
   taskId: string;
   leaseId: string;
+  permitId: string;
   splitLiteral: number;
 }
 
 export interface YieldMessage extends MessageBase {
   type: "YIELD";
+  slotId: string;
   taskId: string;
   leaseId: string;
-  reason: "BUDGET" | "PAUSED" | "SHUTDOWN" | "UNSUPPORTED";
+  reason: "PAUSED" | "SHUTDOWN" | "UNSUPPORTED" | "WORKER_ERROR";
 }
 
 export interface ResultMessage extends MessageBase {
   type: "RESULT";
+  slotId: string;
   taskId: string;
   leaseId: string;
   result: "SAT" | "UNSAT";
@@ -126,8 +114,7 @@ export interface ResultMessage extends MessageBase {
 
 export type CoordinatorClientMessage =
   | HelloMessage
-  | RequestWorkMessage
-  | HeartbeatMessage
+  | SessionHeartbeatMessage
   | SplitMessage
   | YieldMessage
   | ResultMessage;
@@ -140,28 +127,30 @@ export interface WelcomeMessage extends ServerMessageBase {
   type: "WELCOME";
   heartbeatIntervalMs: number;
   leaseDurationMs: number;
-  activeLeases: Array<{ task: CubeTask; lease: Lease }>;
+  activeLeases: Array<{ slotId: string; task: CubeTask; lease: Lease }>;
 }
 
 export interface WorkMessage extends ServerMessageBase {
   type: "WORK";
-  requestMessageId: string;
+  slotId: string;
+  requestMessageId?: string;
   task: CubeTask;
   lease: Lease;
-  queue: CubeQueueSnapshot;
 }
 
-export interface NoWorkMessage extends ServerMessageBase {
-  type: "NO_WORK";
-  requestMessageId: string;
-  retryAfterMs: number;
+export interface SplitPermitMessage extends ServerMessageBase {
+  type: "SPLIT_PERMIT";
+  permitId: string;
+  slotId: string;
+  taskId: string;
+  leaseId: string;
+  expiresAt: number;
 }
 
 export interface AckMessage extends ServerMessageBase {
   type: "ACK";
   requestMessageId: string;
-  action: "HEARTBEAT" | "SPLIT" | "YIELD" | "RESULT";
-  leaseExpiresAt?: number;
+  action: "SESSION_HEARTBEAT" | "SPLIT" | "YIELD" | "RESULT";
   staleLease?: boolean;
 }
 
@@ -175,8 +164,8 @@ export interface CoordinatorErrorMessage extends ServerMessageBase {
     | "HELLO_REQUIRED"
     | "INVALID_STATE"
     | "STALE_LEASE"
+    | "SPLIT_NOT_NEEDED"
     | "SESSION_QUARANTINED"
-    | "ATTEMPTS_EXHAUSTED"
     | "TASK_LIMIT";
   retryable: boolean;
 }
@@ -192,13 +181,19 @@ export interface JobResultMessage extends ServerMessageBase {
   taskId: string;
 }
 
+export interface JobSuspendedMessage extends ServerMessageBase {
+  type: "JOB_SUSPENDED";
+  reason: "OWNER_ACTION_REQUIRED";
+}
+
 export type CoordinatorServerMessage =
   | WelcomeMessage
   | WorkMessage
-  | NoWorkMessage
+  | SplitPermitMessage
   | AckMessage
   | CoordinatorErrorMessage
   | JobCancelledMessage
+  | JobSuspendedMessage
   | JobResultMessage;
 
 export type CoordinatorMessageParseResult =
@@ -237,6 +232,7 @@ export function parseWorkerCapabilities(value: unknown): WorkerCapabilities | nu
     typeof value.solverVersion !== "string" ||
     value.solverVersion.length < 1 ||
     value.solverVersion.length > 64 ||
+    (value.proofGeneration !== undefined && typeof value.proofGeneration !== "boolean") ||
     (value.calibratedConflictsPerSecond !== undefined &&
       !isBoundedInteger(value.calibratedConflictsPerSecond, 1, 10_000_000))
   ) return null;
@@ -245,6 +241,9 @@ export function parseWorkerCapabilities(value: unknown): WorkerCapabilities | nu
     maxWorkers: value.maxWorkers,
     mobile: value.mobile,
     solverVersion: value.solverVersion,
+    ...(typeof value.proofGeneration === "boolean"
+      ? { proofGeneration: value.proofGeneration }
+      : {}),
     ...(typeof value.calibratedConflictsPerSecond === "number"
       ? { calibratedConflictsPerSecond: value.calibratedConflictsPerSecond }
       : {}),
@@ -266,55 +265,71 @@ export function parseCoordinatorClientMessage(value: unknown): CoordinatorMessag
   };
   if (value.type === "HELLO") {
     const capabilities = parseWorkerCapabilities(value.capabilities);
-    if (!isId(value.sessionId) || !capabilities) return { ok: false, code: "INVALID_MESSAGE" };
-    return { ok: true, message: { ...base, type: "HELLO", sessionId: value.sessionId, capabilities } };
-  }
-  if (value.type === "REQUEST_WORK") {
-    return { ok: true, message: { ...base, type: "REQUEST_WORK" } };
-  }
-  if (!isId(value.taskId) || !isId(value.leaseId)) return { ok: false, code: "INVALID_MESSAGE" };
-  if (value.type === "HEARTBEAT") {
-    if (!isRecord(value.progress)) return { ok: false, code: "INVALID_MESSAGE" };
-    const progress = value.progress;
-    if (
-      !isBoundedInteger(progress.activeMs, 0, 3_600_000) ||
-      !isBoundedInteger(progress.conflicts, 0, Number.MAX_SAFE_INTEGER) ||
-      !isBoundedInteger(progress.decisions, 0, Number.MAX_SAFE_INTEGER) ||
-      !isBoundedInteger(progress.propagations, 0, Number.MAX_SAFE_INTEGER) ||
-      (value.requestExtension !== undefined && value.requestExtension !== true)
-    ) return { ok: false, code: "INVALID_MESSAGE" };
+    if (!isId(value.sessionId) || !capabilities ||
+      !Array.isArray(value.slotIds) || value.slotIds.length < 1 ||
+      value.slotIds.length > COORDINATOR_MAX_SLOTS ||
+      value.slotIds.length !== capabilities.maxWorkers ||
+      !value.slotIds.every(isId) || new Set(value.slotIds).size !== value.slotIds.length ||
+      (value.assignmentId !== undefined && !isId(value.assignmentId))) {
+      return { ok: false, code: "INVALID_MESSAGE" };
+    }
     return {
       ok: true,
       message: {
         ...base,
-        type: "HEARTBEAT",
-        taskId: value.taskId,
-        leaseId: value.leaseId,
-        progress: {
-          activeMs: progress.activeMs,
-          conflicts: progress.conflicts,
-          decisions: progress.decisions,
-          propagations: progress.propagations,
-        },
-        ...(value.requestExtension === true ? { requestExtension: true as const } : {}),
+        type: "HELLO",
+        sessionId: value.sessionId,
+        slotIds: [...value.slotIds] as string[],
+        ...(typeof value.assignmentId === "string" ? { assignmentId: value.assignmentId } : {}),
+        capabilities,
       },
     };
   }
-  if (value.type === "SPLIT") {
-    if (!isBoundedInteger(value.splitLiteral, -0x7fff_ffff, 0x7fff_ffff) || value.splitLiteral === 0) {
+  if (value.type === "SESSION_HEARTBEAT") {
+    if (!Array.isArray(value.slots) || value.slots.length > COORDINATOR_MAX_SLOTS) {
       return { ok: false, code: "INVALID_MESSAGE" };
     }
-    return { ok: true, message: { ...base, type: "SPLIT", taskId: value.taskId, leaseId: value.leaseId, splitLiteral: value.splitLiteral } };
+    const slots: SessionHeartbeatSlot[] = [];
+    for (const slot of value.slots) {
+      if (!isRecord(slot) || !isId(slot.slotId) ||
+        (slot.leaseId !== null && !isId(slot.leaseId)) ||
+        !isBoundedInteger(slot.activeMs, 0, COORDINATOR_MAX_LEASE_TENURE_MS) ||
+        !isBoundedInteger(slot.conflicts, 0, Number.MAX_SAFE_INTEGER) ||
+        !isBoundedInteger(slot.decisions, 0, Number.MAX_SAFE_INTEGER) ||
+        !isBoundedInteger(slot.propagations, 0, Number.MAX_SAFE_INTEGER)) {
+        return { ok: false, code: "INVALID_MESSAGE" };
+      }
+      slots.push({
+        slotId: slot.slotId,
+        leaseId: slot.leaseId,
+        activeMs: slot.activeMs,
+        conflicts: slot.conflicts,
+        decisions: slot.decisions,
+        propagations: slot.propagations,
+      });
+    }
+    if (new Set(slots.map((slot) => slot.slotId)).size !== slots.length) {
+      return { ok: false, code: "INVALID_MESSAGE" };
+    }
+    return { ok: true, message: { ...base, type: "SESSION_HEARTBEAT", slots } };
+  }
+  if (!isId(value.taskId) || !isId(value.leaseId)) return { ok: false, code: "INVALID_MESSAGE" };
+  if (value.type === "SPLIT") {
+    if (!isId(value.slotId) || !isId(value.permitId) ||
+      !isBoundedInteger(value.splitLiteral, -0x7fff_ffff, 0x7fff_ffff) || value.splitLiteral === 0) {
+      return { ok: false, code: "INVALID_MESSAGE" };
+    }
+    return { ok: true, message: { ...base, type: "SPLIT", slotId: value.slotId, taskId: value.taskId, leaseId: value.leaseId, permitId: value.permitId, splitLiteral: value.splitLiteral } };
   }
   if (value.type === "YIELD") {
-    if (!(["BUDGET", "PAUSED", "SHUTDOWN", "UNSUPPORTED"] as const).includes(value.reason as YieldMessage["reason"])) {
+    if (!isId(value.slotId) || !(["PAUSED", "SHUTDOWN", "UNSUPPORTED", "WORKER_ERROR"] as const).includes(value.reason as YieldMessage["reason"])) {
       return { ok: false, code: "INVALID_MESSAGE" };
     }
-    return { ok: true, message: { ...base, type: "YIELD", taskId: value.taskId, leaseId: value.leaseId, reason: value.reason as YieldMessage["reason"] } };
+    return { ok: true, message: { ...base, type: "YIELD", slotId: value.slotId, taskId: value.taskId, leaseId: value.leaseId, reason: value.reason as YieldMessage["reason"] } };
   }
   if (value.type === "RESULT") {
     const manifest = parseResultManifest(value.manifest);
-    if ((value.result !== "SAT" && value.result !== "UNSAT") ||
+    if (!isId(value.slotId) || (value.result !== "SAT" && value.result !== "UNSAT") ||
       typeof value.evidenceSha256 !== "string" ||
       !SHA256_PATTERN.test(value.evidenceSha256) ||
       !manifest ||
@@ -331,6 +346,7 @@ export function parseCoordinatorClientMessage(value: unknown): CoordinatorMessag
       message: {
         ...base,
         type: "RESULT",
+        slotId: value.slotId,
         taskId: value.taskId,
         leaseId: value.leaseId,
         result: value.result,
@@ -361,40 +377,21 @@ function parseCubeTask(value: unknown): CubeTask | null {
 
 function parseLease(value: unknown): Lease | null {
   if (!isRecord(value) || !isId(value.leaseId) || !isId(value.taskId) ||
-    !isBoundedInteger(value.attempt, 1, COORDINATOR_MAX_TASK_ATTEMPTS) ||
+    !isId(value.slotId) ||
+    !isBoundedInteger(value.leaseCount, 1, Number.MAX_SAFE_INTEGER) ||
     !isBoundedInteger(value.issuedAt, 0, Number.MAX_SAFE_INTEGER) ||
     !isBoundedInteger(value.expiresAt, 0, Number.MAX_SAFE_INTEGER) ||
-    value.expiresAt < value.issuedAt
+    !isBoundedInteger(value.maximumExpiresAt, 0, Number.MAX_SAFE_INTEGER) ||
+    value.expiresAt < value.issuedAt || value.maximumExpiresAt < value.expiresAt
   ) return null;
   return {
     leaseId: value.leaseId,
     taskId: value.taskId,
-    attempt: value.attempt,
+    slotId: value.slotId,
+    leaseCount: value.leaseCount,
     issuedAt: value.issuedAt,
     expiresAt: value.expiresAt,
-  };
-}
-
-function parseQueueSnapshot(value: unknown): CubeQueueSnapshot | null {
-  if (!isRecord(value) ||
-    !isBoundedInteger(value.readyTasks, 0, COORDINATOR_MAX_TASKS) ||
-    !isBoundedInteger(value.activeWorkers, 1, 32) ||
-    !isBoundedInteger(value.lowWatermark, 1, COORDINATOR_MAX_TASKS) ||
-    !isBoundedInteger(value.targetWatermark, 1, COORDINATOR_MAX_TASKS) ||
-    !isBoundedInteger(value.highWatermark, 1, COORDINATOR_MAX_TASKS) ||
-    !isBoundedInteger(value.taskCount, 1, COORDINATOR_MAX_TASKS) ||
-    typeof value.canSplit !== "boolean" ||
-    value.lowWatermark > value.targetWatermark ||
-    value.targetWatermark > value.highWatermark
-  ) return null;
-  return {
-    readyTasks: value.readyTasks,
-    activeWorkers: value.activeWorkers,
-    lowWatermark: value.lowWatermark,
-    targetWatermark: value.targetWatermark,
-    highWatermark: value.highWatermark,
-    taskCount: value.taskCount,
-    canSplit: value.canSplit,
+    maximumExpiresAt: value.maximumExpiresAt,
   };
 }
 
@@ -417,33 +414,57 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
     ) return { ok: false, code: "INVALID_MESSAGE" };
     const activeLeases: WelcomeMessage["activeLeases"] = [];
     for (const item of value.activeLeases) {
-      if (!isRecord(item)) return { ok: false, code: "INVALID_MESSAGE" };
+      if (!isRecord(item) || !isId(item.slotId)) return { ok: false, code: "INVALID_MESSAGE" };
       const task = parseCubeTask(item.task);
       const lease = parseLease(item.lease);
-      if (!task || !lease || task.taskId !== lease.taskId) return { ok: false, code: "INVALID_MESSAGE" };
-      activeLeases.push({ task, lease });
+      if (!task || !lease || task.taskId !== lease.taskId || item.slotId !== lease.slotId) {
+        return { ok: false, code: "INVALID_MESSAGE" };
+      }
+      activeLeases.push({ slotId: item.slotId, task, lease });
     }
     return { ok: true, message: { ...base, type: "WELCOME", heartbeatIntervalMs: value.heartbeatIntervalMs, leaseDurationMs: value.leaseDurationMs, activeLeases } };
   }
   if (value.type === "WORK") {
     const task = parseCubeTask(value.task);
     const lease = parseLease(value.lease);
-    const queue = parseQueueSnapshot(value.queue);
-    if (!isId(value.requestMessageId) || !task || !lease || !queue || task.taskId !== lease.taskId) {
+    if (!isId(value.slotId) ||
+      (value.requestMessageId !== undefined && !isId(value.requestMessageId)) ||
+      !task || !lease || task.taskId !== lease.taskId || value.slotId !== lease.slotId) {
       return { ok: false, code: "INVALID_MESSAGE" };
     }
-    return { ok: true, message: { ...base, type: "WORK", requestMessageId: value.requestMessageId, task, lease, queue } };
+    return {
+      ok: true,
+      message: {
+        ...base,
+        type: "WORK",
+        slotId: value.slotId,
+        ...(typeof value.requestMessageId === "string" ? { requestMessageId: value.requestMessageId } : {}),
+        task,
+        lease,
+      },
+    };
   }
-  if (value.type === "NO_WORK") {
-    if (!isId(value.requestMessageId) || !isBoundedInteger(value.retryAfterMs, 0, 3_600_000)) {
+  if (value.type === "SPLIT_PERMIT") {
+    if (!isId(value.permitId) || !isId(value.slotId) || !isId(value.taskId) ||
+      !isId(value.leaseId) || !isBoundedInteger(value.expiresAt, 0, Number.MAX_SAFE_INTEGER)) {
       return { ok: false, code: "INVALID_MESSAGE" };
     }
-    return { ok: true, message: { ...base, type: "NO_WORK", requestMessageId: value.requestMessageId, retryAfterMs: value.retryAfterMs } };
+    return {
+      ok: true,
+      message: {
+        ...base,
+        type: "SPLIT_PERMIT",
+        permitId: value.permitId,
+        slotId: value.slotId,
+        taskId: value.taskId,
+        leaseId: value.leaseId,
+        expiresAt: value.expiresAt,
+      },
+    };
   }
   if (value.type === "ACK") {
     if (!isId(value.requestMessageId) ||
-      !(["HEARTBEAT", "SPLIT", "YIELD", "RESULT"] as const).includes(value.action as AckMessage["action"]) ||
-      (value.leaseExpiresAt !== undefined && !isBoundedInteger(value.leaseExpiresAt, 0, Number.MAX_SAFE_INTEGER)) ||
+      !(["SESSION_HEARTBEAT", "SPLIT", "YIELD", "RESULT"] as const).includes(value.action as AckMessage["action"]) ||
       (value.staleLease !== undefined && typeof value.staleLease !== "boolean")
     ) return { ok: false, code: "INVALID_MESSAGE" };
     return {
@@ -453,7 +474,6 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
         type: "ACK",
         requestMessageId: value.requestMessageId,
         action: value.action as AckMessage["action"],
-        ...(typeof value.leaseExpiresAt === "number" ? { leaseExpiresAt: value.leaseExpiresAt } : {}),
         ...(typeof value.staleLease === "boolean" ? { staleLease: value.staleLease } : {}),
       },
     };
@@ -461,7 +481,7 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
   if (value.type === "ERROR") {
     const codes: CoordinatorErrorMessage["code"][] = [
       "INVALID_MESSAGE", "UPGRADE_REQUIRED", "JOB_MISMATCH", "HELLO_REQUIRED",
-      "INVALID_STATE", "STALE_LEASE", "ATTEMPTS_EXHAUSTED", "TASK_LIMIT",
+      "INVALID_STATE", "STALE_LEASE", "SPLIT_NOT_NEEDED", "TASK_LIMIT",
       "SESSION_QUARANTINED",
     ];
     if (!codes.includes(value.code as CoordinatorErrorMessage["code"]) ||
@@ -481,6 +501,9 @@ export function parseCoordinatorServerMessage(value: unknown): CoordinatorServer
   }
   if (value.type === "JOB_CANCELLED" && (value.reason === "OWNER_CANCELLED" || value.reason === "EXPIRED")) {
     return { ok: true, message: { ...base, type: "JOB_CANCELLED", reason: value.reason } };
+  }
+  if (value.type === "JOB_SUSPENDED" && value.reason === "OWNER_ACTION_REQUIRED") {
+    return { ok: true, message: { ...base, type: "JOB_SUSPENDED", reason: value.reason } };
   }
   if (value.type === "JOB_RESULT" &&
     (["SAT_VERIFIED", "UNSAT_CERTIFIED", "UNSAT_OWNER_VERIFIED"] as const).includes(value.result as JobResultMessage["result"]) &&

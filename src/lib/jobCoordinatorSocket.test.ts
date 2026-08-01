@@ -4,12 +4,17 @@ import { JobCoordinatorSocket, coordinatorReconnectDelayMs } from "./jobCoordina
 class FakeWebSocket extends EventTarget {
   readyState: WebSocket["readyState"] = WebSocket.CONNECTING;
   readonly sent: string[] = [];
+  closeCode: number | undefined;
 
   send(data: Parameters<WebSocket["send"]>[0]): void {
     this.sent.push(String(data));
   }
 
-  close(): void {
+  close(code = 1000): void {
+    if (code !== 1000 && (code < 3000 || code > 4999)) {
+      throw new DOMException("Invalid browser WebSocket close code", "InvalidAccessError");
+    }
+    this.closeCode = code;
     this.readyState = WebSocket.CLOSED;
     this.dispatchEvent(new CloseEvent("close"));
   }
@@ -27,12 +32,12 @@ class FakeWebSocket extends EventTarget {
 function welcome(jobId: string) {
   return {
     type: "WELCOME",
-    protocolVersion: 3,
+    protocolVersion: 4,
     messageId: "welcome-one",
     jobId,
     serverTime: 1,
     heartbeatIntervalMs: 60_000,
-    leaseDurationMs: 900_000,
+    leaseDurationMs: 300_000,
     activeLeases: [],
   };
 }
@@ -55,6 +60,7 @@ describe("JobCoordinatorSocket", () => {
     const client = new JobCoordinatorSocket({
       jobId: "job-one",
       sessionId: "session-one",
+      slotIds: ["slot-1", "slot-2"],
       capabilities: { hardwareConcurrency: 8, maxWorkers: 2, mobile: false, solverVersion: "cadical-3.0.1" },
       url: "wss://hive.test/socket",
       random: () => 0.5,
@@ -73,6 +79,7 @@ describe("JobCoordinatorSocket", () => {
       type: "HELLO",
       jobId: "job-one",
       sessionId: "session-one",
+      slotIds: ["slot-1", "slot-2"],
     });
     sockets[0].receive(welcome("job-one"));
     expect(client.getState()).toBe("connected");
@@ -96,6 +103,7 @@ describe("JobCoordinatorSocket", () => {
     const client = new JobCoordinatorSocket({
       jobId: "job-one",
       sessionId: "session-one",
+      slotIds: ["slot-1"],
       capabilities: { hardwareConcurrency: 4, maxWorkers: 1, mobile: false, solverVersion: "cadical-3.0.1" },
       url: "wss://hive.test/socket",
       webSocketFactory: () => {
@@ -111,6 +119,7 @@ describe("JobCoordinatorSocket", () => {
     sockets[0].receive(welcome("another-job"));
     expect(errors).toEqual(["JOB_MISMATCH"]);
     expect(sockets[0].readyState).toBe(WebSocket.CLOSED);
+    expect(sockets[0].closeCode).toBe(4002);
     client.stop();
   });
 });

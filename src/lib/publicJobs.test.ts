@@ -1,14 +1,40 @@
 import { describe, expect, it, vi } from "vitest";
+import type { PublicJobStatus } from "../../shared/public-jobs";
 import { encodeHiveCnfV1, sha256Hex } from "./formula/hiveCnf";
 import {
   downloadVerifiedPublicFormula,
   getPublicJob,
+  isMonotonicPublicJobStatus,
+  isPublicJobNotFoundError,
   ownedJobGroup,
+  ownedJobListGroup,
   ownerTokenFromFragment,
   publicJobStatusLabel,
   publicJobUrl,
   type OwnedPublicJobRecord,
 } from "./publicJobs";
+
+function status(state: PublicJobStatus["state"], overrides: Partial<PublicJobStatus> = {}): PublicJobStatus {
+  return {
+    protocolVersion: 4,
+    jobId: "job",
+    state,
+    formula: {
+      hash: "ab".repeat(32),
+      variableCount: 1,
+      clauseCount: 1,
+      literalCount: 1,
+      encodedBytes: 24,
+      compressedBytes: 20,
+    },
+    createdAt: 1_000,
+    expiresAt: 10_000,
+    uploadedBytes: 20,
+    rootTaskState: "READY",
+    certificate: null,
+    ...overrides,
+  };
+}
 
 describe("public job browser trust boundary", () => {
   it("groups browser-owned jobs and presents terminal verdicts clearly", () => {
@@ -27,21 +53,48 @@ describe("public job browser trust boundary", () => {
     expect(ownedJobGroup(base)).toBe("submitted");
     const completed = {
       ...base,
-      lastStatus: {
-        protocolVersion: 3,
-        jobId: "job",
-        state: "SAT_VERIFIED",
-        formula: { hash: "ab".repeat(32), variableCount: 1, clauseCount: 1, literalCount: 1, encodedBytes: 24, compressedBytes: 20 },
-        createdAt: base.createdAt,
-        expiresAt: base.expiresAt,
-        uploadedBytes: 20,
-        rootTaskState: "SAT_VERIFIED",
-        certificate: null,
-      },
+      lastStatus: status("SAT_VERIFIED", { createdAt: base.createdAt, expiresAt: base.expiresAt }),
     } satisfies OwnedPublicJobRecord;
     expect(ownedJobGroup(completed)).toBe("completed");
     expect(publicJobStatusLabel(completed)).toBe("Completed · SAT");
     expect(ownedJobGroup({ ...base, unavailable: true })).toBe("stopped");
+  });
+
+  it("places submitted/running jobs under Active and terminal/local-expiry jobs under Finished", () => {
+    const base: OwnedPublicJobRecord = {
+      jobId: "job",
+      ownerToken: null,
+      filename: "sample.cnf",
+      formula: null,
+      createdAt: 1_000,
+      expiresAt: 10_000,
+      lastStatus: status("RUNNING"),
+      lastSyncedAt: 2_000,
+      terminalAt: null,
+      unavailable: false,
+    };
+    expect(ownedJobGroup(base, 5_000)).toBe("in-progress");
+    expect(ownedJobListGroup(base, 5_000)).toBe("active");
+    expect(ownedJobGroup(base, 10_001)).toBe("stopped");
+    expect(ownedJobListGroup(base, 10_001)).toBe("finished");
+    expect(publicJobStatusLabel(base, 10_001)).toBe("Expired");
+
+    const completed = { ...base, lastStatus: status("SAT_VERIFIED") };
+    expect(ownedJobGroup(completed, 10_001)).toBe("completed");
+    expect(ownedJobListGroup(completed, 10_001)).toBe("finished");
+  });
+
+  it("accepts forward status changes while rejecting stale regressions", () => {
+    expect(isMonotonicPublicJobStatus(status("QUEUED"), status("RUNNING"))).toBe(true);
+    expect(isMonotonicPublicJobStatus(status("RUNNING"), status("QUEUED"))).toBe(false);
+    expect(isMonotonicPublicJobStatus(status("RUNNING"), status("UNKNOWN"))).toBe(true);
+    expect(isMonotonicPublicJobStatus(status("UNKNOWN"), status("RUNNING"))).toBe(false);
+    expect(isMonotonicPublicJobStatus(
+      status("UPLOADING", { uploadedBytes: 20 }),
+      status("UPLOADING", { uploadedBytes: 10 }),
+    )).toBe(false);
+    expect(isMonotonicPublicJobStatus(status("UNSAT_CERTIFIED"), status("UNSAT_OWNER_VERIFIED"))).toBe(true);
+    expect(isMonotonicPublicJobStatus(status("SAT_VERIFIED"), status("UNSAT_CERTIFIED"))).toBe(false);
   });
 
   it("keeps owner credentials in the fragment and public links credential-free", () => {
@@ -64,7 +117,7 @@ describe("public job browser trust boundary", () => {
       (value) => value.charCodeAt(0),
     );
     const status = {
-      protocolVersion: 3,
+      protocolVersion: 4,
       jobId: "job",
       state: "QUEUED",
       formula: {
@@ -97,7 +150,7 @@ describe("public job browser trust boundary", () => {
     const fetcher = vi.fn<typeof fetch>(async (input) => String(input).endsWith("/formula")
       ? new Response(new Uint8Array([1]), { headers: { "x-hivesat-formula-sha256": "cd".repeat(32) } })
       : Response.json({
-          protocolVersion: 3,
+          protocolVersion: 4,
           jobId: "job",
           state: "QUEUED",
           formula: { hash, variableCount: 0, clauseCount: 0, literalCount: 0, encodedBytes: 20, compressedBytes: 1 },
@@ -118,5 +171,30 @@ describe("public job browser trust boundary", () => {
     await expect(getPublicJob("job", fetcher)).rejects.toThrow(
       "This device already has an active public job.",
     );
+  });
+
+  it("classifies only structured not-found responses as unavailable", async () => {
+    const missing = await getPublicJob("job", vi.fn<typeof fetch>(async () => Response.json({
+      error: { code: "JOB_NOT_FOUND", message: "Gone." },
+    }, { status: 404 }))).catch((error: unknown) => error);
+    const transient = await getPublicJob("job", vi.fn<typeof fetch>(async () => Response.json({
+      error: { code: "STORAGE_UNAVAILABLE", message: "Job not found in a transient replica." },
+    }, { status: 503 }))).catch((error: unknown) => error);
+    const empty404 = await getPublicJob("job", vi.fn<typeof fetch>(async () => new Response(null, {
+      status: 404,
+    }))).catch((error: unknown) => error);
+
+    expect(isPublicJobNotFoundError(missing)).toBe(true);
+    expect(isPublicJobNotFoundError(empty404)).toBe(true);
+    expect(isPublicJobNotFoundError(transient)).toBe(false);
+  });
+
+  it("forwards an abort signal to status requests", async () => {
+    const controller = new AbortController();
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json(status("QUEUED")));
+
+    await getPublicJob("job", fetcher, controller.signal);
+
+    expect(fetcher).toHaveBeenCalledWith("/api/v1/jobs/job", { signal: controller.signal });
   });
 });

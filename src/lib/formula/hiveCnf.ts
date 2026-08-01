@@ -1,7 +1,9 @@
 import type { ParsedDimacs } from "./dimacs";
 import {
   MAX_ENCODED_FORMULA_BYTES,
+  MAX_CLAUSES,
   MAX_LITERAL_OCCURRENCES,
+  MAX_VARIABLES,
   SOLVER_CLAUSE_BATCH_INTS,
 } from "./limits";
 
@@ -22,10 +24,16 @@ function encodedByteLength(formula: Pick<ParsedDimacs, "literalCount" | "clauseC
 }
 
 export function encodeHiveCnfV1(formula: ParsedDimacs): Uint8Array {
+  if (!Number.isSafeInteger(formula.variableCount) || formula.variableCount < 0 || formula.variableCount > MAX_VARIABLES) {
+    throw new Error(`HiveCnfV1 variable count must be between 0 and ${MAX_VARIABLES}.`);
+  }
   const actualClauseCount = formula.clauses.length;
   const actualLiteralCount = formula.clauses.reduce((total, clause) => total + clause.length, 0);
   if (actualClauseCount !== formula.clauseCount || actualLiteralCount !== formula.literalCount) {
     throw new Error("Cannot encode HiveCnfV1 with mismatched clause metadata.");
+  }
+  if (actualClauseCount > MAX_CLAUSES) {
+    throw new Error(`HiveCnfV1 exceeds ${MAX_CLAUSES} clauses.`);
   }
   if (actualLiteralCount > MAX_LITERAL_OCCURRENCES) {
     throw new Error(`HiveCnfV1 exceeds ${MAX_LITERAL_OCCURRENCES} literal occurrences.`);
@@ -73,6 +81,12 @@ export function decodeHiveCnfV1(bytes: Uint8Array): HiveCnfV1 {
   const variableCount = view.getUint32(8, true);
   const clauseCount = view.getUint32(12, true);
   const literalCount = view.getUint32(16, true);
+  if (variableCount > MAX_VARIABLES) {
+    throw new Error(`HiveCnfV1 exceeds the ${MAX_VARIABLES.toLocaleString("en-US")} variable limit.`);
+  }
+  if (clauseCount > MAX_CLAUSES) {
+    throw new Error(`HiveCnfV1 exceeds the ${MAX_CLAUSES.toLocaleString("en-US")} clause limit.`);
+  }
   if (literalCount > MAX_LITERAL_OCCURRENCES) {
     throw new Error("HiveCnfV1 exceeds the literal-occurrence limit.");
   }

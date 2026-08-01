@@ -1,8 +1,10 @@
 import type { CubeTask, Lease } from "../../../shared/coordinator-protocol";
 import type { FormulaMetadata, SolverMetrics } from "../formula/workerProtocol";
 
+export type CubeWorkerMode = "SEARCH" | "PROOF_FINISHER";
+
 export type CubeWorkerRequest =
-  | { type: "initialize"; requestId: string; metadata: FormulaMetadata }
+  | { type: "initialize"; requestId: string; metadata: FormulaMetadata; mode?: CubeWorkerMode }
   | {
       type: "clause-batch";
       requestId: string;
@@ -15,9 +17,14 @@ export type CubeWorkerRequest =
       requestId: string;
       task: CubeTask;
       lease: Lease;
-      allowSplit: boolean;
-      maxSlices: number;
       conflictBudget: number;
+    }
+  | {
+      type: "grant-split";
+      requestId: string;
+      taskId: string;
+      leaseId: string;
+      permitId: string;
     }
   | { type: "stop"; requestId: string; reason: "PAUSED" | "SHUTDOWN" };
 
@@ -39,6 +46,7 @@ export type CubeWorkerResponse =
       type: "split";
       taskId: string;
       leaseId: string;
+      permitId: string;
       splitLiteral: number;
       activeMs: number;
       metrics: SolverMetrics;
@@ -47,7 +55,7 @@ export type CubeWorkerResponse =
       type: "yield";
       taskId: string;
       leaseId: string;
-      reason: "BUDGET" | "PAUSED" | "SHUTDOWN" | "UNSUPPORTED";
+      reason: "PAUSED" | "SHUTDOWN" | "UNSUPPORTED";
       activeMs: number;
       metrics: SolverMetrics;
     })

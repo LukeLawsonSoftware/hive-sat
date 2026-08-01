@@ -1,20 +1,39 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppHeader } from "../components/AppHeader";
 import {
   PublicJobOwnerStore,
   getPublicJob,
+  isPublicJobNotFoundError,
   isTerminalPublicJobState,
   ownedJobGroup,
+  ownedJobListGroup,
   publicJobStatusLabel,
   type OwnedJobGroup,
   type OwnedPublicJobRecord,
 } from "../lib/publicJobs";
 
-const GROUPS: Array<{ key: OwnedJobGroup; label: string; description: string }> = [
-  { key: "submitted", label: "Submitted", description: "Uploaded and waiting for swarm capacity." },
-  { key: "in-progress", label: "In progress", description: "Work is currently available to solver browsers." },
-  { key: "completed", label: "Completed", description: "Jobs with a verified SAT or certified UNSAT result." },
-  { key: "stopped", label: "Stopped", description: "Cancelled, invalid, expired, or unavailable jobs." },
+const BADGE_GROUPS: Array<{ key: OwnedJobGroup; label: string }> = [
+  { key: "submitted", label: "Submitted" },
+  { key: "in-progress", label: "In progress" },
+  { key: "completed", label: "Completed" },
+  { key: "stopped", label: "Stopped" },
+];
+
+const LIST_GROUPS: Array<{
+  key: "active" | "finished";
+  label: string;
+  description: string;
+}> = [
+  {
+    key: "active",
+    label: "Active",
+    description: "Submitted jobs and work currently available to solver browsers.",
+  },
+  {
+    key: "finished",
+    label: "Finished",
+    description: "Verified results and jobs that were cancelled, invalid, expired, or unavailable.",
+  },
 ];
 
 function formatFormula(record: OwnedPublicJobRecord): string {
@@ -32,60 +51,104 @@ export default function JobsPage() {
   const [jobs, setJobs] = useState<OwnedPublicJobRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState<string | null>(null);
+  const generation = useRef(0);
+  const inFlight = useRef<Promise<void> | null>(null);
+  const controller = useRef<AbortController | null>(null);
 
-  const refresh = useCallback(async () => {
-    try {
-      const local = await store.listJobs();
-      setJobs(local);
-      const active = local.filter((record) =>
-        record.expiresAt > Date.now() &&
-        (!record.lastStatus || !isTerminalPublicJobState(record.lastStatus.state)),
-      );
-      const outcomes = await Promise.allSettled(active.map(async (record) => {
-        const status = await getPublicJob(record.jobId);
-        await store.updateStatus(status);
-      }));
-      await Promise.all(outcomes.map(async (outcome, index) => {
-        if (outcome.status === "rejected") await store.markUnavailable(active[index].jobId);
-      }));
-      setJobs(await store.listJobs());
-      setMessage(outcomes.some((outcome) => outcome.status === "rejected")
-        ? "Some live statuses could not be refreshed. Their last known state is shown."
-        : null);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Job history is unavailable in this browser.");
-    } finally {
-      setLoading(false);
-    }
+  const refresh = useCallback((): Promise<void> => {
+    if (inFlight.current) return inFlight.current;
+    const refreshGeneration = ++generation.current;
+    const abortController = new AbortController();
+    const observedAt = Date.now();
+    controller.current = abortController;
+
+    const operation = (async () => {
+      try {
+        const local = await store.listJobs(observedAt);
+        if (generation.current !== refreshGeneration || abortController.signal.aborted) return;
+        setJobs(local);
+        setLoading(false);
+        const active = local.filter((record) =>
+          record.expiresAt > observedAt &&
+          (!record.lastStatus || !isTerminalPublicJobState(record.lastStatus.state)),
+        );
+        let failedStatuses = 0;
+        await Promise.all(active.map(async (record) => {
+          try {
+            const status = await getPublicJob(record.jobId, fetch, abortController.signal);
+            if (abortController.signal.aborted) return;
+            await store.updateStatus(status, observedAt);
+          } catch (error) {
+            if (abortController.signal.aborted || error instanceof DOMException && error.name === "AbortError") return;
+            failedStatuses += 1;
+            if (isPublicJobNotFoundError(error)) {
+              await store.markUnavailable(record.jobId, observedAt);
+            }
+          }
+        }));
+        if (generation.current !== refreshGeneration || abortController.signal.aborted) return;
+        const refreshed = await store.listJobs();
+        if (generation.current !== refreshGeneration || abortController.signal.aborted) return;
+        setJobs(refreshed);
+        setMessage(failedStatuses > 0
+          ? "Some live statuses could not be refreshed. Their last known state is shown."
+          : null);
+      } catch (error) {
+        if (generation.current !== refreshGeneration || abortController.signal.aborted ||
+          error instanceof DOMException && error.name === "AbortError") return;
+        setMessage(error instanceof Error ? error.message : "Job history is unavailable in this browser.");
+      } finally {
+        if (generation.current === refreshGeneration) setLoading(false);
+      }
+    })();
+    const tracked = operation.finally(() => {
+      if (inFlight.current === tracked) inFlight.current = null;
+      if (controller.current === abortController) controller.current = null;
+    });
+    inFlight.current = tracked;
+    return tracked;
   }, [store]);
 
   useEffect(() => {
-    const initial = window.setTimeout(() => void refresh(), 0);
+    void refresh();
     const timer = window.setInterval(() => {
       if (!document.hidden) void refresh();
-    }, 5_000);
+    }, 30_000);
     const onVisibility = () => { if (!document.hidden) void refresh(); };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      window.clearTimeout(initial);
+      generation.current += 1;
+      controller.current?.abort();
+      controller.current = null;
+      // React StrictMode immediately runs this effect again. Do not let the
+      // aborted first pass suppress that replacement refresh until the timer.
+      inFlight.current = null;
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [refresh]);
 
+  async function stopRefresh(): Promise<void> {
+    generation.current += 1;
+    controller.current?.abort();
+    await inFlight.current?.catch(() => undefined);
+  }
+
   async function remove(record: OwnedPublicJobRecord) {
     if (!window.confirm(`Remove ${record.filename} from this browser's history?`)) return;
+    await stopRefresh();
     await store.removeJob(record.jobId);
     setJobs(await store.listJobs());
   }
 
   async function clearFinished() {
     if (!window.confirm("Remove all completed and stopped jobs from this browser's history?")) return;
+    await stopRefresh();
     await store.clearTerminalJobs();
     setJobs(await store.listJobs());
   }
 
-  const counts = Object.fromEntries(GROUPS.map(({ key }) => [
+  const counts = Object.fromEntries(BADGE_GROUPS.map(({ key }) => [
     key,
     jobs.filter((job) => ownedJobGroup(job) === key).length,
   ])) as Record<OwnedJobGroup, number>;
@@ -108,7 +171,7 @@ export default function JobsPage() {
         </section>
 
         <div className="job-counts" aria-label="Job totals">
-          {GROUPS.map((group) => (
+          {BADGE_GROUPS.map((group) => (
             <div key={group.key}><strong>{counts[group.key]}</strong><span>{group.label}</span></div>
           ))}
         </div>
@@ -124,8 +187,8 @@ export default function JobsPage() {
           </section>
         )}
 
-        {GROUPS.map((group) => {
-          const records = jobs.filter((job) => ownedJobGroup(job) === group.key);
+        {LIST_GROUPS.map((group) => {
+          const records = jobs.filter((job) => ownedJobListGroup(job) === group.key);
           if (records.length === 0) return null;
           return (
             <section className="job-group" key={group.key} aria-labelledby={`jobs-${group.key}`}>
@@ -135,11 +198,12 @@ export default function JobsPage() {
               </div>
               <div className="job-list">
                 {records.map((record) => {
-                  const terminal = ownedJobGroup(record) === "completed" || ownedJobGroup(record) === "stopped";
+                  const badgeGroup = ownedJobGroup(record);
+                  const terminal = group.key === "finished";
                   return (
                     <article className="job-card" key={record.jobId}>
                       <div className="job-card-main">
-                        <span className={`job-status status-${ownedJobGroup(record)}`}>{publicJobStatusLabel(record)}</span>
+                        <span className={`job-status status-${badgeGroup}`}>{publicJobStatusLabel(record)}</span>
                         <h3>{record.filename}</h3>
                         <p>{formatFormula(record)}</p>
                       </div>

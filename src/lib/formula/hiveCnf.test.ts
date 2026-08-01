@@ -44,6 +44,18 @@ describe("HiveCnfV1", () => {
     const badLiteral = encodeHiveCnfV1(parsed);
     new DataView(badLiteral.buffer).setInt32(20, 2, true);
     expect(() => decodeHiveCnfV1(badLiteral)).toThrow(/out-of-range/i);
+
+    const excessiveVariables = encodeHiveCnfV1(parsed);
+    new DataView(excessiveVariables.buffer).setUint32(8, 2_000_001, true);
+    expect(() => decodeHiveCnfV1(excessiveVariables)).toThrow(/variable limit/i);
+  });
+
+  it("rejects an unsupported variable count before encoding", () => {
+    expect(() => encodeHiveCnfV1({
+      variableCount: 2_000_001,
+      clauseCount: 0,
+      literalCount: 0,
+      clauses: [],
+    })).toThrow(/variable count/i);
   });
 });
-

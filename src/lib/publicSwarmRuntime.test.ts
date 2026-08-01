@@ -47,7 +47,7 @@ describe("PublicSwarmRuntime", () => {
     sockets[0].open();
     sockets[0].receive({
       type: "SWARM_ASSIGNMENT",
-      protocolVersion: 3,
+      protocolVersion: 4,
       messageId: "server-one",
       requestMessageId: "request-one",
       serverTime: 1,
@@ -58,7 +58,7 @@ describe("PublicSwarmRuntime", () => {
       quantumMs: 3_600_000,
       reservedWorkerMs: 7_200_000,
       conflictBudget: 100,
-      leaseTargetMs: 900_000,
+      leaseTargetMs: 300_000,
     });
     sockets[0].close();
 

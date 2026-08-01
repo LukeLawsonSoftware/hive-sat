@@ -45,7 +45,7 @@ layer reduces what the next one must handle:
 | Directory control message | 8 KiB |
 | Cube assumptions | 64 distinct variables |
 | Task tree | 10,000 tasks, depth 64 |
-| Formula | 5 MiB gzip, 32 MiB canonical, 2,000,000 literals |
+| Formula | 5 MiB gzip; 2,000,000 literals/variables; 1,000,000 clauses; 12,000,020-byte effective canonical maximum; 32 MiB decoder ceiling |
 | SAT model | 512 KiB |
 | LRAT per job | 25 MiB gzip, 128 MiB expanded |
 | Job coordinator sockets | 32 by default |
@@ -83,9 +83,11 @@ denies plugins, framing, unrelated forms, camera, microphone, location,
 payments, and USB. Production responses add HSTS.
 
 WebSocket clients use capped exponential reconnect backoff with jitter.
-`UPGRADE_REQUIRED` is terminal rather than a reconnect loop. Phase 11 advances
-the public protocol version, so older clients receive a clear upgrade response
-before Turnstile or allocation work.
+`UPGRADE_REQUIRED` is terminal rather than a reconnect loop. Public protocol
+v4 declares stable slot IDs in `HELLO`, returns persisted initial/resumed work
+in `WELCOME.activeLeases`, pushes subsequent `WORK` from the coordinator, and
+uses one batched session heartbeat per minute. Older clients receive a clear
+upgrade response before Turnstile or allocation work.
 
 ## Capacity and kill switches
 
@@ -117,11 +119,28 @@ code change. Disabling public jobs prevents creation; disabling the swarm
 prevents new directory handoffs. Existing coordinators still expire and clean
 up their artifacts normally.
 
-The deterministic load model uses worker-time, duty cycle, 60-second sparse
-heartbeats, long leases, one-hour assignment quanta, cache-hit rate, and result
-frequency. It explicitly shows that heartbeats do not write SQL rows. Launch
-gates compare projections with configurable ceilings at the same safety
+The deterministic load model uses worker-time, duty cycle, one 60-second
+heartbeat per session, five-minute rolling leases capped at 60 minutes,
+five-minute pending handoffs that activate into one-hour assignment quanta,
+cache-hit rate, and result frequency. Metric-only
+heartbeats do not write task rows; only advancing a lease deadline is durable.
+Launch gates compare projections with configurable ceilings at the same safety
 margin; they do not claim free-plan capacity is guaranteed.
+
+For `N` slots, the old active design received `60N` heartbeat requests per
+hour and an idle five-second loop could receive up to `720N` work-poll requests
+per hour. Protocol v4 receives 60 session-heartbeat requests per hour and zero
+idle work polls. Coordinator-pushed work also removes one request/response
+round trip at each task handoff. Counting replies doubles the wire-message
+figures but not the reduction. The full estimate is in
+[stability and efficiency](../stability-and-efficiency.md#request-and-cost-estimate).
+
+Workers KV remains the sole artifact binding, with the formula limits above
+enforced before upload and after decode. Cloudflare Queues are not used for
+cube dispatch: browser slot affinity, lease renewal, cancellation, reconnects,
+and atomic split-tree changes all belong to the per-job Durable Object. A Queue
+could later carry optional lossy telemetry, provided its delivery can never
+change task ownership or a verdict.
 
 ## Rolling updates and partial deployment
 

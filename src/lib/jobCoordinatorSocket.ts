@@ -13,6 +13,8 @@ export type CoordinatorWebSocket = Pick<WebSocket, "readyState" | "send" | "clos
 export interface CoordinatorSocketOptions {
   jobId: string;
   sessionId: string;
+  assignmentId?: string;
+  slotIds: string[];
   capabilities: WorkerCapabilities;
   url?: string;
   webSocketFactory?: (url: string) => CoordinatorWebSocket;
@@ -90,6 +92,8 @@ export class JobCoordinatorSocket {
         messageId: crypto.randomUUID(),
         jobId: this.options.jobId,
         sessionId: this.options.sessionId,
+        ...(this.options.assignmentId ? { assignmentId: this.options.assignmentId } : {}),
+        slotIds: [...this.options.slotIds],
         capabilities: this.options.capabilities,
       };
       socket.send(JSON.stringify(hello));

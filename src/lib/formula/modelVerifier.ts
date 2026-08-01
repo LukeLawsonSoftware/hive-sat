@@ -1,4 +1,9 @@
 import type { HiveCnfV1 } from "./hiveCnf";
+import {
+  MAX_CLAUSES,
+  MAX_LITERAL_OCCURRENCES,
+  MAX_VARIABLES,
+} from "./limits";
 
 export type ModelVerification =
   | { valid: true; assignment: boolean[] }
@@ -8,6 +13,22 @@ export function verifySatModel(
   formula: Pick<HiveCnfV1, "variableCount" | "clauses">,
   model: readonly number[],
 ): ModelVerification {
+  if (
+    !Number.isSafeInteger(formula.variableCount) ||
+    formula.variableCount < 0 ||
+    formula.variableCount > MAX_VARIABLES
+  ) {
+    return {
+      valid: false,
+      reason: `Formula variable count exceeds the supported ${MAX_VARIABLES.toLocaleString("en-US")} variable limit.`,
+    };
+  }
+  if (formula.clauses.length > MAX_CLAUSES) {
+    return {
+      valid: false,
+      reason: `Formula clause count exceeds the supported ${MAX_CLAUSES.toLocaleString("en-US")} clause limit.`,
+    };
+  }
   const assignments = new Int8Array(formula.variableCount + 1);
 
   for (const literal of model) {
@@ -28,10 +49,22 @@ export function verifySatModel(
     }
   }
 
+  let literalCount = 0;
   for (let clauseIndex = 0; clauseIndex < formula.clauses.length; clauseIndex += 1) {
-    const satisfied = formula.clauses[clauseIndex].some((literal) =>
-      assignments[Math.abs(literal)] === (literal > 0 ? 1 : -1),
-    );
+    let satisfied = false;
+    for (const literal of formula.clauses[clauseIndex]) {
+      literalCount += 1;
+      if (literalCount > MAX_LITERAL_OCCURRENCES) {
+        return {
+          valid: false,
+          reason: `Formula exceeds the supported ${MAX_LITERAL_OCCURRENCES.toLocaleString("en-US")} literal-occurrence limit.`,
+        };
+      }
+      if (!Number.isInteger(literal) || literal === 0 || Math.abs(literal) > formula.variableCount) {
+        return { valid: false, reason: `Formula contains invalid literal ${literal}.` };
+      }
+      if (assignments[Math.abs(literal)] === (literal > 0 ? 1 : -1)) satisfied = true;
+    }
     if (!satisfied) {
       return {
         valid: false,
@@ -46,4 +79,3 @@ export function verifySatModel(
     assignment: Array.from(assignments.subarray(1), (value) => value === 1),
   };
 }
-

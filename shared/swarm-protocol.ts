@@ -5,6 +5,9 @@ import {
 import { PUBLIC_JOB_PROTOCOL_VERSION } from "./public-jobs";
 
 export const SWARM_ASSIGNMENT_QUANTUM_MS = 60 * 60_000;
+// Large formulas may spend substantial time in browser verification and Wasm
+// initialization before the coordinator HELLO can activate the reservation.
+export const SWARM_ASSIGNMENT_ACTIVATION_MS = 5 * 60_000;
 export const SWARM_MAX_JOB_WORKERS = 8;
 export const SWARM_NO_WORK_RETRY_MS = 30_000;
 export const SWARM_MAX_MESSAGE_BYTES = 8 * 1024;

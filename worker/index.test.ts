@@ -29,7 +29,7 @@ async function createJob(overrides: Record<string, unknown> = {}): Promise<Creat
     },
     body: JSON.stringify({
       deviceId: `device_${String(sequence).padStart(24, "0")}`,
-      protocolVersion: 3,
+      protocolVersion: 4,
       turnstileToken: `test-turnstile-token-${sequence}`,
       publicConsent: true,
       formula: FORMULA,
@@ -91,6 +91,27 @@ describe("HiveSAT Worker", () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["variable", { variableCount: 2_000_001 }],
+    ["clause", { clauseCount: 1_000_001 }],
+    ["literal-occurrence", { literalCount: 2_000_001 }],
+  ])("rejects formulas above the %s ceiling before admission", async (_limit, formulaOverride) => {
+    const response = await SELF.fetch("https://hive-sat.test/api/v1/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        deviceId: "device_000000000000000000000098",
+        protocolVersion: 4,
+        turnstileToken: `oversized-${_limit}-token`,
+        publicConsent: true,
+        formula: { ...FORMULA, ...formulaOverride },
+      }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_FORMULA" } });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
   it("prevents Turnstile replay even across distinct device and network identities", async () => {
     const replayToken = `replay-${++sequence}`;
     const first = await createJob({ turnstileToken: replayToken });
@@ -100,7 +121,7 @@ describe("HiveSAT Worker", () => {
       headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.220" },
       body: JSON.stringify({
         deviceId: "device_replay_000000000000000002",
-        protocolVersion: 3,
+        protocolVersion: 4,
         turnstileToken: replayToken,
         publicConsent: true,
         formula: FORMULA,
@@ -135,7 +156,7 @@ describe("HiveSAT Worker", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         deviceId: "device_000000000000000000000001",
-        protocolVersion: 3,
+        protocolVersion: 4,
         turnstileToken: "token",
         publicConsent: false,
         formula: FORMULA,
@@ -322,7 +343,7 @@ describe("HiveSAT Worker", () => {
     });
     socket.send(JSON.stringify({
       type: "SWARM_HELLO",
-      protocolVersion: 3,
+      protocolVersion: 4,
       messageId: "swarm-index-request",
       sessionId: "swarm-index-session",
       capabilities: {
@@ -382,7 +403,7 @@ describe("HiveSAT Worker", () => {
         headers: { "content-type": "application/json", "cf-connecting-ip": ip },
         body: JSON.stringify({
           deviceId,
-          protocolVersion: 3,
+          protocolVersion: 4,
           turnstileToken: `token-${++attemptSequence}`,
           publicConsent: true,
           formula: FORMULA,

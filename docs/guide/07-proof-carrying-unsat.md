@@ -3,7 +3,8 @@
 SAT and UNSAT need different evidence. A satisfying assignment is a compact
 witness: check every clause and the claim is settled. UNSAT says that *every*
 possible assignment fails. Two browsers reaching UNSAT independently is a
-useful fault-detection step, but it is not a mathematical certificate.
+duplicate observation, not a mathematical certificate. Waiting for the second
+observation adds latency without strengthening the eventual proof.
 
 HiveSAT closes that gap with LRAT proofs. An LRAT proof is a list of clauses
 plus explicit references to earlier clauses that justify each addition. An
@@ -15,7 +16,6 @@ only if the proof derives the empty clause.
 ```mermaid
 sequenceDiagram
   participant A as "Browser A"
-  participant B as "Browser B"
   participant J as "JobCoordinatorDO"
   participant F as "Fresh proof finisher"
   participant K as "Workers KV"
@@ -23,10 +23,9 @@ sequenceDiagram
   participant O as "Owner browser"
 
   A->>J: "UNSAT candidate for cube C"
-  J->>J: "Requeue exactly C"
-  B->>J: "Independent UNSAT candidate for C"
-  J->>J: "Mark C proof-required"
+  J->>J: "Mark exactly C proof-required"
   J->>F: "WORK(C, PROOF_FINISHER)"
+  F->>F: "Discard search instance; create proof-capable instance"
   F->>F: "Enable tracing before loading clauses"
   F->>F: "Load F, then cube literals as unit clauses"
   F->>K: "Upload gzip LRAT with lease token"
@@ -43,14 +42,14 @@ sequenceDiagram
   end
 ```
 
-There are three deliberately separate solver instances:
+There are two deliberately separate solving roles:
 
-1. The first browser finds an UNSAT candidate.
-2. A different session repeats the cube from scratch.
-3. A proof-finisher creates a *new* CaDiCaL instance, enables LRAT tracing
-   before loading any clause, and solves `F ∧ cube`.
+1. An ordinary search instance finds the first UNSAT candidate.
+2. A proof-capable slot discards that search instance, creates a *new* CaDiCaL
+   instance, enables LRAT tracing before loading any clause, and solves
+   `F ∧ cube`.
 
-The proof-finisher is not a continuation of either candidate solver. That
+The proof-finisher is not a continuation of the candidate solver. That
 prevents missing trace history and keeps the proof tied to a complete clause
 load.
 
@@ -99,8 +98,10 @@ only its manifest and verification state.
 
 An oversized proof is never truncated. Truncation could remove the empty
 clause or references and make the artifact ambiguous. HiveSAT instead fails
-closed: a task becomes `UNKNOWN` when it exceeds platform bounds, or the
-browser solver may split earlier while ordinary search is still possible.
+closed: a task becomes `UNKNOWN` when it exceeds platform bounds. During
+ordinary search, coordinator-granted adaptive splitting aims to keep cubes
+small enough that proof work remains practical; proof-finisher tasks themselves
+do not split.
 
 ## Two independent checking paths
 
@@ -149,7 +150,7 @@ propagates to the root as `UNSAT_OWNER_VERIFIED`; otherwise the root is
 
 | Condition | Result |
 | --- | --- |
-| One or two UNSAT reports without proof | candidate only |
+| Any number of UNSAT reports without proof | proof work remains pending; never final UNSAT |
 | Missing, swapped, corrupt, or invalid gzip proof | `UNKNOWN`, never UNSAT |
 | LRAT hint chain fails | `UNKNOWN`; artifact marked invalid |
 | Server operation budget expires | `UNKNOWN`, unless the artifact is intentionally routed to the owner path by size |

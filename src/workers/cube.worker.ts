@@ -1,16 +1,15 @@
+import { runCubeSearchLoop } from "../lib/distributed/cubeSearchLoop";
 import type {
+  CubeWorkerMode,
   CubeWorkerRequest,
   CubeWorkerResponse,
 } from "../lib/distributed/cubeWorkerProtocol";
+import { MAX_VARIABLES } from "../lib/formula/limits";
 import type { SolverMetrics } from "../lib/formula/workerProtocol";
 import {
   MAX_UNSAT_PROOF_COMPRESSED_BYTES,
   MAX_UNSAT_PROOF_DECOMPRESSED_BYTES,
 } from "../../shared/result-manifest";
-
-const UNKNOWN = 0;
-const SAT = 10;
-const UNSAT = 20;
 
 interface CaDiCaLSolver {
   addClauses(literals: Int32Array): void;
@@ -41,7 +40,11 @@ let requestId: string | null = null;
 let variableCount = 0;
 let stopped: "PAUSED" | "SHUTDOWN" | null = null;
 let operation = Promise.resolve();
-let formulaBatches: Int32Array[] = [];
+let mode: CubeWorkerMode = "SEARCH";
+let activeTaskId: string | null = null;
+let activeLeaseId: string | null = null;
+let splitPermitId: string | null = null;
+let proofTaskId: string | null = null;
 
 function send(message: CubeWorkerResponse): void {
   globalThis.postMessage(message);
@@ -53,26 +56,39 @@ async function loadModule(): Promise<CaDiCaLModule> {
   return modulePromise;
 }
 
-async function readMetrics(): Promise<SolverMetrics> {
-  if (!solver) return { conflicts: 0, decisions: 0, propagations: 0 };
+async function readMetrics(target: CaDiCaLSolver | null = solver): Promise<SolverMetrics> {
+  if (!target) return { conflicts: 0, decisions: 0, propagations: 0 };
   const runtimeModule = await loadModule();
   return {
-    conflicts: solver.metric(runtimeModule.SolverMetric.CONFLICTS),
-    decisions: solver.metric(runtimeModule.SolverMetric.DECISIONS),
-    propagations: solver.metric(runtimeModule.SolverMetric.PROPAGATIONS),
-    memoryBytes: solver.metric(runtimeModule.SolverMetric.MEMORY_BYTES),
-    memoryHighWaterBytes: solver.metric(runtimeModule.SolverMetric.MEMORY_HIGH_WATER_BYTES),
+    conflicts: target.metric(runtimeModule.SolverMetric.CONFLICTS),
+    decisions: target.metric(runtimeModule.SolverMetric.DECISIONS),
+    propagations: target.metric(runtimeModule.SolverMetric.PROPAGATIONS),
+    memoryBytes: target.metric(runtimeModule.SolverMetric.MEMORY_BYTES),
+    memoryHighWaterBytes: target.metric(runtimeModule.SolverMetric.MEMORY_HIGH_WATER_BYTES),
   };
 }
 
 async function initialize(message: Extract<CubeWorkerRequest, { type: "initialize" }>): Promise<void> {
+  if (
+    !Number.isSafeInteger(message.metadata.variableCount) ||
+    message.metadata.variableCount < 0 ||
+    message.metadata.variableCount > MAX_VARIABLES
+  ) {
+    throw new Error(`Cube solver variable count exceeds the supported ${MAX_VARIABLES.toLocaleString("en-US")} limit.`);
+  }
+
   solver?.dispose();
   const runtime = await (await loadModule()).loadCaDiCaL();
   solver = runtime.createSolver();
+  mode = message.mode ?? "SEARCH";
+  if (mode === "PROOF_FINISHER") solver.enableLrat("/proof.lrat");
   requestId = message.requestId;
   variableCount = message.metadata.variableCount;
   stopped = null;
-  formulaBatches = [];
+  activeTaskId = null;
+  activeLeaseId = null;
+  splitPermitId = null;
+  proofTaskId = null;
   if (message.metadata.clauseCount === 0) send({ type: "ready", requestId });
 }
 
@@ -91,112 +107,64 @@ async function gzipText(text: string): Promise<Uint8Array> {
 
 async function runProofFinisher(
   message: Extract<CubeWorkerRequest, { type: "run" }>,
-  startedAt: number,
 ): Promise<void> {
-  const runtime = await (await loadModule()).loadCaDiCaL();
-  const proofSolver = runtime.createSolver();
-  try {
-    proofSolver.enableLrat("/proof.lrat");
-    for (const batch of formulaBatches) proofSolver.addClauses(batch);
-    for (const literal of message.task.assumptions) {
-      proofSolver.addClauses(Int32Array.of(literal, 0));
-    }
-    for (let slices = 1; slices <= message.maxSlices; slices += 1) {
-      if (stopped) {
-        send({
-          type: "yield",
-          requestId: message.requestId,
-          taskId: message.task.taskId,
-          leaseId: message.lease.leaseId,
-          reason: stopped,
-          activeMs: Math.max(0, performance.now() - startedAt),
-          metrics: await readMetrics(),
-        });
-        return;
-      }
-      const status = proofSolver.solve(message.conflictBudget);
-      if (status === SAT) {
-        const model = proofSolver.model(1, variableCount)
-          .map((literal, index) => literal === 0 ? -(index + 1) : literal);
-        send({
-          type: "result",
-          requestId: message.requestId,
-          taskId: message.task.taskId,
-          leaseId: message.lease.leaseId,
-          verdict: "SAT",
-          model,
-          activeMs: Math.max(0, performance.now() - startedAt),
-          metrics: await readMetrics(),
-        });
-        return;
-      }
-      if (status === UNSAT) {
-        const text = proofSolver.closeLrat("/proof.lrat");
-        const proof = await gzipText(text);
-        send({
-          type: "result",
-          requestId: message.requestId,
-          taskId: message.task.taskId,
-          leaseId: message.lease.leaseId,
-          verdict: "UNSAT",
-          proof,
-          proofBytes: new TextEncoder().encode(text).byteLength,
-          activeMs: Math.max(0, performance.now() - startedAt),
-          metrics: await readMetrics(),
-        });
-        return;
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    }
-    send({
-      type: "yield",
-      requestId: message.requestId,
-      taskId: message.task.taskId,
-      leaseId: message.lease.leaseId,
-      reason: "BUDGET",
-      activeMs: Math.max(0, performance.now() - startedAt),
-      metrics: await readMetrics(),
-    });
-  } catch (error) {
+  if (!solver || mode !== "PROOF_FINISHER") {
     send({
       type: "yield",
       requestId: message.requestId,
       taskId: message.task.taskId,
       leaseId: message.lease.leaseId,
       reason: "UNSUPPORTED",
-      activeMs: Math.max(0, performance.now() - startedAt),
+      activeMs: 0,
       metrics: await readMetrics(),
     });
-    console.error(error);
-  } finally {
-    proofSolver.dispose();
-  }
-}
-
-async function runCube(message: Extract<CubeWorkerRequest, { type: "run" }>): Promise<void> {
-  if (!solver || requestId !== message.requestId) return;
-  stopped = null;
-  const startedAt = performance.now();
-  if (message.task.purpose === "PROOF_FINISHER") {
-    await runProofFinisher(message, startedAt);
     return;
   }
-  for (let slices = 1; slices <= message.maxSlices; slices += 1) {
-    if (stopped) {
+
+  try {
+    if (proofTaskId && proofTaskId !== message.task.taskId) {
+      throw new Error("A proof worker must be reinitialized before it can accept another proof task.");
+    }
+    if (!proofTaskId) {
+      for (const literal of message.task.assumptions) {
+        solver.addClauses(Int32Array.of(literal, 0));
+      }
+      proofTaskId = message.task.taskId;
+    }
+
+    const outcome = await runCubeSearchLoop({
+      solver,
+      assumptions: [],
+      conflictBudget: message.conflictBudget,
+      stopped: () => stopped,
+      splitRequested: () => false,
+      clearSplitRequest: () => undefined,
+      onProgress: async ({ activeMs, slices }) => {
+        send({
+          type: "progress",
+          requestId: message.requestId,
+          taskId: message.task.taskId,
+          leaseId: message.lease.leaseId,
+          activeMs,
+          metrics: await readMetrics(),
+          slices,
+        });
+      },
+    });
+
+    if (outcome.kind === "STOPPED") {
       send({
         type: "yield",
         requestId: message.requestId,
         taskId: message.task.taskId,
         leaseId: message.lease.leaseId,
-        reason: stopped,
-        activeMs: Math.max(0, performance.now() - startedAt),
+        reason: outcome.reason,
+        activeMs: outcome.activeMs,
         metrics: await readMetrics(),
       });
       return;
     }
-    solver.assume(message.task.assumptions);
-    const status = solver.solve(message.conflictBudget);
-    if (status === SAT) {
+    if (outcome.kind === "SAT") {
       const model = solver.model(1, variableCount)
         .map((literal, index) => literal === 0 ? -(index + 1) : literal);
       send({
@@ -206,67 +174,146 @@ async function runCube(message: Extract<CubeWorkerRequest, { type: "run" }>): Pr
         leaseId: message.lease.leaseId,
         verdict: "SAT",
         model,
-        activeMs: Math.max(0, performance.now() - startedAt),
+        activeMs: outcome.activeMs,
         metrics: await readMetrics(),
       });
       return;
     }
-    if (status === UNSAT) {
-      send({
-        type: "result",
-        requestId: message.requestId,
-        taskId: message.task.taskId,
-        leaseId: message.lease.leaseId,
-        verdict: "UNSAT",
-        activeMs: Math.max(0, performance.now() - startedAt),
-        metrics: await readMetrics(),
-      });
-      return;
-    }
-    if (status !== UNKNOWN) throw new Error(`CaDiCaL returned unexpected status ${status}.`);
-    if (slices === 1 || slices % 8 === 0) {
+    if (outcome.kind === "SPLIT") throw new Error("A proof worker unexpectedly attempted to split.");
+
+    const text = solver.closeLrat("/proof.lrat");
+    const proof = await gzipText(text);
+    send({
+      type: "result",
+      requestId: message.requestId,
+      taskId: message.task.taskId,
+      leaseId: message.lease.leaseId,
+      verdict: "UNSAT",
+      proof,
+      proofBytes: new TextEncoder().encode(text).byteLength,
+      activeMs: outcome.activeMs,
+      metrics: await readMetrics(),
+    });
+  } catch (error) {
+    send({
+      type: "yield",
+      requestId: message.requestId,
+      taskId: message.task.taskId,
+      leaseId: message.lease.leaseId,
+      reason: "UNSUPPORTED",
+      activeMs: 0,
+      metrics: await readMetrics(),
+    });
+    console.error(error);
+  }
+}
+
+async function runSearch(message: Extract<CubeWorkerRequest, { type: "run" }>): Promise<void> {
+  if (!solver || mode !== "SEARCH") {
+    send({
+      type: "yield",
+      requestId: message.requestId,
+      taskId: message.task.taskId,
+      leaseId: message.lease.leaseId,
+      reason: "UNSUPPORTED",
+      activeMs: 0,
+      metrics: await readMetrics(),
+    });
+    return;
+  }
+
+  let consumedSplitPermitId: string | null = null;
+  const outcome = await runCubeSearchLoop({
+    solver,
+    assumptions: message.task.assumptions,
+    conflictBudget: message.conflictBudget,
+    stopped: () => stopped,
+    splitRequested: () => splitPermitId !== null,
+    clearSplitRequest: () => {
+      consumedSplitPermitId = splitPermitId;
+      splitPermitId = null;
+    },
+    onProgress: async ({ activeMs, slices }) => {
       send({
         type: "progress",
         requestId: message.requestId,
         taskId: message.task.taskId,
         leaseId: message.lease.leaseId,
-        activeMs: Math.max(0, performance.now() - startedAt),
+        activeMs,
         metrics: await readMetrics(),
         slices,
       });
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  }
+    },
+  });
 
-  if (message.allowSplit) {
-    solver.assume(message.task.assumptions);
-    const splitLiteral = solver.lookahead();
-    const alreadyAssigned = message.task.assumptions.some(
-      (literal) => Math.abs(literal) === Math.abs(splitLiteral),
-    );
-    if (splitLiteral !== 0 && !alreadyAssigned) {
-      send({
-        type: "split",
-        requestId: message.requestId,
-        taskId: message.task.taskId,
-        leaseId: message.lease.leaseId,
-        splitLiteral,
-        activeMs: Math.max(0, performance.now() - startedAt),
-        metrics: await readMetrics(),
-      });
-      return;
-    }
+  if (outcome.kind === "STOPPED") {
+    send({
+      type: "yield",
+      requestId: message.requestId,
+      taskId: message.task.taskId,
+      leaseId: message.lease.leaseId,
+      reason: outcome.reason,
+      activeMs: outcome.activeMs,
+      metrics: await readMetrics(),
+    });
+    return;
   }
-
+  if (outcome.kind === "SPLIT") {
+    if (!consumedSplitPermitId) throw new Error("A split result is missing its coordinator permit.");
+    send({
+      type: "split",
+      requestId: message.requestId,
+      taskId: message.task.taskId,
+      leaseId: message.lease.leaseId,
+      permitId: consumedSplitPermitId,
+      splitLiteral: outcome.splitLiteral,
+      activeMs: outcome.activeMs,
+      metrics: await readMetrics(),
+    });
+    return;
+  }
+  if (outcome.kind === "SAT") {
+    const model = solver.model(1, variableCount)
+      .map((literal, index) => literal === 0 ? -(index + 1) : literal);
+    send({
+      type: "result",
+      requestId: message.requestId,
+      taskId: message.task.taskId,
+      leaseId: message.lease.leaseId,
+      verdict: "SAT",
+      model,
+      activeMs: outcome.activeMs,
+      metrics: await readMetrics(),
+    });
+    return;
+  }
   send({
-    type: "yield",
+    type: "result",
     requestId: message.requestId,
     taskId: message.task.taskId,
     leaseId: message.lease.leaseId,
-    reason: "BUDGET",
-    activeMs: Math.max(0, performance.now() - startedAt),
+    verdict: "UNSAT",
+    activeMs: outcome.activeMs,
     metrics: await readMetrics(),
   });
+}
+
+async function runCube(message: Extract<CubeWorkerRequest, { type: "run" }>): Promise<void> {
+  if (!solver || requestId !== message.requestId) return;
+  stopped = null;
+  activeTaskId = message.task.taskId;
+  activeLeaseId = message.lease.leaseId;
+  splitPermitId = null;
+  try {
+    if (message.task.purpose === "PROOF_FINISHER") await runProofFinisher(message);
+    else await runSearch(message);
+  } finally {
+    if (activeTaskId === message.task.taskId && activeLeaseId === message.lease.leaseId) {
+      activeTaskId = null;
+      activeLeaseId = null;
+      splitPermitId = null;
+    }
+  }
 }
 
 async function handle(message: CubeWorkerRequest): Promise<void> {
@@ -275,7 +322,6 @@ async function handle(message: CubeWorkerRequest): Promise<void> {
   if (message.type === "clause-batch") {
     if (!solver) throw new Error("Cube solver is not initialized.");
     solver.addClauses(message.literals);
-    formulaBatches.push(message.literals.slice());
     if (message.last) send({ type: "ready", requestId: message.requestId });
     return;
   }
@@ -283,11 +329,21 @@ async function handle(message: CubeWorkerRequest): Promise<void> {
     stopped = message.reason;
     return;
   }
+  if (message.type === "grant-split") {
+    if (
+      mode === "SEARCH" &&
+      message.taskId === activeTaskId &&
+      message.leaseId === activeLeaseId
+    ) splitPermitId = message.permitId;
+    return;
+  }
   return runCube(message);
 }
 
 globalThis.addEventListener("message", (event: MessageEvent<CubeWorkerRequest>) => {
-  if (event.data.type === "stop") {
+  // Control messages must be observed while a long-lived run owns the serialized
+  // operation chain. The search loop yields browser control at most every 16 ms.
+  if (event.data.type === "stop" || event.data.type === "grant-split") {
     void handle(event.data);
     return;
   }

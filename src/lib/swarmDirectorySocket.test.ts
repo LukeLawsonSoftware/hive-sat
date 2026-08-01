@@ -32,7 +32,7 @@ class FakeWebSocket extends EventTarget {
 function serverBase(type: string) {
   return {
     type,
-    protocolVersion: 3,
+    protocolVersion: 4,
     messageId: "server-one",
     requestMessageId: "request-one",
     serverTime: 1,
@@ -72,7 +72,7 @@ describe("SwarmDirectorySocket", () => {
       quantumMs: 3_600_000,
       reservedWorkerMs: 7_200_000,
       conflictBudget: 100,
-      leaseTargetMs: 900_000,
+      leaseTargetMs: 300_000,
     });
     expect(events).toEqual([]);
     socket.close();

@@ -72,10 +72,18 @@ For a public task, a participant:
 7. caches only a matching formula;
 8. transfers fresh clause-batch buffers to each Dedicated Worker.
 
-The current limits are 5 MiB compressed, 32 MiB canonical bytes, and two
-million literal occurrences. A corrupt cache entry is deleted. A network
+The current limits are 5 MiB compressed, two million literal occurrences, two
+million declared variables, and one million clauses. Since the encoding has a
+20-byte header and four bytes per literal and clause terminator, those counts
+cap canonical bytes at 12,000,020 (about 11.45 MiB). A separate 32 MiB decoder
+ceiling rejects malformed, cached, or network input before allocation. These
+restrictions keep formulae within browser memory and Workers KV's HiveSAT
+storage boundary; R2 is not required or supported. A corrupt cache entry is
+deleted. A network
 object whose response header, job metadata, decoded shape, or hash disagrees is
-rejected before CaDiCaL is initialized.
+rejected before CaDiCaL is initialized. Because KV may be eventually
+consistent across locations, a fresh object that is temporarily unavailable is
+retried with bounded backoff rather than declared invalid.
 
 ## Why workers receive clause batches
 

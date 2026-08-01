@@ -1,7 +1,9 @@
 import {
   MAX_DECOMPRESSED_DIMACS_BYTES,
   MAX_ENCODED_FORMULA_BYTES,
+  MAX_CLAUSES,
   MAX_LITERAL_OCCURRENCES,
+  MAX_VARIABLES,
 } from "./limits";
 
 export interface ParsedDimacs {
@@ -197,6 +199,22 @@ export async function parseDimacs(
       }
       variableCount = parseUnsigned(tokens[2], "Variable count", lineNumber);
       declaredClauseCount = parseUnsigned(tokens[3], "Clause count", lineNumber);
+      if (variableCount > MAX_VARIABLES) {
+        throw new DimacsParseError(
+          `Variable count exceeds the supported ${MAX_VARIABLES.toLocaleString("en-US")} variable limit`,
+          lineNumber,
+          tokens[2].column,
+          tokens[2].byteOffset,
+        );
+      }
+      if (declaredClauseCount > MAX_CLAUSES) {
+        throw new DimacsParseError(
+          `Clause count exceeds the supported ${MAX_CLAUSES.toLocaleString("en-US")} clause limit`,
+          lineNumber,
+          tokens[3].column,
+          tokens[3].byteOffset,
+        );
+      }
       if (projectedEncodedBytes(0, declaredClauseCount) > MAX_ENCODED_FORMULA_BYTES) {
         throw new DimacsParseError(
           `Declared clauses exceed the ${MAX_ENCODED_FORMULA_BYTES}-byte encoded limit`,

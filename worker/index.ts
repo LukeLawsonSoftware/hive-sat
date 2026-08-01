@@ -5,7 +5,12 @@ import {
   type CreateJobInput,
   type FormulaDeclaration,
 } from "./contracts";
-import { PUBLIC_JOB_PROTOCOL_VERSION } from "../shared/public-jobs";
+import {
+  MAX_PUBLIC_JOB_CLAUSES,
+  MAX_PUBLIC_JOB_LITERAL_OCCURRENCES,
+  MAX_PUBLIC_JOB_VARIABLES,
+  PUBLIC_JOB_PROTOCOL_VERSION,
+} from "../shared/public-jobs";
 import { hmacSha256Hex, randomToken, sha256Hex } from "./crypto";
 import { JobCoordinatorDO } from "./job-coordinator";
 import { SwarmDirectoryDO } from "./swarm-directory";
@@ -124,9 +129,9 @@ function parseFormula(value: unknown): FormulaDeclaration {
   if (
     typeof declaration.hash !== "string" ||
     !SHA256_PATTERN.test(declaration.hash) ||
-    !positiveInteger(declaration.variableCount, 0xffff_ffff) ||
-    !positiveInteger(declaration.clauseCount, 0xffff_ffff) ||
-    !positiveInteger(declaration.literalCount, 2_000_000) ||
+    !positiveInteger(declaration.variableCount, MAX_PUBLIC_JOB_VARIABLES) ||
+    !positiveInteger(declaration.clauseCount, MAX_PUBLIC_JOB_CLAUSES) ||
+    !positiveInteger(declaration.literalCount, MAX_PUBLIC_JOB_LITERAL_OCCURRENCES) ||
     !positiveInteger(declaration.encodedBytes, MAX_ENCODED_FORMULA_BYTES) ||
     !positiveInteger(declaration.compressedBytes, MAX_COMPRESSED_FORMULA_BYTES) ||
     declaration.encodedBytes < 20 ||

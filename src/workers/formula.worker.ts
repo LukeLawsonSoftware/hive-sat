@@ -1,7 +1,7 @@
 import { VerifiedFormulaCache } from "../lib/formula/cache";
 import { gzipHiveCnf, streamDimacsFile } from "../lib/formula/compression";
 import { DimacsParseError, parseDimacs } from "../lib/formula/dimacs";
-import { createClauseBatches, decodeHiveCnfV1, encodeHiveCnfV1, sha256Hex } from "../lib/formula/hiveCnf";
+import { decodeHiveCnfV1, encodeHiveCnfV1, sha256Hex } from "../lib/formula/hiveCnf";
 import type { FormulaWorkerRequest, FormulaWorkerResponse } from "../lib/formula/workerProtocol";
 
 const controllers = new Map<string, AbortController>();
@@ -53,9 +53,7 @@ async function parseFormula(requestId: string, file: File): Promise<void> {
     }
 
     const verified = decodeHiveCnfV1(encoded);
-    const batches = createClauseBatches(verified.clauses);
     const encodedBuffer = encoded.slice().buffer;
-    const batchTransfers = batches.map((batch) => batch.buffer as ArrayBuffer);
     send(
       {
         type: "completed",
@@ -70,9 +68,8 @@ async function parseFormula(requestId: string, file: File): Promise<void> {
           cacheHit,
         },
         encoded: encodedBuffer,
-        batches,
       },
-      [encodedBuffer, ...batchTransfers],
+      [encodedBuffer],
     );
   } catch (error) {
     if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {

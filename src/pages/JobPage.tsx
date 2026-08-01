@@ -1,19 +1,25 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { PublicJobStatus } from "../../shared/public-jobs";
 import { AppHeader } from "../components/AppHeader";
 import {
   PublicJobOwnerStore,
   cancelPublicJob,
   getPublicJob,
+  isMonotonicPublicJobStatus,
+  isPublicJobNotFoundError,
   isTerminalPublicJobState,
   ownerTokenFromFragment,
   publicJobUrl,
   rotatePublicJobOwnerToken,
   verifyAndConfirmOwnerProof,
 } from "../lib/publicJobs";
-import { useDistributedCubeRuntime } from "../hooks/useDistributedCubeRuntime";
 
-function statusLabel(status: PublicJobStatus): string {
+function isLocallyExpired(status: PublicJobStatus, now = Date.now()): boolean {
+  return status.expiresAt <= now && !isTerminalPublicJobState(status.state);
+}
+
+function statusLabel(status: PublicJobStatus, now = Date.now()): string {
+  if (isLocallyExpired(status, now)) return "Expired";
   const labels: Record<PublicJobStatus["state"], string> = {
     UPLOADING: "Uploading formula",
     QUEUED: "Submitted",
@@ -28,7 +34,8 @@ function statusLabel(status: PublicJobStatus): string {
   return labels[status.state];
 }
 
-function resultCopy(status: PublicJobStatus): { verdict: string; detail: string } | null {
+function resultCopy(status: PublicJobStatus, now = Date.now()): { verdict: string; detail: string } | null {
+  if (isLocallyExpired(status, now)) return { verdict: "No result", detail: "Expired" };
   if (status.state === "SAT_VERIFIED") {
     return { verdict: "SAT", detail: "HiveSAT independently verified the returned satisfying assignment." };
   }
@@ -50,65 +57,105 @@ export default function JobPage({ jobId }: { jobId: string }) {
   const [ownerToken, setOwnerToken] = useState<string | null>(null);
   const [message, setMessage] = useState("Loading public job…");
   const [busy, setBusy] = useState(false);
-  const { runtime, snapshot: cubeRuntime } = useDistributedCubeRuntime(jobId);
+  const statusRef = useRef<PublicJobStatus | null>(null);
+  const terminal = useRef(false);
+  const pollGeneration = useRef(0);
+  const pollController = useRef<AbortController | null>(null);
 
   useEffect(() => {
     let active = true;
-    let terminal = false;
-    const fragmentToken = ownerTokenFromFragment();
-    const refresh = async (initial = false) => {
-      try {
-        const job = await getPublicJob(jobId);
-        if (!active) return;
-        setStatus(job);
-        terminal = isTerminalPublicJobState(job.state);
-        await store.updateStatus(job).catch(() => undefined);
-        if (initial) {
-          let storedToken: string | null = null;
-          try { storedToken = await store.getOwnerToken(jobId); } catch { /* Public status remains readable. */ }
-          const token = fragmentToken ?? storedToken;
-          if (fragmentToken) {
-            await store.saveOwner({ jobId, ownerToken: fragmentToken, expiresAt: job.expiresAt }).catch(() => undefined);
+    let ownerLoaded = false;
+    let inFlight: Promise<void> | null = null;
+    statusRef.current = null;
+    terminal.current = false;
+    const refresh = (): Promise<void> => {
+      if (inFlight) return inFlight;
+      const generation = ++pollGeneration.current;
+      const abortController = new AbortController();
+      const observedAt = Date.now();
+      pollController.current = abortController;
+
+      const operation = (async () => {
+        try {
+          const job = await getPublicJob(jobId, fetch, abortController.signal);
+          if (!active || abortController.signal.aborted || pollGeneration.current !== generation) return;
+          if (statusRef.current && !isMonotonicPublicJobStatus(statusRef.current, job)) return;
+          statusRef.current = job;
+          terminal.current = isTerminalPublicJobState(job.state) || isLocallyExpired(job);
+          setStatus(job);
+          await store.updateStatus(job, observedAt).catch(() => undefined);
+          if (!active || abortController.signal.aborted || pollGeneration.current !== generation) return;
+          if (!ownerLoaded) {
+            ownerLoaded = true;
+            const fragmentToken = ownerTokenFromFragment();
+            let storedToken: string | null = null;
+            try { storedToken = await store.getOwnerToken(jobId); } catch { /* Public status remains readable. */ }
+            if (!active || abortController.signal.aborted || pollGeneration.current !== generation) return;
+            if (fragmentToken) {
+              await store.saveOwner({ jobId, ownerToken: fragmentToken, expiresAt: job.expiresAt }).catch(() => undefined);
+            }
+            if (active && pollGeneration.current === generation) {
+              setOwnerToken(fragmentToken ?? storedToken);
+            }
           }
-          if (active) setOwnerToken(token);
+          if (active && pollGeneration.current === generation) setMessage("");
+        } catch (error) {
+          if (!active || abortController.signal.aborted || pollGeneration.current !== generation ||
+            error instanceof DOMException && error.name === "AbortError") return;
+          const unavailable = isPublicJobNotFoundError(error);
+          if (unavailable) {
+            terminal.current = true;
+            await store.markUnavailable(jobId, observedAt).catch(() => undefined);
+          }
+          if (!active || abortController.signal.aborted || pollGeneration.current !== generation) return;
+          if (!statusRef.current || unavailable) {
+            setMessage(
+              unavailable
+                ? "This job is unavailable. It may have expired or been removed."
+                : "The latest job status could not be loaded. Try again in a moment.",
+            );
+          }
         }
-        if (active) setMessage("");
-      } catch (error) {
-        if (!active) return;
-        const unavailable = error instanceof Error && /not found|JOB_NOT_FOUND/i.test(error.message);
-        if (unavailable) terminal = true;
-        await store.markUnavailable(jobId).catch(() => undefined);
-        if (initial) {
-          setMessage(
-            unavailable
-              ? "This job is unavailable. It may have expired or been removed."
-              : "The latest job status could not be loaded. Try again in a moment.",
-          );
-        }
-      }
+      })();
+      const tracked = operation.finally(() => {
+        if (inFlight === tracked) inFlight = null;
+        if (pollController.current === abortController) pollController.current = null;
+      });
+      inFlight = tracked;
+      return tracked;
     };
-    void refresh(true);
+    void refresh();
     const timer = window.setInterval(() => {
-      if (!document.hidden && !terminal) void refresh();
-    }, 5_000);
+      if (!document.hidden && !terminal.current) void refresh();
+    }, 30_000);
     const onVisibility = () => {
-      if (!document.hidden && !terminal) void refresh();
+      if (!document.hidden && !terminal.current) void refresh();
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       active = false;
+      pollGeneration.current += 1;
+      pollController.current?.abort();
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [jobId, store]);
 
+  function invalidateStatusPoll(): void {
+    pollGeneration.current += 1;
+    pollController.current?.abort();
+  }
+
   async function cancel() {
     if (!ownerToken) return;
+    invalidateStatusPoll();
     setBusy(true);
     try {
       await cancelPublicJob(jobId, ownerToken);
       if (status) {
         const cancelled = { ...status, state: "CANCELLED", rootTaskState: "CANCELLED", uploadedBytes: null } satisfies PublicJobStatus;
+        statusRef.current = cancelled;
+        terminal.current = true;
         setStatus(cancelled);
         await store.updateStatus(cancelled);
       }
@@ -120,10 +167,16 @@ export default function JobPage({ jobId }: { jobId: string }) {
 
   async function verifyOwnerProof() {
     if (!ownerToken || !status) return;
+    invalidateStatusPoll();
     setBusy(true);
     setMessage("Downloading and independently checking the LRAT certificate in this browser…");
     try {
       const verified = await verifyAndConfirmOwnerProof(jobId, ownerToken, status);
+      if (statusRef.current && !isMonotonicPublicJobStatus(statusRef.current, verified)) {
+        throw new Error("The proof response contained an older job state.");
+      }
+      statusRef.current = verified;
+      terminal.current = isTerminalPublicJobState(verified.state);
       setStatus(verified);
       await store.updateStatus(verified);
       setMessage(verified.state === "UNSAT_OWNER_VERIFIED"
@@ -146,9 +199,10 @@ export default function JobPage({ jobId }: { jobId: string }) {
     } finally { setBusy(false); }
   }
 
+  const locallyExpired = status ? isLocallyExpired(status) : false;
   const result = status ? resultCopy(status) : null;
   const timelineStep = status
-    ? isTerminalPublicJobState(status.state) ? 3 : status.state === "RUNNING" ? 2 : 1
+    ? isTerminalPublicJobState(status.state) || locallyExpired ? 3 : status.state === "RUNNING" ? 2 : 1
     : 0;
 
   return (
@@ -214,32 +268,16 @@ export default function JobPage({ jobId }: { jobId: string }) {
           </section>
         )}
 
-        {ownerToken && status && (status.state === "QUEUED" || status.state === "RUNNING") && (
-          <section className="job-action-card" aria-labelledby="owner-compute-title">
-            <p className="eyebrow">Optional local acceleration</p>
-            <h2 id="owner-compute-title">Solve your job in this browser</h2>
-            <p>Your job receives all {cubeRuntime.capacity} local worker{cubeRuntime.capacity === 1 ? "" : "s"} before public swarm work.</p>
-            <p role="status">{cubeRuntime.message ?? `${cubeRuntime.activeWorkers} local workers active`}</p>
-            {["idle", "paused", "error"].includes(cubeRuntime.phase) ? (
-              <button className="primary-button" type="button" onClick={() => void runtime.start()}>
-                {cubeRuntime.phase === "paused" ? "Resume local workers" : "Start local workers"}
-              </button>
-            ) : (
-              <button className="secondary-button" type="button" onClick={() => runtime.pause()}>Pause local workers</button>
-            )}
-          </section>
-        )}
-
         <section className="job-owner-actions" aria-labelledby="job-actions-title">
           <div><p className="eyebrow">Manage job</p><h2 id="job-actions-title">Sharing and owner actions</h2></div>
           <div className="result-actions">
             <button className="secondary-button" type="button" onClick={() => void navigator.clipboard?.writeText(publicJobUrl(jobId))}>
               Copy public share link
             </button>
-            {ownerToken && status && status.state !== "CANCELLED" && (
+            {ownerToken && status && !locallyExpired && status.state !== "CANCELLED" && (
               <button className="secondary-button" type="button" disabled={busy} onClick={() => void rotateOwner()}>Rotate owner token</button>
             )}
-            {ownerToken && status && !isTerminalPublicJobState(status.state) && (
+            {ownerToken && status && !locallyExpired && !isTerminalPublicJobState(status.state) && (
               <button className="danger-button" type="button" disabled={busy} onClick={() => void cancel()}>
                 {busy ? "Cancelling…" : "Cancel and delete formula"}
               </button>

@@ -32,12 +32,12 @@ class FakeWebSocket extends EventTarget {
 function welcome(jobId: string) {
   return {
     type: "WELCOME",
-    protocolVersion: 3,
+    protocolVersion: 4,
     messageId: "welcome-one",
     jobId,
     serverTime: 1,
     heartbeatIntervalMs: 60_000,
-    leaseDurationMs: 900_000,
+    leaseDurationMs: 300_000,
     activeLeases: [],
   };
 }
@@ -60,6 +60,7 @@ describe("JobCoordinatorSocket", () => {
     const client = new JobCoordinatorSocket({
       jobId: "job-one",
       sessionId: "session-one",
+      slotIds: ["slot-1", "slot-2"],
       capabilities: { hardwareConcurrency: 8, maxWorkers: 2, mobile: false, solverVersion: "cadical-3.0.1" },
       url: "wss://hive.test/socket",
       random: () => 0.5,
@@ -78,6 +79,7 @@ describe("JobCoordinatorSocket", () => {
       type: "HELLO",
       jobId: "job-one",
       sessionId: "session-one",
+      slotIds: ["slot-1", "slot-2"],
     });
     sockets[0].receive(welcome("job-one"));
     expect(client.getState()).toBe("connected");
@@ -101,6 +103,7 @@ describe("JobCoordinatorSocket", () => {
     const client = new JobCoordinatorSocket({
       jobId: "job-one",
       sessionId: "session-one",
+      slotIds: ["slot-1"],
       capabilities: { hardwareConcurrency: 4, maxWorkers: 1, mobile: false, solverVersion: "cadical-3.0.1" },
       url: "wss://hive.test/socket",
       webSocketFactory: () => {

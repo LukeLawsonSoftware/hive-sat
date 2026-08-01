@@ -24,7 +24,7 @@ addresses are not persisted by Durable Objects.
 
 ## API lifecycle
 
-All JSON job requests use `protocolVersion: 3`. Older versions fail with
+All JSON job requests use `protocolVersion: 4`. Older versions fail with
 `UPGRADE_REQUIRED` before Turnstile validation or allocation.
 
 1. `POST /api/v1/jobs` validates bounded metadata, explicit public consent,
@@ -46,18 +46,49 @@ All JSON job requests use `protocolVersion: 3`. Older versions fail with
 7. `GET /api/v1/jobs/{jobId}/socket` upgrades to the hibernating, versioned
    coordinator protocol documented in [coordinator-protocol.md](coordinator-protocol.md).
 
+Public formula declarations and uploads are rejected above 5 MiB compressed,
+two million literal occurrences, two million variables, or one million
+clauses. Those count caps imply a maximum 12,000,020-byte canonical
+`HiveCnfV1` (about 11.45 MiB). The separate 32 MiB encoded check is a defensive
+decoder ceiling for malformed, cached, or network input. These are part of the
+Workers KV design boundary, not tunable hints: HiveSAT does not require or
+support R2.
+
 Every solver-browser formula download compares the response hash with public
 job status, expands gzip under the 32 MiB cap, validates the HiveCnfV1 encoding,
 and computes SHA-256 over the uncompressed canonical bytes. A mismatch fails
-closed before solver loading.
+closed before solver loading. IndexedDB hits receive the same decode-and-hash
+check; a locally cached byte sequence is never trusted merely because its key
+matches. Unique artifact keys avoid overwrites, and a temporarily unavailable
+fresh KV value is retried with bounded backoff rather than treated as proof that
+the job is corrupt.
+
+## Browser routes and status reads
+
+The three browser experiences have separate ownership:
+
+- `/` is local-only solving and never joins the public swarm;
+- `/swarm` is the explicit, page-scoped contribution runtime; and
+- `/jobs` plus `/jobs/:jobId` provide status and owner controls without
+  starting solver workers.
+
+Job status uses 30-second polling only while visible and non-terminal. Each
+page permits one in-flight request, aborts it on unmount or mutation, and
+ignores a response from an older observation or one that would regress the
+known state. The owned-jobs view groups
+`UPLOADING`, `QUEUED`, and `RUNNING` records as active and verified, stopped,
+cancelled, expired, invalid, or unavailable records as finished. A transient
+network error retains the last known status; only an explicit not-found
+response marks a retained job unavailable.
 
 ## Durable state and expiry
 
 `JobCoordinatorDO` is one SQLite-backed object per job. Its `jobs` table owns
 state and formula metadata; its `tasks` table starts with the root task.
-`SwarmDirectoryDO` uses a single `global-v1` instance for Phase 4 admission and
-stores only active-job and rolling creation records. Later scheduling work must
-remain shard-ready and must not route solver heartbeats through this directory.
+`SwarmDirectoryDO` uses a single `global-v1` instance for admission and coarse
+equal-service assignment. It stores active jobs, rolling creation records, and
+assignment reservations, but never receives solver heartbeats or manages cube
+leases. The selected job's coordinator is the sole lease dispatcher.
 
 Both objects use `_sql_schema_migrations`; the Wrangler namespace migration is
 the append-only `v0001_job_platform` entry. A job alarm is scheduled for exactly

@@ -22,8 +22,11 @@ Incomplete user-facing behavior remains behind feature flags. The architecture i
 ## Target Architecture and Interfaces
 
 - Browser runtime:
-  - React routes for home, job status, and `/swarm`.
-  - An app-level external store controls personal-job solving, swarm participation, WebSockets, browser workers, telemetry, and IndexedDB.
+  - Separate React experiences: home owns local-only solving, `/swarm` owns
+    explicit public contribution, and `/jobs` owns status and owner controls.
+  - Route-scoped runtimes prevent local solving from competing with or
+    stranding a public assignment; shared stores are limited to durable browser
+    records and aggregate telemetry.
   - One single-threaded CaDiCaL instance per Dedicated Worker; multiple workers provide multicore use without Wasm pthreads or `SharedArrayBuffer`.
   - Web Locks plus `BroadcastChannel` elect one active runtime per browser profile to prevent tabs from oversubscribing the device.
 
@@ -49,11 +52,17 @@ Incomplete user-facing behavior remains behind feature flags. The architecture i
   - JSON control messages use discriminated unions and runtime validation; large payloads live in Workers KV.
   - Every message includes `protocolVersion`, `messageId`, `jobId`, and applicable `taskId`/`leaseId`.
   - Unsupported clients receive `UPGRADE_REQUIRED`; duplicate messages and results are idempotent.
+  - Public protocol v4 declares stable slot IDs in `HELLO`, carries persisted
+    initial/resumed assignments in `WELCOME.activeLeases`, pushes later `WORK`
+    from the coordinator, batches all slot counters into one session heartbeat
+    per minute, and grants adaptive split permits.
 
 - State semantics:
   - Jobs: `UPLOADING → QUEUED → RUNNING → SAT_VERIFIED | UNSAT_CERTIFIED | UNSAT_OWNER_VERIFIED | UNKNOWN`, plus cancellation, invalidation, and expiry.
   - Tasks: `READY → LEASED → SPLIT | SAT_CANDIDATE | UNSAT_CANDIDATE | YIELDED`, followed by verification/certification where applicable.
-  - Replicated UNSAT is never presented as definitive. Until a proof is checked, it remains `UNSAT_CANDIDATE` or ultimately `UNKNOWN`.
+  - A browser UNSAT report is never presented as definitive. The first valid
+    candidate goes directly to proof finishing; only checked LRAT coverage can
+    produce a terminal UNSAT state.
 
 ## Delivery Phases
 
@@ -92,7 +101,11 @@ Branch: `codex/hivesat-03-formula-runtime`
 
 - [x] Implement strict DIMACS parsing in a browser worker with useful line/offset errors, progress, cancellation, and decompression-bomb limits. Plain `.cnf` and gzip `.cnf.gz` streams report one-based line/column plus zero-based byte offsets and yield often enough for cancellation without quadratic long-line buffering.
 - [x] Define `HiveCnfV1`: deterministic little-endian integer encoding preserving parsed clause order, with SHA-256 over the uncompressed encoding and gzip for transfer. The byte-level contract is documented in `docs/formula-runtime.md`.
-- [x] Enforce 5 MiB compressed, 32 MiB encoded, and two million literal-occurrence limits. Decompressed source text is independently capped at 32 MiB so comments and whitespace cannot form a gzip bomb.
+- [x] Enforce 5 MiB compressed, a defensive 32 MiB encoded decoder ceiling,
+  two million literal occurrences, two million variables, and one million
+  clauses. The count caps make the effective canonical maximum 12,000,020
+  bytes (about 11.45 MiB). Decompressed source text is independently capped at
+  32 MiB so comments and whitespace cannot form a gzip bomb.
 - [x] Cache verified formulas by hash in IndexedDB and transfer typed arrays to solver workers in batches. Cache reads re-decode and re-hash canonical bytes; corrupt entries fail closed and are deleted.
 - [x] Replace filename-derived mock verdicts with real bounded CaDiCaL solving and an independent TypeScript model verifier. Dedicated solver workers retain CaDiCaL state across pause/resume, the UI displays only SAT models that satisfy every parsed clause, and verified assignments can be downloaded as DIMACS-style `s`/`v` output.
 - [x] Add brute-force differential tests for random small formulas and known SAT/UNSAT fixtures. Browser coverage also exercises gzip input/cache hits, malformed locations, decompression limits, and bounded cancellation/resume.
@@ -125,16 +138,25 @@ Exit gate: a valid public formula can be created, uploaded, inspected, cancelled
 
 Branch: `codex/hivesat-05-leasing`
 
-- [x] Implement hibernating Job Coordinator WebSockets and versioned `HELLO`, `REQUEST_WORK`, `HEARTBEAT`, `SPLIT`, `YIELD`, `RESULT`, and cancellation messages. Both protocol directions use bounded runtime validation; application `PING`/`PONG` uses a hibernation auto-response.
-- [x] Persist a lease before sending work. Use unpredictable lease IDs, bounded attempts, and atomic task transitions. Leases use 192-bit random IDs, five-attempt fail-closed recovery, and SQLite transactions for lease/task changes plus duplicate-response recording.
-- [x] Target roughly ten-minute desktop tasks with 15-minute leases; use 60-second batched heartbeats and persist only authoritative transitions or an exceptional lease extension. Ordinary telemetry heartbeats do not write lease progress; one bounded five-minute extension may be persisted near expiry.
+- [x] Implement hibernating Job Coordinator WebSockets and protocol-v4
+  `HELLO`, `SESSION_HEARTBEAT`, `SPLIT`, `YIELD`, and `RESULT` messages plus
+  coordinator-pushed `WORK` and `SPLIT_PERMIT`. Both directions use bounded
+  runtime validation; application `PING`/`PONG` uses a hibernation auto-response.
+- [x] Persist a lease before pushing work. Use unpredictable lease IDs, stable
+  `(sessionId, slotId)` ownership, atomic task transitions, and duplicate
+  response recording. Lease count is telemetry; expiry always requeues
+  non-terminal work and never exhausts a task-attempt budget.
+- [x] Use one 60-second heartbeat per session. Active slots receive rolling
+  five-minute renewals capped at 60 minutes from issue and job expiry; only
+  authoritative deadline changes are persisted.
 - [x] Consolidate lease recovery and job expiry into the object’s single earliest-deadline alarm. The alarm recomputes the earlier deadline after every authoritative transition.
 - [x] Accept valid decisive evidence from stale leases, but reject stale splits and ordinary progress mutations. Phase 5 stores structurally valid stale SAT/UNSAT candidates without promoting them to a terminal verdict; independent evidence verification remains Phase 7.
 - [x] Add socket attachments, reconnect/backoff, duplicate-message handling, and bounded alarm batches. Stable sessions resume active leases after hibernation, the browser transport uses capped jittered exponential backoff, and alarms recover at most 64 leases per invocation.
 
 Phase 5 implementation note: the coordinator's append-only internal SQLite
-schema migration 2 adds lease history, candidate evidence, processed-message
-replay, task attempts, and active-lease ownership. No Wrangler namespace
+schema migrations retain lease history, candidate evidence, processed-message
+replay, and active-lease ownership; migration 7 adds stable slot identity,
+rolling-tenure deadlines, split permits, and monotonic transition metadata. No Wrangler namespace
 migration was added because the existing `JobCoordinatorDO` class remains in
 `v0001_job_platform`. The wire contract and trust boundaries are documented in
 `docs/coordinator-protocol.md`.
@@ -147,9 +169,15 @@ Branch: `codex/hivesat-06-distributed-cubes`
 
 - [x] Add a browser worker pool with conservative defaults: up to two desktop workers and one mobile worker, bounded by user preference and detected capacity. `DistributedCubeRuntime` owns the external-store snapshot and one single-threaded CaDiCaL Dedicated Worker per slot.
 - [x] Use CaDiCaL `lookahead()` to split only into exact complementary children `C ∧ l` and `C ∧ ¬l`; the coordinator independently validates coverage. Browsers send only the literal; the coordinator constructs and persists both children atomically.
-- [x] Use queue watermarks of approximately 1×/3×/8× active workers, a maximum cube depth of 64, and a 10,000-task ceiling. Every WORK message carries the coordinator-derived queue snapshot used to decide whether lookahead splitting is appropriate.
-- [x] When a budget expires without a safe split, yield and restart the cube later; do not migrate CDCL state. Cube assumptions are reapplied on every bounded slice and yielded cubes return to READY.
-- [x] Give a user’s active job first claim on every local worker. Only workers for which no owner task is ready request public swarm work. The owner-first claim policy is explicit and unit tested; the job page exposes the owner runtime while public-swarm admission remains Phase 8.
+- [x] Let the coordinator grant short-lived split permits after one second of
+  active search only when the frontier is below `min(2 × connected slots, 16)`.
+  Retain maximum cube depth 64 and a 10,000-task safety ceiling.
+- [x] Keep conquering when no split permit exists or a permit becomes
+  unnecessary. Cube assumptions are reapplied on every bounded call; a worker
+  yields only for pause, shutdown, unsupported execution, or a worker error.
+- [x] Separate local and public worker ownership. Home owns local-only solving;
+  only the explicitly started `/swarm` runtime accepts public work; job status
+  pages never create solver workers.
 - [x] Cache formulas locally and never send full formulas or proof data through WebSockets. Public downloads revalidate IndexedDB hits and cache newly verified canonical/gzip bytes by SHA-256.
 
 Phase 6 implementation note: the sequential learning guide begins at
@@ -168,18 +196,22 @@ Branch: `codex/hivesat-07-results`
 
 - [x] Encode SAT models as compact bitsets with formula, cube, path, and solver-version metadata. `HSMODL01` artifacts carry bounded JSON metadata plus one truth bit per variable and are uploaded under their lease ID.
 - [x] Verify final SAT models independently inside a `ResultVerifierDO`; invalid results quarantine that session and requeue the task. The coordinator reads both KV values and streams them to the verifier, which hashes and decodes both formats before checking the cube and every clause.
-- [x] Treat browser-reported UNSAT as a candidate only. Require an independent repeated solve before requesting proof production, but never promote consensus alone to final UNSAT.
+- [x] Treat browser-reported UNSAT as a candidate only. Send the first valid
+  candidate directly to a fresh proof finisher; repeated browser agreement is
+  not a trust boundary and consensus alone can never promote UNSAT.
 - [x] Propagate task completion through the tree only when complementary coverage is intact. Upward propagation requires exactly two completed children with the parent prefix and opposite final literals.
 - [x] Define invalid-formula, invalid-model, verification-timeout, exhausted-budget, and conflicting-result behavior explicitly. The fail-closed state table and SAT/UNSAT asymmetry are documented in the sequential guide.
-- [x] Track session reliability only for lease sizing and abuse containment; it never affects job priority. Invalid-model sessions are quarantined; verifier timeouts are recorded separately.
+- [x] Track session reliability only for abuse containment and observability; it
+  never affects lease tenure or job priority. Invalid-model sessions are
+  quarantined; verifier timeouts are recorded separately.
 
 Phase 7 implementation note: the append-only Wrangler migration
 `v0002_result_verifier` introduces the short-lived verifier namespace, while
 Job Coordinator internal schema migration 3 adds candidate manifests,
 verification state, and session reliability. Detailed diagrams, artifact
 layout, examples, and failure semantics are in
-`docs/guide/04-result-correctness.md`. Repeated UNSAT is deliberately retained
-as `UNSAT_CANDIDATE`; proof-backed terminal UNSAT remains Phase 10.
+`docs/guide/04-result-correctness.md`. The first UNSAT candidate enters
+proof-required work; proof-backed terminal UNSAT remains Phase 10.
 
 Exit gate: no malformed, stale, incomplete, or unverified result can produce a terminal job verdict.
 
@@ -189,16 +221,22 @@ Branch: `codex/hivesat-08-public-swarm`
 
 - [x] Connect opted-in browsers to `SwarmDirectoryDO`, assign a job, then move the browser to that job’s coordinator so only one DO socket is active. Directory sockets are one-shot and close before `PublicSwarmRuntime` starts the job runtime.
 - [x] Schedule the active job with the lowest equal-weight virtual worker runtime. New jobs enter at the current minimum so they receive service without monopolizing the swarm.
-- [x] Reconcile reserved versus actual active worker time; use hour-scale assignment quanta to avoid excessive WebSocket handshakes.
-- [x] Use capability calibration for task sizing and lease length, not priority. Calibration selects 50/100/200-conflict slices and bounded 10/15/20-minute leases; the fair selection function cannot see it.
+- [x] Create a five-minute pending directory handoff, activate it from the job
+  coordinator `HELLO` into an hour-scale assignment quantum, and reconcile
+  reserved versus actual active worker time. Unactivated expiry releases
+  capacity and refunds the tentative virtual runtime.
+- [x] Use capability calibration for local 50/100/200-conflict slices, never
+  priority. All slots use the same five-minute rolling lease with a 60-minute
+  tenure cap; the fair selection function cannot see calibration.
 - [x] Apply aging and a per-job concurrency ceiling so all eligible jobs progress; no credits, contribution register, paid priority, or long-term contributor advantage.
 - [x] Allow non-contributors to submit and receive the same public scheduling weight as contributors. The scheduling schema has no contributor or owner weight field.
 
 Phase 8 implementation note: Swarm Directory internal schema migration 2 adds
 eligibility, virtual worker-time accounting, active reservations, aging inputs,
 and an eight-worker per-job ceiling. `PublicSwarmRuntime` performs the
-directory-to-coordinator handoff and reports measured active worker time on its
-next directory connection. Deterministic simulations cover unequal tasks,
+directory-to-coordinator handoff, activates the pending assignment through
+coordinator `HELLO`, and reports measured active worker time on its next
+directory connection. Deterministic simulations cover unequal tasks,
 heterogeneous capacities, churn, new arrivals, and concurrency saturation.
 The illustrated scheduling walkthrough is
 `docs/guide/05-fair-swarm-scheduling.md`.
@@ -242,7 +280,9 @@ Exit gate: responsive and accessible behavior is verified on modern desktop brow
 
 Branch: `codex/hivesat-10-unsat-proofs`
 
-- [x] Reassign an UNSAT candidate to a fresh proof-finisher CaDiCaL instance with tracing enabled before clauses are loaded.
+- [x] Reassign the first valid UNSAT candidate to a proof-capable slot, which
+  discards its search solver and creates a fresh proof-finisher CaDiCaL instance
+  with tracing enabled before clauses are loaded.
 - [x] Produce gzip-compressed LRAT for `F ∧ cube`, with a manifest binding the proof to the formula hash, cube assumptions, path hash, clause IDs, solver version, and artifact hash.
 - [x] Stream proofs to Workers KV under lease-scoped upload tokens. Cap each job at 25 MiB compressed and 128 MiB decompressed proof data; split further or return `UNKNOWN` when exceeded.
 - [x] Pin and compile the independent MIT-licensed `lrat-check.c` checker from DRAT-trim for browser and bounded Durable Object use. [DRAT-trim/LRAT checker](https://github.com/marijnheule/drat-trim).
@@ -273,13 +313,16 @@ Branch: `codex/hivesat-11-launch-hardening`
 
 - [x] Fuzz DIMACS, decompression, WebSocket, API, model, and proof parsers; enforce message, assumption, task, upload, and artifact limits.
 - [x] Add session quarantine, Turnstile replay prevention, HMACed network identifiers, token rotation, CSP/security headers, and structured error responses.
-- [x] Load-test several hundred intermittent clients with realistic 60-second heartbeats and long task leases; verify DO request, duration, row-write, and Workers KV-operation projections remain below configurable safety margins.
+- [x] Load-test several hundred intermittent clients with one 60-second
+  heartbeat per session and five-minute rolling leases capped at 60 minutes;
+  verify DO request, duration, row-write, and Workers KV-operation projections
+  remain below configurable safety margins.
 - [x] Add admission and swarm kill switches, maximum active connections/jobs, exponential client backoff, quota dashboards, and operator runbooks.
 - [x] Test expiry and Workers KV cleanup, schema migration, rolling deployment, older-client rejection, and recovery from partial deployment.
 - [x] Remove simulation copy, enable the public swarm flag, and publish privacy/trust limitations.
 - [ ] Perform the final production smoke test after manual integration. This delivery run explicitly forbids deployments, so no production mutation or smoke test is performed from these stacked branches.
 
-Phase 11 implementation note: the public protocol advances to version 2 and
+Phase 11 implementation note: the current public protocol is version 4 and
 rejects older clients before allocation. Swarm Directory internal migration 3
 adds a single-use Turnstile replay ledger and its alarm cleanup. Owner tokens
 can be rotated atomically; invalid models and proofs quarantine sessions;
@@ -310,7 +353,8 @@ Exit gate: production remains usable when quotas are approached, malicious clien
 - All submitted server jobs are public to swarm participants; confidential formulas are explicitly unsupported.
 - Anonymous device identity plus Turnstile is sufficient; there are no accounts, private cohorts, cross-device history, payments, credits, or contributor-priority rules.
 - Users may submit jobs without contributing. Other-user computation is explicit opt-in and runs only on `/swarm`.
-- Personal jobs preempt public work on the same device.
+- Local solving and public contribution are separate route-owned runtimes; a
+  page does not silently lend its workers to the other experience.
 - The roadmap stops at a robust proof-capable core. Learned-clause sharing, full solver checkpoints, adaptive portfolio selection, research-grade scheduling, and a full search-tree UI are deferred.
 - Workers KV must be available on the Cloudflare account, although usage is intended to remain inside the included allowance.
 - Free-plan operation is a fail-closed target, not a guarantee: capacity is rejected or work returns `UNKNOWN` instead of silently incurring unsupported behavior or weakening correctness.

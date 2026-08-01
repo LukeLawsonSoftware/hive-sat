@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
   <title id="title">HiveSAT fair swarm handoff</title>
-  <desc id="desc">A browser connects to the swarm directory, receives a fair one-hour job assignment, closes that socket, computes through the selected job coordinator, and later reconciles actual worker time.</desc>
+  <desc id="desc">A browser receives a five-minute pending handoff from the swarm directory. Coordinator HELLO activates the one-hour quantum; unactivated handoffs are refunded.</desc>
   <defs>
     <linearGradient id="bg8" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#10150e"/>
@@ -30,15 +30,15 @@
   <text x="552" y="150" text-anchor="middle" class="h">SwarmDirectoryDO</text>
   <text x="552" y="188" text-anchor="middle" class="t">lowest virtual worker time</text>
   <text x="552" y="220" text-anchor="middle" class="t">aging + concurrency cap</text>
-  <text x="552" y="254" text-anchor="middle" class="s">reserve hour-scale worker-ms</text>
+  <text x="552" y="254" text-anchor="middle" class="s">5 min pending; tentative hour reserve</text>
   <rect x="830" y="220" width="315" height="145" rx="16" class="amber"/>
   <text x="987" y="263" text-anchor="middle" class="h">JobCoordinatorDO</text>
   <text x="987" y="300" text-anchor="middle" class="t">cube tasks + leases</text>
-  <text x="987" y="330" text-anchor="middle" class="s">directory socket already closed</text>
+  <text x="987" y="330" text-anchor="middle" class="s">HELLO activates one-hour quantum</text>
   <path d="M275 255 C325 210 345 190 390 190" class="a"/>
   <text x="322" y="190" class="s">ask</text>
   <path d="M715 225 C775 240 790 270 830 280" class="a"/>
-  <text x="743" y="230" class="s">handoff</text>
+  <text x="743" y="230" class="s">pending handoff</text>
   <path d="M830 335 C700 475 390 485 275 345" class="a"/>
   <text x="545" y="493" text-anchor="middle" class="s">quantum ends: close coordinator socket</text>
   <path d="M275 325 C320 410 350 390 430 300" class="dash"/>

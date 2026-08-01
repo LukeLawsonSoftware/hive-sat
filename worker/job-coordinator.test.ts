@@ -7,9 +7,12 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   COORDINATOR_ALARM_BATCH_SIZE,
-  COORDINATOR_MAX_TASK_ATTEMPTS,
+  COORDINATOR_MAX_CUBE_DEPTH,
+  COORDINATOR_MAX_TASKS,
+  COORDINATOR_SPLIT_SEED_MS,
   type CoordinatorServerMessage,
 } from "../shared/coordinator-protocol";
+import { PUBLIC_JOB_PROTOCOL_VERSION } from "../shared/public-jobs";
 import {
   encodeSatModelArtifact,
   resultPathHash,
@@ -53,14 +56,31 @@ async function openSocket(stub: DurableObjectStub<JobCoordinatorDO>): Promise<We
   return response.webSocket;
 }
 
-function nextMessage(socket: WebSocket): Promise<CoordinatorServerMessage | "PONG"> {
+type TestSocketMessage = CoordinatorServerMessage | "PONG";
+
+function nextMessages(socket: WebSocket, count: number): Promise<TestSocketMessage[]> {
   return new Promise((resolve, reject) => {
-    socket.addEventListener("message", (event) => {
-      if (event.data === "PONG") resolve("PONG");
-      else resolve(JSON.parse(String(event.data)) as CoordinatorServerMessage);
-    }, { once: true });
-    socket.addEventListener("error", () => reject(new Error("WebSocket test connection failed.")), { once: true });
+    const messages: TestSocketMessage[] = [];
+    const onMessage = (event: MessageEvent) => {
+      messages.push(event.data === "PONG"
+        ? "PONG"
+        : JSON.parse(String(event.data)) as CoordinatorServerMessage);
+      if (messages.length !== count) return;
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("error", onError);
+      resolve(messages);
+    };
+    const onError = () => {
+      socket.removeEventListener("message", onMessage);
+      reject(new Error("WebSocket test connection failed."));
+    };
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("error", onError, { once: true });
   });
+}
+
+async function nextMessage(socket: WebSocket): Promise<TestSocketMessage> {
+  return (await nextMessages(socket, 1))[0]!;
 }
 
 async function send(
@@ -72,24 +92,87 @@ async function send(
   return response;
 }
 
+async function sendMany(
+  socket: WebSocket,
+  message: Record<string, unknown>,
+  responseCount: number,
+): Promise<TestSocketMessage[]> {
+  const responses = nextMessages(socket, responseCount);
+  socket.send(JSON.stringify(message));
+  return responses;
+}
+
 async function hello(socket: WebSocket, jobId: string, sessionId: string) {
+  const slotIds = [`${sessionId}-slot-0`];
   return send(socket, {
     type: "HELLO",
-    protocolVersion: 3,
+    protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
     messageId: `hello-${sessionId}`,
     jobId,
     sessionId,
+    slotIds,
     capabilities: {
       hardwareConcurrency: 8,
-      maxWorkers: 2,
+      maxWorkers: slotIds.length,
       mobile: false,
       solverVersion: "cadical-3.0.1",
+      proofGeneration: false,
     },
   });
 }
 
-async function requestWork(socket: WebSocket, jobId: string, messageId: string) {
-  return send(socket, { type: "REQUEST_WORK", protocolVersion: 3, messageId, jobId });
+async function helloWithSlots(
+  socket: WebSocket,
+  jobId: string,
+  sessionId: string,
+  slotIds: string[],
+  options: { assignmentId?: string; proofGeneration?: boolean } = {},
+) {
+  return send(socket, {
+    type: "HELLO",
+    protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+    messageId: `hello-${sessionId}`,
+    jobId,
+    sessionId,
+    slotIds,
+    ...(options.assignmentId ? { assignmentId: options.assignmentId } : {}),
+    capabilities: {
+      hardwareConcurrency: 8,
+      maxWorkers: slotIds.length,
+      mobile: false,
+      solverVersion: "cadical-3.0.1",
+      proofGeneration: options.proofGeneration ?? false,
+    },
+  });
+}
+
+async function helloAndWork(
+  socket: WebSocket,
+  jobId: string,
+  sessionId: string,
+  slotIds = [`${sessionId}-slot-0`],
+  options: { assignmentId?: string; proofGeneration?: boolean } = {},
+) {
+  const welcome = await send(socket, {
+    type: "HELLO",
+    protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+    messageId: `hello-${sessionId}`,
+    jobId,
+    sessionId,
+    slotIds,
+    ...(options.assignmentId ? { assignmentId: options.assignmentId } : {}),
+    capabilities: {
+      hardwareConcurrency: 8,
+      maxWorkers: slotIds.length,
+      mobile: false,
+      solverVersion: "cadical-3.0.1",
+      proofGeneration: options.proofGeneration ?? false,
+    },
+  });
+  if (welcome === "PONG" || welcome.type !== "WELCOME" || welcome.activeLeases.length === 0) {
+    throw new Error(`Expected WELCOME with an active lease: ${JSON.stringify(welcome)}`);
+  }
+  return { welcome, work: welcome.activeLeases[0]! };
 }
 
 function expectWork(message: CoordinatorServerMessage | "PONG") {
@@ -109,25 +192,34 @@ async function gzip(bytes: Uint8Array): Promise<ArrayBuffer> {
 }
 
 describe("JobCoordinatorDO leasing protocol", () => {
-  it("persists a lease before delivery and replays duplicate requests idempotently", async () => {
+  it("persists an initial slot lease in WELCOME", async () => {
     const { jobId, stub } = await initializedCoordinator();
     const socket = await openSocket(stub);
-    await expect(hello(socket, jobId, "session-one")).resolves.toMatchObject({
+    const slotId = "session-one-slot";
+    const { welcome, work } = await helloAndWork(socket, jobId, "session-one", [slotId]);
+    expect(welcome).toMatchObject({
       type: "WELCOME",
-      activeLeases: [],
+      activeLeases: [{ slotId, task: { taskId: "root" }, lease: { slotId } }],
     });
-
-    const first = expectWork(await requestWork(socket, jobId, "request-one"));
-    const duplicate = expectWork(await requestWork(socket, jobId, "request-one"));
-    expect(duplicate).toEqual(first);
+    expect(work).toMatchObject({
+      slotId,
+      task: { taskId: "root", purpose: "SEARCH" },
+      lease: { slotId, taskId: "root", leaseCount: 1 },
+    });
 
     await runInDurableObject(stub, (_instance, state) => {
       const lease = state.storage.sql.exec<{
         lease_id: string;
+        slot_id: string;
         status: string;
-        attempt: number;
-      }>("SELECT lease_id, status, attempt FROM leases").one();
-      expect(lease).toEqual({ lease_id: first.lease.leaseId, status: "ACTIVE", attempt: 1 });
+        lease_count: number;
+      }>("SELECT lease_id, slot_id, status, lease_count FROM leases").one();
+      expect(lease).toEqual({
+        lease_id: work.lease.leaseId,
+        slot_id: slotId,
+        status: "ACTIVE",
+        lease_count: 1,
+      });
       expect(state.storage.sql.exec<{ total: number }>("SELECT COUNT(*) AS total FROM leases").one().total).toBe(1);
       expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM tasks WHERE task_id = 'root'").one().state).toBe("LEASED");
 
@@ -135,6 +227,58 @@ describe("JobCoordinatorDO leasing protocol", () => {
       expect(serverSocket.deserializeAttachment()).toMatchObject({
         jobId,
         sessionId: "session-one",
+        assignmentId: null,
+        slotIds: [slotId],
+      });
+    });
+    socket.close(1000, "done");
+  });
+
+  it("activates a pending directory reservation during HELLO", async () => {
+    const { jobId, stub } = await initializedCoordinator();
+    const directory = env.SWARM_DIRECTORY.getByName("global-v1");
+    const now = Date.now();
+    await expect(directory.admit({
+      jobId,
+      deviceDigest: "activation-device",
+      networkDigest: "activation-network",
+      createdAt: now - 10,
+      expiresAt: now + 24 * 60 * 60_000,
+      globalCeiling: 100,
+    })).resolves.toEqual({ ok: true });
+    expect(await directory.markReady(jobId, now - 10)).toBe(true);
+    const assignment = await directory.assign("reserved-session", {
+      hardwareConcurrency: 8,
+      maxWorkers: 1,
+      mobile: false,
+      solverVersion: "cadical-3.0.1",
+      proofGeneration: false,
+    }, undefined, now - 1);
+    expect(assignment).toMatchObject({ ok: true, jobId, workers: 1 });
+    if (!assignment.ok) throw new Error("Expected a pending directory assignment.");
+    await runInDurableObject(directory, (_instance, state) => {
+      expect(state.storage.sql.exec<{ status: string }>(
+        "SELECT status FROM assignments WHERE assignment_id = ?",
+        assignment.assignmentId,
+      ).one().status).toBe("PENDING");
+    });
+
+    const socket = await openSocket(stub);
+    const { welcome, work } = await helloAndWork(socket, jobId, "reserved-session", ["reserved-slot"], {
+      assignmentId: assignment.assignmentId,
+    });
+    expect(welcome).toMatchObject({ type: "WELCOME" });
+    expect(work).toMatchObject({ slotId: "reserved-slot", task: { taskId: "root" } });
+    await runInDurableObject(directory, (_instance, state) => {
+      expect(state.storage.sql.exec<{ status: string }>(
+        "SELECT status FROM assignments WHERE assignment_id = ?",
+        assignment.assignmentId,
+      ).one().status).toBe("ACTIVE");
+    });
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.getWebSockets()[0]?.deserializeAttachment()).toMatchObject({
+        sessionId: "reserved-session",
+        assignmentId: assignment.assignmentId,
       });
     });
     socket.close(1000, "done");
@@ -143,13 +287,13 @@ describe("JobCoordinatorDO leasing protocol", () => {
   it("restores socket attachments and active leases after hibernation/reconnect", async () => {
     const { jobId, stub } = await initializedCoordinator();
     const firstSocket = await openSocket(stub);
-    await hello(firstSocket, jobId, "resumable-session");
-    const work = expectWork(await requestWork(firstSocket, jobId, "request-resume"));
+    const slotId = "resumable-slot";
+    const { work } = await helloAndWork(firstSocket, jobId, "resumable-session", [slotId]);
 
     await runInDurableObject(stub, (_instance, state) => {
       expect(state.storage.sql.exec<{ id: number }>(
         "SELECT id FROM _sql_schema_migrations ORDER BY id",
-      ).toArray().map((row) => row.id)).toEqual([1, 2, 3, 4, 5, 6]);
+      ).toArray().map((row) => row.id)).toEqual([1, 2, 3, 4, 5, 6, 7]);
     });
 
     await evictDurableObject(stub);
@@ -159,92 +303,120 @@ describe("JobCoordinatorDO leasing protocol", () => {
 
     firstSocket.close(1000, "reconnect");
     const secondSocket = await openSocket(stub);
-    const welcome = await hello(secondSocket, jobId, "resumable-session");
+    const welcome = await helloWithSlots(secondSocket, jobId, "resumable-session", [slotId]);
     expect(welcome).toMatchObject({
       type: "WELCOME",
-      activeLeases: [{ lease: { leaseId: work.lease.leaseId }, task: { taskId: "root" } }],
+      activeLeases: [{
+        slotId,
+        lease: { leaseId: work.lease.leaseId, slotId },
+        task: { taskId: "root" },
+      }],
     });
     secondSocket.close(1000, "done");
   });
 
-  it("batches heartbeat progress, extends exceptionally, yields, and splits atomically", async () => {
+  it("renews a session heartbeat, splits only with a permit, and requeues a yielded slot", async () => {
     const { jobId, stub } = await initializedCoordinator();
     const socket = await openSocket(stub);
-    await hello(socket, jobId, "transition-session");
-    const first = expectWork(await requestWork(socket, jobId, "transition-work-one"));
+    const slotIds = ["transition-slot-a", "transition-slot-b"];
+    const { work: first } = await helloAndWork(socket, jobId, "transition-session", slotIds);
+    expect(first.slotId).toBe(slotIds[0]);
+
+    await expect(send(socket, {
+      type: "SPLIT",
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+      messageId: "split-without-permit",
+      jobId,
+      slotId: first.slotId,
+      taskId: first.task.taskId,
+      leaseId: first.lease.leaseId,
+      permitId: "forged-permit",
+      splitLiteral: 3,
+    })).resolves.toMatchObject({
+      type: "ERROR",
+      code: "SPLIT_NOT_NEEDED",
+      retryable: true,
+    });
 
     const heartbeat = {
-      type: "HEARTBEAT",
-      protocolVersion: 3,
+      type: "SESSION_HEARTBEAT",
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: "heartbeat-batch",
       jobId,
-      taskId: "root",
-      leaseId: first.lease.leaseId,
-      progress: { activeMs: 60_000, conflicts: 10, decisions: 20, propagations: 30 },
+      slots: [
+        {
+          slotId: first.slotId,
+          leaseId: first.lease.leaseId,
+          activeMs: COORDINATOR_SPLIT_SEED_MS,
+          conflicts: 10,
+          decisions: 20,
+          propagations: 30,
+        },
+        {
+          slotId: slotIds[1],
+          leaseId: null,
+          activeMs: 0,
+          conflicts: 0,
+          decisions: 0,
+          propagations: 0,
+        },
+      ],
     };
-    await expect(send(socket, heartbeat)).resolves.toMatchObject({
-      type: "ACK",
-      action: "HEARTBEAT",
-      leaseExpiresAt: first.lease.expiresAt,
-    });
     await runInDurableObject(stub, (_instance, state) => {
-      expect(state.storage.sql.exec<{ total: number }>(
-        "SELECT COUNT(*) AS total FROM processed_messages",
-      ).one().total).toBe(1);
       state.storage.sql.exec(
         "UPDATE leases SET expires_at = ? WHERE lease_id = ?",
         Date.now() + 60_000,
         first.lease.leaseId,
       );
     });
-
-    const extension = { ...heartbeat, messageId: "heartbeat-extension", requestExtension: true };
-    const extended = await send(socket, extension);
-    expect(extended).toMatchObject({ type: "ACK", action: "HEARTBEAT" });
-    expect(await send(socket, extension)).toEqual(extended);
+    const [heartbeatAck, permit] = await sendMany(socket, heartbeat, 2);
+    expect(heartbeatAck).toMatchObject({
+      type: "ACK",
+      action: "SESSION_HEARTBEAT",
+    });
+    expect(permit).toMatchObject({
+      type: "SPLIT_PERMIT",
+      slotId: first.slotId,
+      taskId: "root",
+      leaseId: first.lease.leaseId,
+    });
+    if (permit === "PONG" || permit.type !== "SPLIT_PERMIT") {
+      throw new Error("Expected SPLIT_PERMIT.");
+    }
     await runInDurableObject(stub, (_instance, state) => {
-      const lease = state.storage.sql.exec<{ extended: number; expires_at: number }>(
-        "SELECT extended, expires_at FROM leases WHERE lease_id = ?",
+      const lease = state.storage.sql.exec<{ last_active_ms: number; expires_at: number }>(
+        "SELECT last_active_ms, expires_at FROM leases WHERE lease_id = ?",
         first.lease.leaseId,
       ).one();
-      expect(lease.extended).toBe(1);
+      expect(lease.last_active_ms).toBe(COORDINATOR_SPLIT_SEED_MS);
       expect(lease.expires_at).toBeGreaterThan(Date.now() + 60_000);
     });
 
-    await expect(send(socket, {
-      type: "YIELD",
-      protocolVersion: 3,
-      messageId: "yield-one",
-      jobId,
-      taskId: "root",
-      leaseId: first.lease.leaseId,
-      reason: "BUDGET",
-    })).resolves.toMatchObject({ type: "ACK", action: "YIELD" });
-    const second = expectWork(await requestWork(socket, jobId, "transition-work-two"));
-    expect(second.queue).toMatchObject({
-      activeWorkers: 1,
-      lowWatermark: 1,
-      targetWatermark: 3,
-      highWatermark: 8,
-      canSplit: true,
-    });
-    await expect(send(socket, {
+    const [splitAck, childAMessage, childBMessage] = await sendMany(socket, {
       type: "SPLIT",
-      protocolVersion: 3,
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: "split-one",
       jobId,
+      slotId: first.slotId,
       taskId: "root",
-      leaseId: second.lease.leaseId,
+      leaseId: first.lease.leaseId,
+      permitId: permit.permitId,
       splitLiteral: 3,
-    })).resolves.toMatchObject({ type: "ACK", action: "SPLIT" });
+    }, 3);
+    expect(splitAck).toMatchObject({ type: "ACK", action: "SPLIT" });
+    const childA = expectWork(childAMessage!);
+    const childB = expectWork(childBMessage!);
+    expect(new Set([childA.task.assumptions.join(","), childB.task.assumptions.join(",")]))
+      .toEqual(new Set(["3", "-3"]));
+    expect(new Set([childA.slotId, childB.slotId])).toEqual(new Set(slotIds));
 
     await runInDurableObject(stub, (_instance, state) => {
       const children = state.storage.sql.exec<{ assumptions_json: string; state: string }>(
         "SELECT assumptions_json, state FROM tasks WHERE parent_task_id = 'root' ORDER BY assumptions_json",
       ).toArray();
       expect(children).toEqual([
-        { assumptions_json: "[-3]", state: "READY" },
-        { assumptions_json: "[3]", state: "READY" },
+        { assumptions_json: "[-3]", state: "LEASED" },
+        { assumptions_json: "[3]", state: "LEASED" },
       ]);
       expect(state.storage.sql.exec<{ state: string }>(
         "SELECT state FROM tasks WHERE task_id = 'root'",
@@ -254,14 +426,139 @@ describe("JobCoordinatorDO leasing protocol", () => {
       ).one();
       expect(JSON.parse(parent.assumptions_json)).toEqual([]);
     });
+
+    const [yieldAck, reassignedMessage] = await sendMany(socket, {
+      type: "YIELD",
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+      messageId: "yield-one",
+      jobId,
+      slotId: childA.slotId,
+      taskId: childA.task.taskId,
+      leaseId: childA.lease.leaseId,
+      reason: "PAUSED",
+    }, 2);
+    expect(yieldAck).toMatchObject({ type: "ACK", action: "YIELD" });
+    const reassigned = expectWork(reassignedMessage!);
+    expect(reassigned).toMatchObject({
+      slotId: childA.slotId,
+      task: { taskId: childA.task.taskId, assumptions: childA.task.assumptions },
+      lease: { leaseCount: 2 },
+    });
+    socket.close(1000, "done");
+  });
+
+  it("withholds split permits at the maximum cube depth without abandoning the lease", async () => {
+    const { jobId, stub } = await initializedCoordinator();
+    const socket = await openSocket(stub);
+    const slotIds = ["depth-slot-a", "depth-slot-b"];
+    const { work } = await helloAndWork(socket, jobId, "depth-session", slotIds);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE tasks SET depth = ? WHERE task_id = ?",
+        COORDINATOR_MAX_CUBE_DEPTH,
+        work.task.taskId,
+      );
+    });
+
+    await expect(send(socket, {
+      type: "SESSION_HEARTBEAT",
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+      messageId: "depth-heartbeat",
+      jobId,
+      slots: slotIds.map((slotId) => ({
+        slotId,
+        leaseId: slotId === work.slotId ? work.lease.leaseId : null,
+        activeMs: slotId === work.slotId ? COORDINATOR_SPLIT_SEED_MS : 0,
+        conflicts: 0,
+        decisions: 0,
+        propagations: 0,
+      })),
+    })).resolves.toMatchObject({ type: "ACK", action: "SESSION_HEARTBEAT" });
+
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM split_permits",
+      ).one().total).toBe(0);
+      expect(state.storage.sql.exec<{ state: string; active_lease_id: string | null }>(
+        "SELECT state, active_lease_id FROM tasks WHERE task_id = ?",
+        work.task.taskId,
+      ).one()).toEqual({ state: "LEASED", active_lease_id: work.lease.leaseId });
+      expect(state.storage.sql.exec<{ status: string }>(
+        "SELECT status FROM leases WHERE lease_id = ?",
+        work.lease.leaseId,
+      ).one().status).toBe("ACTIVE");
+    });
+    socket.close(1000, "done");
+  });
+
+  it("withholds split permits at the task ceiling without abandoning the lease", async () => {
+    const { jobId, stub } = await initializedCoordinator();
+    const socket = await openSocket(stub);
+    const slotIds = ["ceiling-slot-a", "ceiling-slot-b"];
+    const { work } = await helloAndWork(socket, jobId, "task-ceiling-session", slotIds);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `WITH digits(value) AS (
+           VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+         ), numbers(value) AS (
+           SELECT ones.value + tens.value * 10 + hundreds.value * 100 + thousands.value * 1000
+           FROM digits AS ones
+           CROSS JOIN digits AS tens
+           CROSS JOIN digits AS hundreds
+           CROSS JOIN digits AS thousands
+           ORDER BY 1
+           LIMIT ?
+         )
+         INSERT INTO tasks (
+           task_id, parent_task_id, depth, assumptions_json, state, created_at, updated_at
+         )
+         SELECT 'ceiling-' || value, 'root', 1, '[]', 'SPLIT', ?, ? FROM numbers`,
+        COORDINATOR_MAX_TASKS - 1,
+        Date.now(),
+        Date.now(),
+      );
+      expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM tasks",
+      ).one().total).toBe(COORDINATOR_MAX_TASKS);
+    });
+
+    await expect(send(socket, {
+      type: "SESSION_HEARTBEAT",
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+      messageId: "task-ceiling-heartbeat",
+      jobId,
+      slots: slotIds.map((slotId) => ({
+        slotId,
+        leaseId: slotId === work.slotId ? work.lease.leaseId : null,
+        activeMs: slotId === work.slotId ? COORDINATOR_SPLIT_SEED_MS : 0,
+        conflicts: 0,
+        decisions: 0,
+        propagations: 0,
+      })),
+    })).resolves.toMatchObject({ type: "ACK", action: "SESSION_HEARTBEAT" });
+
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM split_permits",
+      ).one().total).toBe(0);
+      expect(state.storage.sql.exec<{ state: string; active_lease_id: string | null }>(
+        "SELECT state, active_lease_id FROM tasks WHERE task_id = ?",
+        work.task.taskId,
+      ).one()).toEqual({ state: "LEASED", active_lease_id: work.lease.leaseId });
+      expect(state.storage.sql.exec<{ status: string }>(
+        "SELECT status FROM leases WHERE lease_id = ?",
+        work.lease.leaseId,
+      ).one().status).toBe("ACTIVE");
+    });
     socket.close(1000, "done");
   });
 
   it("expires and reassigns work, rejects stale mutations, and accepts duplicate stale evidence once", async () => {
     const { jobId, stub } = await initializedCoordinator();
-    const staleSocket = await openSocket(stub);
-    await hello(staleSocket, jobId, "stale-session");
-    const first = expectWork(await requestWork(staleSocket, jobId, "first-attempt"));
+    const firstSocket = await openSocket(stub);
+    const staleSlotId = "stale-slot";
+    const { work: first } = await helloAndWork(firstSocket, jobId, "stale-session", [staleSlotId]);
+    firstSocket.close(1000, "network churn");
 
     await runInDurableObject(stub, (_instance, state) => {
       state.storage.sql.exec("UPDATE leases SET expires_at = ? WHERE lease_id = ?", Date.now() - 1, first.lease.leaseId);
@@ -270,26 +567,30 @@ describe("JobCoordinatorDO leasing protocol", () => {
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
     const currentSocket = await openSocket(stub);
-    await hello(currentSocket, jobId, "current-session");
-    const second = expectWork(await requestWork(currentSocket, jobId, "second-attempt"));
-    expect(second.lease.attempt).toBe(2);
+    const { work: second } = await helloAndWork(currentSocket, jobId, "current-session");
+    expect(second.lease.leaseCount).toBe(2);
     expect(second.lease.leaseId).not.toBe(first.lease.leaseId);
 
+    const staleSocket = await openSocket(stub);
+    await helloWithSlots(staleSocket, jobId, "stale-session", [staleSlotId]);
     await expect(send(staleSocket, {
       type: "SPLIT",
-      protocolVersion: 3,
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: "stale-split",
       jobId,
+      slotId: staleSlotId,
       taskId: "root",
       leaseId: first.lease.leaseId,
+      permitId: "stale-permit",
       splitLiteral: 1,
     })).resolves.toMatchObject({ type: "ERROR", code: "STALE_LEASE" });
 
     const result = {
       type: "RESULT",
-      protocolVersion: 3,
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: "stale-result",
       jobId,
+      slotId: staleSlotId,
       taskId: "root",
       leaseId: first.lease.leaseId,
       result: "UNSAT",
@@ -316,32 +617,54 @@ describe("JobCoordinatorDO leasing protocol", () => {
     currentSocket.close(1000, "done");
   });
 
-  it("leases exact complementary cubes to separate browser sessions and recovers churn", async () => {
+  it("leases exact complementary cubes to separate slots and recovers browser churn", async () => {
     const { jobId, stub } = await initializedCoordinator();
     const splitterSocket = await openSocket(stub);
-    await hello(splitterSocket, jobId, "splitter-session");
-    const root = expectWork(await requestWork(splitterSocket, jobId, "root-work"));
-    await send(splitterSocket, {
+    const splitSlots = ["splitter-slot-a", "splitter-slot-b"];
+    const { work: root } = await helloAndWork(splitterSocket, jobId, "splitter-session", splitSlots);
+    const [heartbeatAck, permit] = await sendMany(splitterSocket, {
+      type: "SESSION_HEARTBEAT",
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+      messageId: "split-heartbeat",
+      jobId,
+      slots: splitSlots.map((slotId) => ({
+        slotId,
+        leaseId: slotId === root.slotId ? root.lease.leaseId : null,
+        activeMs: slotId === root.slotId ? COORDINATOR_SPLIT_SEED_MS : 0,
+        conflicts: 0,
+        decisions: 0,
+        propagations: 0,
+      })),
+    }, 2);
+    expect(heartbeatAck).toMatchObject({ type: "ACK", action: "SESSION_HEARTBEAT" });
+    if (permit === "PONG" || permit.type !== "SPLIT_PERMIT") {
+      throw new Error("Expected SPLIT_PERMIT.");
+    }
+    const [splitAck, firstMessage, secondMessage] = await sendMany(splitterSocket, {
       type: "SPLIT",
-      protocolVersion: 3,
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: "split-root",
       jobId,
+      slotId: root.slotId,
       taskId: root.task.taskId,
       leaseId: root.lease.leaseId,
+      permitId: permit.permitId,
       splitLiteral: 4,
-    });
+    }, 3);
+    expect(splitAck).toMatchObject({ type: "ACK", action: "SPLIT" });
+    const first = expectWork(firstMessage!);
+    const second = expectWork(secondMessage!);
 
-    const firstSocket = await openSocket(stub);
-    const secondSocket = await openSocket(stub);
-    await hello(firstSocket, jobId, "browser-context-a");
-    await hello(secondSocket, jobId, "browser-context-b");
-    const first = expectWork(await requestWork(firstSocket, jobId, "child-a"));
-    const second = expectWork(await requestWork(secondSocket, jobId, "child-b"));
     expect(new Set([
       first.task.assumptions.join(","),
       second.task.assumptions.join(","),
     ])).toEqual(new Set(["4", "-4"]));
     expect(first.task.taskId).not.toBe(second.task.taskId);
+    expect(first.slotId).not.toBe(second.slotId);
+
+    const replacementSocket = await openSocket(stub);
+    await hello(replacementSocket, jobId, "browser-context-c");
+    splitterSocket.close(1000, "network churn");
 
     await runInDurableObject(stub, (_instance, state) => {
       state.storage.sql.exec(
@@ -351,41 +674,58 @@ describe("JobCoordinatorDO leasing protocol", () => {
       );
       return state.storage.setAlarm(Date.now() + 10_000);
     });
+    const replacementMessage = nextMessage(replacementSocket);
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
-    const replacementSocket = await openSocket(stub);
-    await hello(replacementSocket, jobId, "browser-context-c");
-    const replacement = expectWork(await requestWork(replacementSocket, jobId, "child-replacement"));
+    const replacement = expectWork(await replacementMessage);
     expect(replacement.task.taskId).toBe(first.task.taskId);
     expect(replacement.task.assumptions).toEqual(first.task.assumptions);
-    expect(replacement.lease.attempt).toBe(2);
+    expect(replacement.lease.leaseCount).toBe(2);
 
-    splitterSocket.close(1000, "done");
-    firstSocket.close(1000, "done");
-    secondSocket.close(1000, "done");
     replacementSocket.close(1000, "done");
   });
 
-  it("requires independent UNSAT solves and propagates only exact complementary coverage", async () => {
+  it("promotes each UNSAT candidate directly to proof-finisher work", async () => {
     const { jobId, stub } = await initializedCoordinator();
     const splitter = await openSocket(stub);
-    await hello(splitter, jobId, "coverage-splitter");
-    const root = expectWork(await requestWork(splitter, jobId, "coverage-root"));
-    await send(splitter, {
+    const coverageSlots = ["coverage-slot-a", "coverage-slot-b"];
+    const { work: root } = await helloAndWork(splitter, jobId, "coverage-splitter", coverageSlots);
+    const [heartbeatAck, permit] = await sendMany(splitter, {
+      type: "SESSION_HEARTBEAT",
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
+      messageId: "coverage-heartbeat",
+      jobId,
+      slots: coverageSlots.map((slotId) => ({
+        slotId,
+        leaseId: slotId === root.slotId ? root.lease.leaseId : null,
+        activeMs: slotId === root.slotId ? COORDINATOR_SPLIT_SEED_MS : 0,
+        conflicts: 0,
+        decisions: 0,
+        propagations: 0,
+      })),
+    }, 2);
+    expect(heartbeatAck).toMatchObject({ type: "ACK", action: "SESSION_HEARTBEAT" });
+    if (permit === "PONG" || permit.type !== "SPLIT_PERMIT") {
+      throw new Error("Expected SPLIT_PERMIT.");
+    }
+    const [splitAck, firstChild, secondChild] = await sendMany(splitter, {
       type: "SPLIT",
-      protocolVersion: 3,
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: "coverage-split",
       jobId,
+      slotId: root.slotId,
       taskId: root.task.taskId,
       leaseId: root.lease.leaseId,
+      permitId: permit.permitId,
       splitLiteral: 1,
-    });
+    }, 3);
+    expect(splitAck).toMatchObject({ type: "ACK", action: "SPLIT" });
+    const children = [
+      expectWork(firstChild!),
+      expectWork(secondChild!),
+    ];
 
-    for (let index = 0; index < 4; index += 1) {
-      const sessionId = `independent-${index}`;
-      const socket = await openSocket(stub);
-      await hello(socket, jobId, sessionId);
-      const work = expectWork(await requestWork(socket, jobId, `coverage-work-${index}`));
+    for (const [index, work] of children.entries()) {
       const manifest = {
         kind: "UNSAT_CANDIDATE_V1",
         formulaHash: "ab".repeat(32),
@@ -394,18 +734,18 @@ describe("JobCoordinatorDO leasing protocol", () => {
         pathHash: await resultPathHash(work.task.assumptions),
         solverVersion: "cadical-3.0.1",
       };
-      await expect(send(socket, {
+      await expect(send(splitter, {
         type: "RESULT",
-        protocolVersion: 3,
+        protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
         messageId: `coverage-result-${index}`,
         jobId,
+        slotId: work.slotId,
         taskId: work.task.taskId,
         leaseId: work.lease.leaseId,
         result: "UNSAT",
         evidenceSha256: `${index + 1}`.repeat(64),
         manifest,
       })).resolves.toMatchObject({ type: "ACK", action: "RESULT" });
-      socket.close(1000, "done");
     }
 
     await runInDurableObject(stub, (_instance, state) => {
@@ -419,12 +759,84 @@ describe("JobCoordinatorDO leasing protocol", () => {
         .toBe("RUNNING");
     });
     const finisherSocket = await openSocket(stub);
-    await hello(finisherSocket, jobId, "fresh-proof-finisher");
-    const finisher = expectWork(await requestWork(finisherSocket, jobId, "proof-work"));
+    const { work: finisher } = await helloAndWork(finisherSocket, jobId, "fresh-proof-finisher", ["proof-slot"], {
+      proofGeneration: true,
+    });
     expect(finisher.task.purpose).toBe("PROOF_FINISHER");
-    expect(finisher.queue.canSplit).toBe(false);
     finisherSocket.close(1000, "done");
     splitter.close(1000, "done");
+  });
+
+  it("re-enables a nonterminal job after owner proof confirmation", async () => {
+    const { jobId, stub } = await initializedCoordinator();
+    const directory = env.SWARM_DIRECTORY.getByName("global-v1");
+    const now = Date.now();
+    const artifactId = "owner-proof-artifact";
+    const artifactSha256 = "ef".repeat(32);
+    await expect(directory.admit({
+      jobId,
+      deviceDigest: "owner-proof-device",
+      networkDigest: "owner-proof-network",
+      createdAt: now,
+      expiresAt: now + 24 * 60 * 60_000,
+      globalCeiling: 100,
+    })).resolves.toEqual({ ok: true });
+    expect(await directory.markReady(jobId, now)).toBe(true);
+    expect(await directory.setEligible(jobId, false, now + 1)).toBe(true);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("UPDATE jobs SET state = 'RUNNING'");
+        state.storage.sql.exec(
+          "UPDATE tasks SET state = 'SPLIT', active_lease_id = NULL, updated_at = ? WHERE task_id = 'root'",
+          now,
+        );
+        state.storage.sql.exec(
+          `INSERT INTO tasks (
+            task_id, parent_task_id, depth, assumptions_json, state, created_at,
+            updated_at, proof_required
+          ) VALUES
+            ('owner-child', 'root', 1, '[1]', 'VERIFYING_UNSAT', ?, ?, 1),
+            ('open-sibling', 'root', 1, '[-1]', 'READY', ?, ?, 0)`,
+          now,
+          now,
+          now,
+          now,
+        );
+        state.storage.sql.exec(
+          `INSERT INTO proof_artifacts (
+            artifact_id, task_id, lease_id, artifact_sha256, compressed_bytes,
+            decompressed_bytes, verification_status, created_at, object_key
+          ) VALUES (?, 'owner-child', 'owner-proof-lease', ?, 10, 20,
+            'OWNER_CHECK_REQUIRED', ?, 'proof/owner-check')`,
+          artifactId,
+          artifactSha256,
+          now,
+        );
+      });
+    });
+
+    await expect(stub.confirmOwnerProof(
+      "11".repeat(32),
+      artifactId,
+      artifactSha256,
+    )).resolves.toEqual({ ok: true, state: "RUNNING" });
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ state: string }>(
+        "SELECT state FROM tasks WHERE task_id = 'owner-child'",
+      ).one().state).toBe("UNSAT_OWNER_VERIFIED");
+      expect(state.storage.sql.exec<{ state: string }>(
+        "SELECT state FROM tasks WHERE task_id = 'root'",
+      ).one().state).toBe("SPLIT");
+      expect(state.storage.sql.exec<{ state: string }>(
+        "SELECT state FROM jobs",
+      ).one().state).toBe("RUNNING");
+    });
+    await runInDurableObject(directory, (_instance, state) => {
+      expect(state.storage.sql.exec<{ eligible: number }>(
+        "SELECT eligible FROM active_jobs WHERE job_id = ?",
+        jobId,
+      ).one().eligible).toBe(1);
+    });
   });
 
   it("quarantines an invalid-model session and requeues without a terminal verdict", async () => {
@@ -462,8 +874,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
     )).toMatchObject({ ok: true });
 
     const socket = await openSocket(stub);
-    await hello(socket, jobId, "dishonest-session");
-    const work = expectWork(await requestWork(socket, jobId, "invalid-model-work"));
+    const { work } = await helloAndWork(socket, jobId, "dishonest-session");
     const pathHash = await resultPathHash([]);
     const artifact = encodeSatModelArtifact({
       version: 1,
@@ -502,9 +913,10 @@ describe("JobCoordinatorDO leasing protocol", () => {
     });
     await expect(send(socket, {
       type: "RESULT",
-      protocolVersion: 3,
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: "invalid-model-result",
       jobId,
+      slotId: work.slotId,
       taskId: "root",
       leaseId: work.lease.leaseId,
       result: "SAT",
@@ -532,6 +944,9 @@ describe("JobCoordinatorDO leasing protocol", () => {
         "SELECT quarantined FROM session_reliability WHERE session_id = 'dishonest-session'",
       ).one().quarantined).toBe(1);
       expect(state.storage.sql.exec<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM leases WHERE session_id = 'dishonest-session' AND status = 'ACTIVE'",
+      ).one().total).toBe(0);
+      expect(state.storage.sql.exec<{ total: number }>(
         "SELECT COUNT(*) AS total FROM model_artifacts",
       ).one().total).toBe(0);
     });
@@ -549,8 +964,7 @@ describe("JobCoordinatorDO leasing protocol", () => {
       state.storage.sql.exec("UPDATE jobs SET object_key = ?", `jobs/${jobId}/formula/missing.hivecnf.gz`);
     });
     const socket = await openSocket(stub);
-    await hello(socket, jobId, "kv-miss-session");
-    const work = expectWork(await requestWork(socket, jobId, "kv-miss-work"));
+    const { work } = await helloAndWork(socket, jobId, "kv-miss-session");
     const pathHash = await resultPathHash([]);
     const artifact = encodeSatModelArtifact({
       version: 1,
@@ -568,11 +982,12 @@ describe("JobCoordinatorDO leasing protocol", () => {
       artifact.byteLength,
     )).resolves.toMatchObject({ ok: true });
 
-    await expect(send(socket, {
+    const [resultAck, retryMessage] = await sendMany(socket, {
       type: "RESULT",
-      protocolVersion: 3,
+      protocolVersion: PUBLIC_JOB_PROTOCOL_VERSION,
       messageId: "kv-miss-result",
       jobId,
+      slotId: work.slotId,
       taskId: "root",
       leaseId: work.lease.leaseId,
       result: "SAT",
@@ -590,12 +1005,19 @@ describe("JobCoordinatorDO leasing protocol", () => {
         artifactSha256,
         artifactBytes: artifact.byteLength,
       },
-    })).resolves.toMatchObject({ type: "ACK", action: "RESULT" });
+    }, 2);
+    expect(resultAck).toMatchObject({ type: "ACK", action: "RESULT" });
 
+    const retry = expectWork(retryMessage!);
+    expect(retry).toMatchObject({
+      slotId: work.slotId,
+      task: { taskId: "root" },
+      lease: { leaseCount: 2 },
+    });
     await runInDurableObject(stub, (_instance, state) => {
       expect(state.storage.sql.exec<{ state: string }>(
         "SELECT state FROM tasks WHERE task_id = 'root'",
-      ).one().state).toBe("READY");
+      ).one().state).toBe("LEASED");
       expect(state.storage.sql.exec<{
         invalid_results: number;
         verification_timeouts: number;
@@ -611,11 +1033,10 @@ describe("JobCoordinatorDO leasing protocol", () => {
     socket.close(1000, "done");
   });
 
-  it("broadcasts owner cancellation without eagerly recovering disconnected leases", async () => {
+  it("broadcasts owner cancellation and cancels active slot leases", async () => {
     const { jobId, stub } = await initializedCoordinator();
     const socket = await openSocket(stub);
-    await hello(socket, jobId, "cancel-session");
-    await requestWork(socket, jobId, "cancel-work");
+    await helloAndWork(socket, jobId, "cancel-session");
 
     const cancellation = nextMessage(socket);
     await expect(stub.cancel("11".repeat(32))).resolves.toMatchObject({ ok: true, changed: true });
@@ -675,19 +1096,19 @@ describe("JobCoordinatorDO leasing protocol", () => {
     });
   });
 
-  it("bounds alarm recovery batches and fails closed after the attempt ceiling", async () => {
+  it("bounds alarm recovery batches and keeps retrying after arbitrarily many leases", async () => {
     const { stub } = await initializedCoordinator();
     const now = Date.now();
     await runInDurableObject(stub, (_instance, state) => {
       state.storage.transactionSync(() => {
-        state.storage.sql.exec("UPDATE tasks SET state = 'UNKNOWN' WHERE task_id = 'root'");
+        state.storage.sql.exec("UPDATE tasks SET state = 'SPLIT' WHERE task_id = 'root'");
         for (let index = 0; index < COORDINATOR_ALARM_BATCH_SIZE + 1; index += 1) {
           const taskId = `batch-task-${index}`;
           const leaseId = `batch-lease-${index}`;
           state.storage.sql.exec(
             `INSERT INTO tasks (
               task_id, parent_task_id, depth, assumptions_json, state, created_at,
-              updated_at, attempt_count, active_lease_id
+              updated_at, lease_count, active_lease_id
             ) VALUES (?, 'root', 1, '[]', 'LEASED', ?, ?, 1, ?)`,
             taskId,
             now,
@@ -696,12 +1117,15 @@ describe("JobCoordinatorDO leasing protocol", () => {
           );
           state.storage.sql.exec(
             `INSERT INTO leases (
-              lease_id, task_id, session_id, attempt, issued_at, expires_at, status, extended
-            ) VALUES (?, ?, 'batch-session', 1, ?, ?, 'ACTIVE', 0)`,
+              lease_id, task_id, session_id, slot_id, attempt, lease_count,
+              issued_at, expires_at, maximum_expires_at, last_active_ms, status, extended
+            ) VALUES (?, ?, 'batch-session', ?, 1, 1, ?, ?, ?, 0, 'ACTIVE', 0)`,
             leaseId,
             taskId,
+            `batch-slot-${index}`,
             now - 2,
             now - 1,
+            now + 60_000,
           );
         }
       });
@@ -717,21 +1141,55 @@ describe("JobCoordinatorDO leasing protocol", () => {
       expect(state.storage.sql.exec<{ total: number }>("SELECT COUNT(*) AS total FROM leases WHERE status = 'ACTIVE'").one().total).toBe(0);
     });
 
-    const ceiling = await initializedCoordinator();
-    const socket = await openSocket(ceiling.stub);
-    await hello(socket, ceiling.jobId, "ceiling-session");
-    const work = expectWork(await requestWork(socket, ceiling.jobId, "ceiling-work"));
-    await runInDurableObject(ceiling.stub, (_instance, state) => {
+    const recovery = await initializedCoordinator();
+    const socket = await openSocket(recovery.stub);
+    const { work } = await helloAndWork(socket, recovery.jobId, "long-running-session");
+    await runInDurableObject(recovery.stub, (_instance, state) => {
       state.storage.sql.exec(
-        "UPDATE tasks SET attempt_count = ? WHERE task_id = 'root'",
-        COORDINATOR_MAX_TASK_ATTEMPTS,
+        "UPDATE tasks SET lease_count = 1000000 WHERE task_id = 'root'",
       );
       state.storage.sql.exec("UPDATE leases SET expires_at = ? WHERE lease_id = ?", Date.now() - 1, work.lease.leaseId);
       return state.storage.setAlarm(Date.now() + 10_000);
     });
-    expect(await runDurableObjectAlarm(ceiling.stub)).toBe(true);
-    await expect(ceiling.stub.getStatus()).resolves.toMatchObject({ state: "UNKNOWN", rootTaskState: "UNKNOWN" });
+    const retriedMessage = nextMessage(socket);
+    expect(await runDurableObjectAlarm(recovery.stub)).toBe(true);
+    const retried = expectWork(await retriedMessage);
+    expect(retried).toMatchObject({
+      slotId: work.slotId,
+      task: { taskId: "root" },
+      lease: { leaseCount: 1_000_001 },
+    });
+    expect(retried.lease.leaseId).not.toBe(work.lease.leaseId);
+    await expect(recovery.stub.getStatus()).resolves.toMatchObject({ state: "RUNNING", rootTaskState: "LEASED" });
     socket.close(1000, "done");
+  });
+
+  it("immediately requeues slots when a client closes cleanly", async () => {
+    const { jobId, stub } = await initializedCoordinator();
+    const firstSocket = await openSocket(stub);
+    const { work: first } = await helloAndWork(firstSocket, jobId, "stopping-session");
+
+    const waitingSocket = await openSocket(stub);
+    await hello(waitingSocket, jobId, "waiting-session");
+    const reassignedMessage = nextMessage(waitingSocket);
+    firstSocket.close(1000, "Client stopped");
+
+    const reassigned = expectWork(await reassignedMessage);
+    expect(reassigned).toMatchObject({
+      task: { taskId: first.task.taskId, assumptions: first.task.assumptions },
+      lease: { leaseCount: 2 },
+    });
+    expect(reassigned.lease.leaseId).not.toBe(first.lease.leaseId);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec<{ status: string }>(
+        "SELECT status FROM leases WHERE lease_id = ?",
+        first.lease.leaseId,
+      ).one().status).toBe("YIELDED");
+      expect(state.storage.sql.exec<{ state: string }>(
+        "SELECT state FROM tasks WHERE task_id = 'root'",
+      ).one().state).toBe("LEASED");
+    });
+    waitingSocket.close(1000, "done");
   });
 
   it("fails closed at the configured per-job WebSocket ceiling", async () => {

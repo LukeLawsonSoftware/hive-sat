@@ -1132,11 +1132,12 @@ describe("JobCoordinatorDO leasing protocol", () => {
       return state.storage.setAlarm(now + 10_000);
     });
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
-    await runInDurableObject(stub, (_instance, state) => {
+    await runInDurableObject(stub, async (instance, state) => {
+      await instance.alarm();
       expect(state.storage.sql.exec<{ total: number }>("SELECT COUNT(*) AS total FROM leases WHERE status = 'ACTIVE'").one().total).toBe(1);
+      expect(await state.storage.getAlarm()).not.toBeNull();
     });
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await runDurableObjectAlarm(stub);
     await runInDurableObject(stub, (_instance, state) => {
       expect(state.storage.sql.exec<{ total: number }>("SELECT COUNT(*) AS total FROM leases WHERE status = 'ACTIVE'").one().total).toBe(0);
     });
